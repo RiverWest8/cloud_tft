@@ -836,7 +836,18 @@ except Exception as _e:
 if torch.cuda.is_available():
     ACCELERATOR = "gpu"
     DEVICES = "auto"          # use all visible GPUs if more than one
-    PRECISION = "bf16-mixed"  # L4 supports fast bf16
+    # default to bf16 but fall back to fp16 if unsupported (e.g., T4)
+    PRECISION = "bf16-mixed"
+    try:
+        if hasattr(torch.cuda, "is_bf16_supported") and not torch.cuda.is_bf16_supported():
+            PRECISION = "16-mixed"
+    except Exception:
+        try:
+            major, _minor = torch.cuda.get_device_capability()
+            if major < 8:  # pre-Ampere
+                PRECISION = "16-mixed"
+        except Exception:
+            PRECISION = "16-mixed"
     try:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
@@ -858,8 +869,8 @@ else:
 # -----------------------------------------------------------------------
 # CLI overrides for common CONFIG knobs
 # -----------------------------------------------------------------------
-parser = argparse.ArgumentParser(description="TFT training with optional permutation importance")
-parser.add_argument("--max_encoder_length", type=int, default= 64, help="Max encoder length")
+parser = argparse.ArgumentParser(description="TFT training with optional permutation importance", add_help=True)
+parser.add_argument("--max_encoder_length", type=int, default=64, help="Max encoder length")
 parser.add_argument("--max_epochs", type=int, default=20, help="Max training epochs")
 parser.add_argument("--batch_size", type=int, default=1024, help="Training batch size")
 parser.add_argument("--early_stop_patience", "--patience", type=int, default=20, help="Early stopping patience")
@@ -870,7 +881,12 @@ parser.add_argument(
     default=None,
     help="Enable permutation feature importance (true/false)"
 )
-ARGS = parser.parse_args()
+# Cloud paths / storage overrides
+parser.add_argument("--gcs_bucket", type=str, default=None, help="GCS bucket name to read/write from")
+parser.add_argument("--gcs_data_prefix", type=str, default=None, help="Full GCS prefix for data parquet folder")
+parser.add_argument("--gcs_output_prefix", type=str, default=None, help="Full GCS prefix for outputs/checkpoints")
+# Parse known args so stray platform args do not crash the script
+ARGS, _UNKNOWN = parser.parse_known_args()
 
 # -----------------------------------------------------------------------
 # CONFIG – tweak as required (GCS-aware)
@@ -878,6 +894,19 @@ ARGS = parser.parse_args()
 GCS_BUCKET = os.environ.get("GCS_BUCKET", "river-ml-bucket")
 GCS_DATA_PREFIX = f"gs://{GCS_BUCKET}/CleanedData"
 GCS_OUTPUT_PREFIX = f"gs://{GCS_BUCKET}/Dissertation/Feature_Ablation"
+
+# Apply CLI overrides (if provided)
+if getattr(ARGS, "gcs_bucket", None):
+    GCS_BUCKET = ARGS.gcs_bucket
+    # recompute defaults if specific prefixes are not provided
+    if not getattr(ARGS, "gcs_data_prefix", None):
+        GCS_DATA_PREFIX = f"gs://{GCS_BUCKET}/CleanedData"
+    if not getattr(ARGS, "gcs_output_prefix", None):
+        GCS_OUTPUT_PREFIX = f"gs://{GCS_BUCKET}/Dissertation/Feature_Ablation"
+if getattr(ARGS, "gcs_data_prefix", None):
+    GCS_DATA_PREFIX = ARGS.gcs_data_prefix
+if getattr(ARGS, "gcs_output_prefix", None):
+    GCS_OUTPUT_PREFIX = ARGS.gcs_output_prefix
 
 # Local ephemerals (good for GCE/Vertex)
 LOCAL_DATA_DIR = Path(os.environ.get("LOCAL_DATA_DIR", "/tmp/data/CleanedData"))
@@ -934,6 +963,23 @@ if not all(map(gcs_exists, [TRAIN_URI, VAL_URI, TEST_URI])):
     READ_PATHS = [str(TRAIN_FILE), str(VAL_FILE), str(TEST_FILE)]
 else:
     READ_PATHS = [TRAIN_URI, VAL_URI, TEST_URI]
+
+# --- Validate data availability early with helpful errors ---
+
+def _is_gcs(p: str) -> bool:
+    return str(p).startswith("gs://")
+
+if all(_is_gcs(p) for p in READ_PATHS):
+    if fs is None:
+        raise RuntimeError(
+            "Data paths point to GCS but 'gcsfs' is not installed. Install gcsfs or provide local files."
+        )
+else:
+    missing_local = [p for p in READ_PATHS if not _is_gcs(p) and not Path(p).exists()]
+    if missing_local:
+        raise FileNotFoundError(
+            f"Local data files not found: {missing_local}. Either upload your data to GCS (set GCS_BUCKET or pass --gcs_bucket) or ensure the local files exist."
+        )
 
 def get_resume_ckpt_path():
     # Prefer newest local checkpoint
@@ -1481,7 +1527,7 @@ if __name__ == "__main__":
 #   - rebuild validation dataset from the *training* spec to keep encoders/scalers identical
 # -------------------------------------------------------------------
 
-if __name__ == "__main__":
+if __name__ == "__main__" and ENABLE_FEATURE_IMPORTANCE:
     from pytorch_forecasting import TimeSeriesDataSet
 
     print("▶ Permutation feature importance …")
@@ -1559,3 +1605,5 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"[WARN] Could not upload permutation importance: {e}")
     print(perm_df.head(25).to_string(index=False))
+else:
+    print("▶ Permutation feature importance is disabled. Set --enable_perm_importance true to enable.")
