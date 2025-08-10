@@ -892,7 +892,7 @@ ARGS, _UNKNOWN = parser.parse_known_args()
 # CONFIG – tweak as required (GCS-aware)
 # -----------------------------------------------------------------------
 GCS_BUCKET = os.environ.get("GCS_BUCKET", "river-ml-bucket")
-GCS_DATA_PREFIX = f"gs://{GCS_BUCKET}/CleanedData"
+GCS_DATA_PREFIX = f"gs://{GCS_BUCKET}/Data/CleanedData"
 GCS_OUTPUT_PREFIX = f"gs://{GCS_BUCKET}/Dissertation/Feature_Ablation"
 
 # Apply CLI overrides (if provided)
