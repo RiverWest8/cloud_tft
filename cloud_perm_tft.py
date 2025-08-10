@@ -871,7 +871,7 @@ else:
 # -----------------------------------------------------------------------
 parser = argparse.ArgumentParser(description="TFT training with optional permutation importance", add_help=True)
 parser.add_argument("--max_encoder_length", type=int, default=64, help="Max encoder length")
-parser.add_argument("--max_epochs", type=int, default=20, help="Max training epochs")
+parser.add_argument("--max_epochs", type=int, default=1, help="Max training epochs")
 parser.add_argument("--batch_size", type=int, default=1024, help="Training batch size")
 parser.add_argument("--early_stop_patience", "--patience", type=int, default=20, help="Early stopping patience")
 parser.add_argument("--perm_len", type=int, default=288, help="Permutation block length for importance")
