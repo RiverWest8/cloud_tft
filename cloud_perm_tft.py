@@ -885,6 +885,12 @@ parser.add_argument(
 parser.add_argument("--gcs_bucket", type=str, default=None, help="GCS bucket name to read/write from")
 parser.add_argument("--gcs_data_prefix", type=str, default=None, help="Full GCS prefix for data parquet folder")
 parser.add_argument("--gcs_output_prefix", type=str, default=None, help="Full GCS prefix for outputs/checkpoints")
+# Performance / input control
+parser.add_argument("--data_dir", type=str, default=None, help="Local folder containing universal_*.parquet; if set, prefer local over GCS")
+parser.add_argument("--num_workers", type=int, default=None, help="DataLoader workers (defaults to CPU count - 1)")
+parser.add_argument("--prefetch_factor", type=int, default=8, help="DataLoader prefetch factor (per worker)")
+parser.add_argument("--check_val_every_n_epoch", type=int, default=1, help="Validate every N epochs")
+parser.add_argument("--log_every_n_steps", type=int, default=200, help="How often to log train steps")
 # Parse known args so stray platform args do not crash the script
 ARGS, _UNKNOWN = parser.parse_known_args()
 
@@ -954,7 +960,14 @@ TRAIN_URI = f"{GCS_DATA_PREFIX}/universal_train.parquet"
 VAL_URI   = f"{GCS_DATA_PREFIX}/universal_val.parquet"
 TEST_URI  = f"{GCS_DATA_PREFIX}/universal_test.parquet"
 
-if not all(map(gcs_exists, [TRAIN_URI, VAL_URI, TEST_URI])):
+# If a local data folder is explicitly provided, use it and skip GCS
+if getattr(ARGS, "data_dir", None):
+    DATA_DIR = Path(ARGS.data_dir).expanduser().resolve()
+    TRAIN_FILE = DATA_DIR / "universal_train.parquet"
+    VAL_FILE   = DATA_DIR / "universal_val.parquet"
+    TEST_FILE  = DATA_DIR / "universal_test.parquet"
+    READ_PATHS = [str(TRAIN_FILE), str(VAL_FILE), str(TEST_FILE)]
+elif not all(map(gcs_exists, [TRAIN_URI, VAL_URI, TEST_URI])):
     # Fallback to your original local paths
     DATA_DIR = Path("/Users/riverwest-gomila/Desktop/Data/CleanedData")
     TRAIN_FILE = DATA_DIR / "universal_train.parquet"
@@ -1251,30 +1264,36 @@ if __name__ == "__main__":
 
     batch_size = min(BATCH_SIZE, len(training_dataset))
 
-    worker_cnt = max(2, (os.cpu_count() or 4) - 1)
+    # DataLoader performance knobs
+    default_workers = max(2, (os.cpu_count() or 4) - 1)
+    worker_cnt = int(ARGS.num_workers) if getattr(ARGS, "num_workers", None) is not None else default_workers
+    prefetch = int(getattr(ARGS, "prefetch_factor", 8))
     pin = torch.cuda.is_available()
+    use_persist = worker_cnt > 0
 
     test_loader = test_dataset.to_dataloader(
         train=False,
         batch_size=batch_size,
         num_workers=worker_cnt,
         pin_memory=pin,
+        persistent_workers=use_persist,
+        prefetch_factor=prefetch,
     )
 
     train_dataloader = training_dataset.to_dataloader(
         train=True,
         batch_size=batch_size,
         num_workers=worker_cnt,
-        persistent_workers=True,
-        prefetch_factor=2,
+        persistent_workers=use_persist,
+        prefetch_factor=prefetch,
         pin_memory=pin,
     )
     val_dataloader = validation_dataset.to_dataloader(
         train=False,
         batch_size=batch_size,
         num_workers=worker_cnt,
-        persistent_workers=True,
-        prefetch_factor=2,
+        persistent_workers=use_persist,
+        prefetch_factor=prefetch,
         pin_memory=pin,
     )
 
@@ -1477,6 +1496,8 @@ if __name__ == "__main__":
         devices=DEVICES,
         strategy="auto",
         detect_anomaly=False,
+        check_val_every_n_epoch=int(getattr(ARGS, "check_val_every_n_epoch", 1)),
+        log_every_n_steps=int(getattr(ARGS, "log_every_n_steps", 200)),
     )
 
     print("▶ Training TFT …")
