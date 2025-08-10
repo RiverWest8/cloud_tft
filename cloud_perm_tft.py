@@ -1445,11 +1445,10 @@ if __name__ == "__main__":
         dirpath=str(LOCAL_CKPT_DIR),
     )
     periodic_ckpt_cb = ModelCheckpoint(
-        every_n_train_steps=2000,              # ≈ frequent snapshots
-        train_time_interval=timedelta(minutes=10),  # or at least every 10 minutes
-        save_top_k=-1,                         # keep all periodic snapshots
+        train_time_interval=timedelta(minutes=10),  # save at least every 10 minutes
+        save_top_k=-1,
         dirpath=str(LOCAL_CKPT_DIR),
-        filename="tft-snap-{epoch:02d}-{step:06d}",
+        filename="tft-snap-time-{epoch:02d}-{step:06d}",
     )
     ckpt_uploader_cb = MirrorCheckpoints()
 
