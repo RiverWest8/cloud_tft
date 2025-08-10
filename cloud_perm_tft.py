@@ -1,0 +1,1561 @@
+# To run this script on macOS with Apple MPS fallback enabled in zsh/bash:
+#   source ~/.venvs/tft-mps/bin/activate    # (tft-mps) environment
+#   python /Users/riverwest-gomila/Desktop/Data/Scripts/permutationTFT.py
+
+"""
+Temporal Fusion Transformer (TFT) pipeline
+==========================================
+
+This script trains a single TFT model that jointly predicts:
+  • realised volatility (quantile regression on an asinh‑transformed target)
+  • the direction of the next period’s price move (binary classification)
+
+It expects three parquet files:
+    ▸ /Users/riverwest-gomila/Desktop/Data/CleanedData/universal_train.parquet
+    ▸ /Users/riverwest-gomila/Desktop/Data/CleanedData/universal_val.parquet
+    ▸ /Users/riverwest-gomila/Desktop/Data/CleanedData/universal_test.parquet
+
+Required columns (exact names or common aliases will be auto‑detected):
+    asset         : categorical asset identifier (aliases: symbol, ticker, instrument)
+    Time          : timestamp (parsed to pandas datetime)
+    realised_vol  : one‑period realised volatility target
+    direction     : 0/1 label for next‑period price direction
+plus any engineered numeric features
+
+What the script does:
+  1) Loads the parquet splits and standardises column names.
+  2) Adds a per‑asset integer `time_idx` required by PyTorch‑Forecasting.
+  3) Builds a `TimeSeriesDataSet` with **two targets**: ["realised_vol", "direction"].
+     • Target normalisation:
+         – realised_vol: `GroupNormalizer(..., transformation="asinh", scale_by_group=True)`
+           (applies asinh in the normaliser, per asset)
+         – direction: identity (no transform)
+     • A per‑asset median `rv_scale` is also attached for **fallback decoding only**
+       if a normaliser decode is unavailable.
+  4) Fits a TemporalFusionTransformer with a dual head: 7 quantiles for vol and one
+     logit for direction, using `LearnableMultiTaskLoss(AsymmetricQuantileLoss, LabelSmoothedBCE)`.
+  5) Saves checkpoints, metrics, predictions, and quick feature‑importance summaries.
+
+Adjust hyper‑parameters in the CONFIG section below.
+"""
+
+# -----------------------------------------------------------------------
+# Imports
+# -----------------------------------------------------------------------
+import warnings
+warnings.filterwarnings("ignore")
+
+import os
+from pathlib import Path
+from typing import List
+import json
+import csv
+import numpy as np
+import pandas as pd
+import lightning as pl
+from lightning.pytorch import Trainer, seed_everything
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from pytorch_forecasting import (
+    TemporalFusionTransformer,
+    TimeSeriesDataSet,
+)
+from pytorch_forecasting.data import GroupNormalizer
+from pytorch_forecasting.data import MultiNormalizer, TorchNormalizer
+
+from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
+from lightning.pytorch.loggers import TensorBoardLogger
+
+# --- Cloud / performance helpers ---
+import fsspec
+try:
+    import gcsfs  # ensure GCS protocol is registered with fsspec
+except Exception:
+    gcsfs = None
+
+# CUDA perf knobs / utils
+import math
+import shutil
+import argparse
+
+
+# -----------------------------------------------------------------------
+# Ensure a robust "identity" transformation for GroupNormalizer
+# -----------------------------------------------------------------------
+#
+# Different versions of PyTorch‑Forecasting store transformations as a
+# dictionary mapping *name* ➜ {"forward": fn, "inverse": fn}.  Some older
+# releases omit "identity" entirely, which triggers a KeyError.  Other
+# versions include it but as a bare function instead of a dict, which then
+# breaks later when `.setdefault()` is called on it.  The logic below
+# handles both cases safely.
+#
+identity_transform = {"forward": lambda x: x, "inverse": lambda x: x}
+
+# If the key is missing OR is not in the expected dict format, patch it.
+if (
+    "identity" not in GroupNormalizer.TRANSFORMATIONS
+    or not isinstance(GroupNormalizer.TRANSFORMATIONS["identity"], dict)
+):
+    GroupNormalizer.TRANSFORMATIONS["identity"] = identity_transform
+
+# Some PF versions expose a separate `INVERSE_TRANSFORMATIONS` registry.
+# Add the mapping only if the attribute exists.
+
+if hasattr(GroupNormalizer, "INVERSE_TRANSFORMATIONS"):
+    GroupNormalizer.INVERSE_TRANSFORMATIONS.setdefault("identity", lambda x: x)
+
+# ---------------- Register custom asinh transformation ----------------
+if (
+    "asinh" not in GroupNormalizer.TRANSFORMATIONS
+    or not isinstance(GroupNormalizer.TRANSFORMATIONS["asinh"], dict)
+):
+    GroupNormalizer.TRANSFORMATIONS["asinh"] = {
+        "forward": lambda x: torch.asinh(x) if torch.is_tensor(x) else np.arcsinh(x),
+        "inverse": lambda x: torch.sinh(x) if torch.is_tensor(x) else np.sinh(x),
+    }
+if hasattr(GroupNormalizer, "INVERSE_TRANSFORMATIONS"):
+    GroupNormalizer.INVERSE_TRANSFORMATIONS.setdefault(
+        "asinh",
+        lambda x: torch.sinh(x) if torch.is_tensor(x) else np.sinh(x),
+    )
+
+
+
+# -----------------------------------------------------------------------
+# Compatibility shim: older PyTorch‑Forecasting versions expose only
+# `.inverse_transform()` but not `.decode()`.  Downstream code expects
+# `.decode()`, so add an alias when missing.
+# -----------------------------------------------------------------------
+if not hasattr(GroupNormalizer, "decode"):
+    def _gn_decode(self, y, group_ids=None, **kwargs):
+        """
+        Alias for `inverse_transform` to keep newer *and* older
+        PyTorch‑Forecasting versions compatible with the same call‑site.
+
+        The underlying `inverse_transform` API has changed a few times:
+        ▸ Newer versions accept ``group_ids=`` keyword
+        ▸ Some legacy variants want ``X=`` instead
+        ▸ Very old releases implement the method but raise ``NotImplementedError``  
+          (it was a placeholder).
+
+        The cascading fall‑backs below try each signature in turn and, as a
+        last resort, simply return the *input* unchanged so downstream code
+        can continue without crashing.
+        """
+        try:
+            # 1️⃣  Modern signature (>=0.10): accepts ``group_ids=``
+            return self.inverse_transform(y, group_ids=group_ids, **kwargs)
+        except (TypeError, NotImplementedError):
+            try:
+                # 2️⃣  Mid‑vintage signature: expects ``X=None`` instead
+                return self.inverse_transform(y, X=None, **kwargs)
+            except (TypeError, NotImplementedError):
+                try:
+                    # 3️⃣  Very early signature: just (y) positional
+                    return self.inverse_transform(y)
+                except (TypeError, NotImplementedError):
+                    # 4️⃣  Ultimate fall‑back – give up on denorm, return y
+                    return y
+
+    GroupNormalizer.decode = _gn_decode
+
+
+
+from pytorch_forecasting.metrics import QuantileLoss
+
+
+
+class LabelSmoothedBCE(nn.Module):
+    """
+    BCE-with-logits + ε-label smoothing with EMA-adaptive pos_weight.
+    - Initializes pos_weight from an Optuna-provided value.
+    - Tracks an EMA of the positive rate over batches and updates pos_weight.
+    """
+    def __init__(self, smoothing: float = 0.1, init_pos_weight: float = 1.2,
+                 ema_beta: float = 0.99, pw_min: float = 0.2, pw_max: float = 5.0):
+        super().__init__()
+        self.smoothing = float(smoothing)
+        self.ema_beta = float(ema_beta)
+        self.pw_min = float(pw_min)
+        self.pw_max = float(pw_max)
+        # Derive initial prevalence from pos_weight: w = (1-p)/p  =>  p = 1/(1+w)
+        p0 = 1.0 / (1.0 + max(float(init_pos_weight), 1e-6))
+        self.register_buffer("pos_rate_ema", torch.tensor(p0, dtype=torch.float32))
+
+    def _current_pos_weight(self, device):
+        p = torch.clamp(self.pos_rate_ema.to(device), 1e-6, 1 - 1e-6)
+        w = (1.0 - p) / p
+        return torch.clamp(w, self.pw_min, self.pw_max)
+
+    def forward(self, y_pred, target):
+        target = target.float()
+        # EMA update only during training mode
+        if self.training:
+            with torch.no_grad():
+                try:
+                    batch_p = target.mean().to(self.pos_rate_ema.device)
+                    if torch.isfinite(batch_p):
+                        self.pos_rate_ema.mul_(self.ema_beta).add_(batch_p * (1.0 - self.ema_beta))
+                except Exception:
+                    pass
+        # Label smoothing toward 0.5
+        target = target * (1.0 - self.smoothing) + 0.5 * self.smoothing
+        pos_weight = self._current_pos_weight(y_pred.device)
+        return F.binary_cross_entropy_with_logits(
+            y_pred.squeeze(-1), target.squeeze(-1), pos_weight=pos_weight
+        )
+
+# ---------------------------------------------------------------------
+# Learnable Multi-Task Loss with Uncertainty-style Weights
+# ---------------------------------------------------------------------
+class LearnableMultiTaskLoss(nn.Module):
+    """
+    Two-loss combiner with learnable uncertainty-style weights.
+    total = exp(-s1) * L1 + exp(-s2) * L2 + (s1 + s2)
+    Initialize with desired starting weights w_i via s_i = -log(w_i).
+    Expects y_pred to be a list/tuple: [pred_vol, pred_dir].
+    """
+    def __init__(self, loss_vol: nn.Module, loss_dir: nn.Module, init_weights=(1.0, 0.5)):
+        super().__init__()
+        self.loss_vol = loss_vol
+        self.loss_dir = loss_dir
+        w1, w2 = float(init_weights[0]), float(init_weights[1])
+        # s_i = -log(w_i) so that exp(-s_i) = w_i at initialization
+        s1 = -np.log(max(w1, 1e-8))
+        s2 = -np.log(max(w2, 1e-8))
+        self.s = nn.Parameter(torch.tensor([s1, s2], dtype=torch.float32))
+
+    def forward(self, y_pred, target, **kwargs):
+                # --- normalize y_pred to (p_vol, p_dir) ---
+        if isinstance(y_pred, (list, tuple)) and len(y_pred) >= 2:
+            p_vol, p_dir = y_pred[0], y_pred[1]
+        elif torch.is_tensor(y_pred):
+            # Accept shapes [..., 2, 7] or [..., 14]
+            if y_pred.ndim >= 3 and y_pred.size(-2) == 2 and y_pred.size(-1) == 7:
+                p_vol = y_pred[..., 0, :]       # [..., 7]
+                # direction logits were replicated across 7; take the median slot and keep last-dim=1
+                p_dir = y_pred[..., 1, 3:4]     # [..., 1]
+            elif y_pred.ndim >= 2 and y_pred.size(-1) == 14:
+                y_resh = y_pred.view(*y_pred.shape[:-1], 2, 7)
+                p_vol = y_resh[..., 0, :]
+                p_dir = y_resh[..., 1, 3:4]
+            else:
+                # assume single-target case
+                p_vol, p_dir = y_pred, None
+        else:
+            p_vol, p_dir = y_pred, None
+
+        # Unpack targets; direction may be missing → set yd=None
+        yv, yd = None, None
+        if torch.is_tensor(target):
+            t = target
+            if t.ndim == 3:
+                # shapes like [B, pred_len, n_targets]
+                if t.size(-1) >= 2:
+                    yv = t[..., 0]
+                    yd = t[..., 1]
+                elif t.size(-1) == 1:
+                    yv = t[..., 0]
+            elif t.ndim == 2:
+                if t.size(-1) >= 2:
+                    yv = t[:, 0]
+                    yd = t[:, 1]
+                elif t.size(-1) == 1:
+                    yv = t[:, 0]
+            elif t.ndim == 1:
+                yv = t
+            else:
+                raise ValueError(f"Unexpected target shape: {t.shape}")
+        elif isinstance(target, (list, tuple)):
+            if len(target) >= 1:
+                yv = target[0]
+            if len(target) >= 2:
+                yd = target[1]
+            # Squeeze trailing singleton dims if present
+            if torch.is_tensor(yv) and yv.ndim >= 3 and yv.size(-1) == 1:
+                yv = yv[..., 0]
+            if torch.is_tensor(yd) and yd is not None and yd.ndim >= 3 and yd.size(-1) == 1:
+                yd = yd[..., 0]
+        else:
+            raise TypeError("LearnableMultiTaskLoss expects target tensor or list/tuple of tensors")
+
+        if yv is None:
+            raise ValueError("Volatility target is missing; cannot compute primary loss.")
+
+        # Compute individual losses
+        L1 = self.loss_vol(p_vol, yv)
+        if L1.ndim > 0:
+            L1 = L1.mean()
+
+        # Direction loss is optional if target/pred is missing
+        do_dir = (p_dir is not None) and (yd is not None)
+        if do_dir:
+            if isinstance(self.loss_dir, nn.CrossEntropyLoss):
+                if p_dir.ndim > 2:
+                    p_dir = p_dir.reshape(p_dir.size(0), -1)
+                yd_ce = yd.long().reshape(-1)
+                L2 = self.loss_dir(p_dir, yd_ce)
+            else:
+                L2 = self.loss_dir(p_dir, yd)
+            if L2.ndim > 0:
+                L2 = L2.mean()
+        else:
+            L2 = torch.tensor(0.0, device=p_vol.device, dtype=p_vol.dtype)
+
+        # Combine with learnable weights; include the log-variance term only for active tasks
+        weights = torch.exp(-self.s)  # [2]
+        total = weights[0] * L1 + (weights[1] * L2 if do_dir else 0.0) + (self.s[0] + (self.s[1] if do_dir else 0.0))
+        return total
+
+    # ------------------------------------------------------------------
+    # Minimal PF output-transform interface
+    # ------------------------------------------------------------------
+    def rescale_parameters(self, parameters, target_scale=None, **kwargs):
+        """
+        PF calls `loss.rescale_parameters(params, target_scale=...)` inside
+        `BaseModel.transform_output`. Our heads already produce values in the
+        same normalized space as the targets, so we **no-op** here and return
+        the parameters unchanged.  (Decoding to physical scale is handled
+        explicitly later via the dataset normalizer.)
+        """
+        return parameters
+
+    def to_prediction(self, parameters, **kwargs):
+        """
+        PF may call `loss.to_prediction(params)` when building the output
+        object for logging. For our composite loss, the network already emits
+        predictions (quantiles for vol; logits for direction), so simply
+        pass them through unchanged.
+        """
+        return parameters
+
+    def to_quantiles(self, parameters, quantiles=None, **kwargs):
+        """
+        PF uses this to extract quantile forecasts for logging/plots.
+        Our network outputs either:
+          • list/tuple [vol(…,7), dir(…,1 or 7)]
+          • tensor of shape [..., 2, 7] (we stack vol and repeated-dir over the last 2 axes)
+        Return a list [vol_quantiles, dir_quantiles], where dir_quantiles is a
+        repeated sigmoid(logit) over the 7 slots so the shapes match.
+        """
+        import torch
+        # normalise inputs
+        if isinstance(parameters, (list, tuple)) and len(parameters) >= 2:
+            vol, d = parameters[0], parameters[1]
+            # ensure dir has last-dim length 7
+            if torch.is_tensor(d):
+                if d.ndim >= 1 and d.size(-1) == 1:
+                    d = d.repeat_interleave(7, dim=-1)
+                elif d.ndim >= 1 and d.size(-1) == 2:
+                    d = d.softmax(-1)[..., 1].unsqueeze(-1).repeat_interleave(7, dim=-1)
+            dir_q = torch.sigmoid(d) if torch.is_tensor(d) else d
+            return [vol, dir_q]
+        elif torch.is_tensor(parameters):
+            t = parameters
+            if t.ndim >= 3 and t.size(-2) == 2 and t.size(-1) == 7:
+                vol = t[..., 0, :]
+                d   = t[..., 1, :]
+                return [vol, torch.sigmoid(d)]
+            # fallback: assume single-target quantiles (vol only)
+            return [t]
+        else:
+            return [parameters]
+
+# -----------------------------------------------------------------------
+# Mini-MLP dual head: one branch for volatility quantiles, one for direction logit
+# -----------------------------------------------------------------------
+class DualHead(nn.Module):
+    def __init__(self, hidden_size: int, quantiles: int = 7, dir_classes: int = 2):
+        super().__init__()
+        h = hidden_size // 2
+        self.vol = nn.Sequential(
+            nn.Linear(hidden_size, h),
+            nn.ReLU(),
+            nn.Dropout(0.10),
+            nn.Linear(h, quantiles),
+        )
+        dir_out = 1 if dir_classes == 2 else int(dir_classes)
+        self.dir = nn.Sequential(
+            nn.Linear(hidden_size, h),
+            nn.ReLU(),
+            nn.Dropout(0.10),
+            nn.Linear(h, dir_out),  # 1 for binary logit; C for multiclass
+        )
+
+    def forward(self, x):
+        vol_out = self.vol(x)
+        dir_out = self.dir(x)
+        return torch.cat([vol_out, dir_out], dim=-1)
+
+# -----------------------------------------------------------------------
+# DualOutputModule: Wrap two heads (vol, dir) as a callable output_layer
+# -----------------------------------------------------------------------
+class DualOutputModule(nn.Module):
+    """Wrap two heads (vol, dir) and return a list [vol_pred, dir_pred].
+    This satisfies PyTorch‑Forecasting's expectation that `output_layer`
+    is callable (has `forward`) while keeping our multi‑head separation.
+    """
+    def __init__(self, vol_head: nn.Module, dir_head: nn.Module):
+        super().__init__()
+        self.vol = vol_head
+        self.dir = dir_head
+
+    def forward(self, x):
+        # x: [B, pred_len, hidden]
+        vol = self.vol(x)  # [B, pred_len, 7]
+        dir = self.dir(x)  # [B, pred_len, 1] (binary logit)
+        # replicate direction logit across 7 positions so downstream ops work uniformly
+        dir_rep = dir.repeat_interleave(vol.size(-1), dim=-1)  # [B, pred_len, 7]
+        # stack targets along a new axis => [B, pred_len, 2, 7]
+        return torch.stack([vol, dir_rep], dim=2)
+
+class AsymmetricQuantileLoss(QuantileLoss):
+    """
+    Pinball (quantile) loss with a **learnable** multiplier applied only when the
+    prediction is BELOW the ground‑truth value. The multiplier is parameterized as
+    alpha = 1 + softplus(u), initialized from an Optuna-provided value.
+    Includes an optional monotonicity penalty and a tiny L2 prior toward alpha=1.
+    """
+    def __init__(self, quantiles, underestimation_init: float = 1.115,
+                 learnable_under: bool = True, reg_lambda: float = 1e-3,
+                 monotone_lambda: float = 0.02, **kwargs):
+        super().__init__(quantiles=quantiles, **kwargs)
+        self.learnable_under = bool(learnable_under)
+        self.reg_lambda = float(reg_lambda)
+        self.monotone_lambda = float(monotone_lambda)
+        # Inverse softplus for (alpha_init - 1)
+        a0 = max(float(underestimation_init), 1.0)
+        u0 = np.log(np.expm1(a0 - 1.0) + 1e-12)
+        param = torch.tensor(u0, dtype=torch.float32)
+        if self.learnable_under:
+            self.u = nn.Parameter(param)
+        else:
+            self.register_buffer("u", param)
+
+    def _alpha(self):
+        return 1.0 + F.softplus(self.u)
+
+    def loss_per_prediction(self, y_pred, target):
+        diff = target.unsqueeze(-1) - y_pred  # positive ⇒ under‑prediction
+        q = torch.tensor(self.quantiles, device=y_pred.device, dtype=y_pred.dtype).view(
+            *([1] * (diff.ndim - 1)), -1
+        )
+        alpha = self._alpha().to(y_pred.device, dtype=y_pred.dtype)
+        loss = torch.where(
+            diff >= 0,
+            alpha * q * diff,
+            (1 - q) * (-diff),
+        )
+        return loss
+
+    def forward(self, y_pred, target, **kwargs):
+        base = super().forward(y_pred, target, **kwargs)
+        # Monotonicity penalty on quantiles: penalize q_{i+1} < q_i
+        if y_pred is not None and y_pred.ndim >= 1 and y_pred.size(-1) >= 2 and self.monotone_lambda > 0:
+            diffs = y_pred[..., 1:] - y_pred[..., :-1]
+            pen = torch.relu(-diffs).mean()
+            base = base + self.monotone_lambda * pen
+        # L2 prior toward alpha=1
+        if self.reg_lambda > 0:
+            alpha = self._alpha()
+            base = base + self.reg_lambda * (alpha - 1.0) ** 2
+        return base
+
+    def current_underestimation(self) -> float:
+        try:
+            return float((1.0 + F.softplus(self.u)).detach().cpu().item())
+        except Exception:
+            return float("nan")
+
+
+class PerAssetMetrics(pl.Callback):
+    """Collects per-asset predictions during validation and prints/saves metrics.
+    Computes MAE, RMSE, MSE, QLIKE for realised_vol and Accuracy for direction.
+    """
+    def __init__(self, id_to_name: dict, vol_normalizer, max_print: int = 10):
+        super().__init__()
+        self.id_to_name = {int(k): str(v) for k, v in id_to_name.items()}
+        self.vol_norm = vol_normalizer
+        self.max_print = max_print
+        self.reset()
+
+    def reset(self):
+        # device-resident accumulators (concatenate at epoch end)
+        self._g_dev = []   # group ids per sample (device, flattened)
+        self._yv_dev = []  # realised vol target (NORMALISED, device)
+        self._pv_dev = []  # realised vol pred   (NORMALISED, device)
+        self._yd_dev = []  # direction target (device)
+        self._pd_dev = []  # direction pred logits/probs (device)
+        # cached final rows/overall from last epoch
+        self._last_rows = None
+        self._last_overall = None
+
+    @torch.no_grad()
+    def on_validation_epoch_start(self, trainer, pl_module):
+        self.reset()
+
+    @torch.no_grad()
+    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx: int = 0):
+        # batch is (x, y, weight) from PF dataloader
+        if not isinstance(batch, (list, tuple)):
+            return
+        x = batch[0]
+        if not isinstance(x, dict):
+            return
+
+        groups = x.get("groups")
+        dec_t = x.get("decoder_target")
+        if groups is None or dec_t is None:
+            return
+
+        # groups can be a Tensor or a list[Tensor]; take the first if list
+        groups_raw = groups[0] if isinstance(groups, (list, tuple)) else groups
+        g = groups_raw
+        # squeeze trailing singleton dims to get [B]
+        while torch.is_tensor(g) and g.ndim > 1 and g.size(-1) == 1:
+            g = g.squeeze(-1)
+        if not torch.is_tensor(g):
+            return
+
+        # decoder_target can be a Tensor [B, n_targets, 1] OR a list[Tensor per target]
+        y_vol_t, y_dir_t = None, None
+        if torch.is_tensor(dec_t):
+            y = dec_t
+            if y.ndim == 3 and y.size(-1) == 1:
+                y = y[..., 0]     # → [B, n_targets]
+            if y.ndim != 2 or y.size(1) < 1:
+                return
+            y_vol_t = y[:, 0]
+            if y.size(1) > 1:
+                y_dir_t = y[:, 1]
+        elif isinstance(dec_t, (list, tuple)) and len(dec_t) >= 1:
+            y_vol_t = dec_t[0]
+            if torch.is_tensor(y_vol_t):
+                if y_vol_t.ndim == 3 and y_vol_t.size(-1) == 1:
+                    y_vol_t = y_vol_t[..., 0]
+                if y_vol_t.ndim == 2 and y_vol_t.size(-1) == 1:
+                    y_vol_t = y_vol_t[:, 0]
+            else:
+                return
+            if len(dec_t) > 1 and torch.is_tensor(dec_t[1]):
+                y_dir_t = dec_t[1]
+                if y_dir_t.ndim == 3 and y_dir_t.size(-1) == 1:
+                    y_dir_t = y_dir_t[..., 0]
+                if y_dir_t.ndim == 2 and y_dir_t.size(-1) == 1:
+                    y_dir_t = y_dir_t[:, 0]
+        else:
+            return
+
+        # Forward pass to get predictions for this batch
+        y_hat = pl_module(x)
+        pred = getattr(y_hat, "prediction", y_hat)
+        if isinstance(pred, dict) and "prediction" in pred:
+            pred = pred["prediction"]
+
+        def _extract_heads(pred):
+            # returns (p_vol: [B], p_dir: [B] or None) on DEVICE
+            if isinstance(pred, (list, tuple)):
+                p_vol_t = pred[0]
+                p_dir_t = pred[1] if len(pred) > 1 else None
+            else:
+                p_vol_t, p_dir_t = pred, None
+
+            def _to_median_q(t):
+                if t is None:
+                    return None
+                if t.ndim == 3 and t.size(1) == 1:
+                    t = t.squeeze(1)  # [B,7]
+                if t.ndim == 2 and t.size(-1) >= 7:
+                    return t[:, t.size(-1) // 2]  # median quantile
+                if t.ndim == 2 and t.size(-1) == 1:
+                    return t[:, 0]
+                if t.ndim == 1:
+                    return t
+                return t.reshape(t.size(0), -1)[:, 0]
+
+            def _to_dir_logit(t):
+                if t is None:
+                    return None
+                if t.ndim == 3 and t.size(1) == 1:
+                    t = t.squeeze(1)
+                if t.ndim == 2 and t.size(-1) >= 7:
+                    return t[:, t.size(-1) // 2]
+                if t.ndim == 2 and t.size(-1) == 1:
+                    return t[:, 0]
+                if t.ndim == 1:
+                    return t
+                return t.reshape(t.size(0), -1)[:, 0]
+
+            p_vol = _to_median_q(p_vol_t)
+            p_dir = _to_dir_logit(p_dir_t)
+            return p_vol, p_dir
+
+        p_vol, p_dir = _extract_heads(pred)
+        if p_vol is None:
+            return
+
+        # Store device tensors; no decode/CPU here
+        L = g.shape[0]
+        self._g_dev.append(g.reshape(L))
+        self._yv_dev.append(y_vol_t.reshape(L))
+        self._pv_dev.append(p_vol.reshape(L))
+        if y_dir_t is not None and p_dir is not None:
+            L2 = min(L, y_dir_t.numel(), p_dir.numel())
+            self._yd_dev.append(y_dir_t.reshape(-1)[:L2])
+            self._pd_dev.append(p_dir.reshape(-1)[:L2])
+
+    @torch.no_grad()
+    def on_validation_epoch_end(self, trainer, pl_module):
+        if not self._g_dev:
+            return
+        device = self._g_dev[0].device
+        g = torch.cat(self._g_dev).to(device)
+        yv = torch.cat(self._yv_dev).to(device)
+        pv = torch.cat(self._pv_dev).to(device)
+        yd = torch.cat(self._yd_dev).to(device) if self._yd_dev else None
+        pd = torch.cat(self._pd_dev).to(device) if self._pd_dev else None
+
+        # decode realised vol in one shot
+        try:
+            yv_dec_t = self.vol_norm.decode(yv.unsqueeze(-1), group_ids=g.unsqueeze(-1)).squeeze(-1)
+        except Exception:
+            yv_dec_t = yv
+        try:
+            pv_dec_t = self.vol_norm.decode(pv.unsqueeze(-1), group_ids=g.unsqueeze(-1)).squeeze(-1)
+        except Exception:
+            pv_dec_t = pv
+
+        # move to CPU for numpy-style metrics
+        g_cpu = g.detach().cpu()
+        yv_dec_all = yv_dec_t.detach().cpu()
+        pv_dec_all = pv_dec_t.detach().cpu()
+        yd_cpu = yd.detach().cpu() if yd is not None else None
+        pd_cpu = pd.detach().cpu() if pd is not None else None
+
+        uniq = torch.unique(g_cpu)
+        rows = []
+        eps = 1e-8
+        for gid in uniq.tolist():
+            m = g_cpu == gid
+            yvi = yv_dec_all[m]
+            pvi = pv_dec_all[m]
+            mae = (pvi - yvi).abs().mean().item()
+            mse = ((pvi - yvi) ** 2).mean().item()
+            rmse = mse ** 0.5
+            sigma2_p = torch.clamp(pvi.abs(), min=eps) ** 2
+            sigma2   = torch.clamp(yvi.abs(), min=eps) ** 2
+            ratio = sigma2_p / sigma2
+            qlike = (ratio - torch.log(ratio) - 1.0).mean().item()
+            acc = None
+            if yd_cpu is not None and pd_cpu is not None and m.sum() > 0:
+                ydi = yd_cpu[m]
+                pdi = pd_cpu[m]
+                try:
+                    if torch.isfinite(pdi).any() and (pdi.min() < 0 or pdi.max() > 1):
+                        pdi = torch.sigmoid(pdi)
+                except Exception:
+                    pdi = torch.sigmoid(pdi)
+                acc = ((pdi >= 0.5).int() == ydi.int()).float().mean().item()
+            name = self.id_to_name.get(int(gid), str(gid))
+            rows.append((name, mae, rmse, mse, qlike, acc, int(m.sum().item())))
+
+        overall_mae = (pv_dec_all - yv_dec_all).abs().mean().item()
+        overall_mse = ((pv_dec_all - yv_dec_all) ** 2).mean().item()
+        overall_rmse = overall_mse ** 0.5
+        sigma2_p_all = torch.clamp(pv_dec_all.abs(), min=eps) ** 2
+        sigma2_all   = torch.clamp(yv_dec_all.abs(), min=eps) ** 2
+        ratio_all    = sigma2_p_all / sigma2_all
+        overall_qlike = (ratio_all - torch.log(ratio_all) - 1.0).mean().item()
+
+        self._last_rows = sorted(rows, key=lambda r: r[-1], reverse=True)
+        self._last_overall = {
+            "mae": overall_mae,
+            "rmse": overall_rmse,
+            "mse": overall_mse,
+            "qlike": overall_qlike,
+            "yd": yd_cpu,
+            "pd": pd_cpu,
+        }
+
+    @torch.no_grad()
+    def on_fit_end(self, trainer, pl_module):
+        if self._last_rows is None or self._last_overall is None:
+            return
+        rows = self._last_rows
+        overall = self._last_overall
+        print("\nOverall decoded metrics (final):")
+        print(f"MAE: {overall['mae']:.6f} | RMSE: {overall['rmse']:.6f} | MSE: {overall['mse']:.6f} | QLIKE: {overall['qlike']:.6f}")
+
+        print("\nPer-asset validation metrics (top by samples):")
+        print("asset | MAE | RMSE | MSE | QLIKE | ACC | N")
+        for r in rows[: self.max_print]:
+            acc_str = "-" if r[5] is None else f"{r[5]:.3f}"
+            print(f"{r[0]} | {r[1]:.6f} | {r[2]:.6f} | {r[3]:.6f} | {r[4]:.6f} | {acc_str} | {r[6]}")
+
+        dir_overall = None
+        yd = overall.get("yd", None)
+        pd = overall.get("pd", None)
+        if yd is not None and pd is not None and yd.numel() > 0 and pd.numel() > 0:
+            try:
+                L = min(yd.numel(), pd.numel())
+                yd1 = yd[:L].float()
+                pd1 = pd[:L]
+                try:
+                    if torch.isfinite(pd1).any() and (pd1.min() < 0 or pd1.max() > 1):
+                        pd1 = torch.sigmoid(pd1)
+                except Exception:
+                    pd1 = torch.sigmoid(pd1)
+                acc = ((pd1 >= 0.5).int() == yd1.int()).float().mean().item()
+                brier = ((pd1 - yd1) ** 2).mean().item()
+                auroc = None
+                try:
+                    from torchmetrics.classification import BinaryAUROC
+                    au = BinaryAUROC()
+                    auroc = float(au(pd1.detach().cpu(), yd1.detach().cpu()).item())
+                except Exception:
+                    auroc = None
+                dir_overall = {"accuracy": acc, "brier": brier, "auroc": auroc}
+                print("\nDirection (final):")
+                msg = f"Accuracy: {acc:.3f} | Brier: {brier:.4f}"
+                if auroc is not None:
+                    msg += f" | AUROC: {auroc:.3f}"
+                print(msg)
+            except Exception as e:
+                print(f"[WARN] Could not compute final direction metrics: {e}")
+
+        try:
+            import json
+            out = {
+                "decoded": True,
+                "overall": {k: v for k, v in overall.items() if k in ("mae","rmse","mse","qlike")},
+                "direction_overall": dir_overall,
+                "per_asset": [
+                    {"asset": r[0], "mae": r[1], "rmse": r[2], "mse": r[3], "qlike": r[4], "acc": r[5], "n": r[6]}
+                    for r in rows
+                ],
+            }
+            path = str(LOCAL_RUN_DIR / f"tft_val_asset_metrics_e{MAX_EPOCHS}_{RUN_SUFFIX}.json")
+            with open(path, "w") as f:
+                json.dump(out, f, indent=2)
+            print(f"✓ Saved per-asset validation metrics (decoded, final) → {path}")
+        except Exception as e:
+            print(f"[WARN] Could not save final per-asset metrics: {e}")
+            
+
+# -----------------------------------------------------------------------
+# Monkey-patch BaseModel.predict_step to support multi-target inference
+# -----------------------------------------------------------------------
+
+# Patch for TFT.py monkey-patch adjust
+def monkey_patch_predict_step():
+    from pytorch_forecasting.models.base._base_model import BaseModel
+    import torch
+
+    def _predict_step_multi(self, batch, batch_idx: int, dataloader_idx: int = 0):
+        """
+        Custom predict_step that returns *all* target heads.
+        Handles PF Output wrapper by extracting the underlying tensor.
+        """
+        # batch comes from TimeSeriesDataLoader: (x, y, weight)
+        x = batch[0] if isinstance(batch, (list, tuple)) else batch
+
+        with torch.no_grad():
+            y_hat = self(x)
+
+        # ――― Extract raw tensor(s) ―――
+        pred = y_hat.prediction if hasattr(y_hat, "prediction") else y_hat
+
+        # If PF returned a list (one tensor per target), stack them
+        if isinstance(pred, (list, tuple)):
+            processed = []
+            for p in pred:                    # each p: [B,1,7] or [B,1,1,7]
+                # squeeze singleton prediction‑length or target dims
+                if p.ndim == 4 and p.shape[2] == 1:
+                    p = p.squeeze(2)          # [B,1,7]
+                if p.ndim == 3 and p.shape[1] == 1:
+                    p = p.squeeze(1)          # [B,7]
+                # ---- harmonise classification logits (size 1 or 2) -------------
+                # if this target is a single logit (shape [...,1]), repeat to 7
+                if p.ndim >= 2 and p.shape[-1] == 1:
+                    p = p.repeat_interleave(7, dim=-1)      # [...,7]
+                # If this target is a classification head with 2 logits,
+                # convert to the probability of the positive class
+                # and replicate it so the last dimension has length 7
+                elif p.ndim >= 2 and p.shape[-1] == 2:
+                    # convert logits -> prob of class 1
+                    pos_prob = p.softmax(-1)[..., 1]          # shape [...,]
+                    # make last dim explicit then repeat to length 7
+                    pos_prob = pos_prob.unsqueeze(-1)         # [...,1]
+                    p = pos_prob.repeat_interleave(7, dim=-1) # [...,7]
+                processed.append(p)
+            pred = torch.stack(processed, dim=1)  # [B,n_targets,7]
+
+        # If tensor still has pred_len dim=1, squeeze it
+        if torch.is_tensor(pred) and pred.ndim == 4 and pred.shape[2] == 1:
+            pred = pred.squeeze(2)             # [B,n_targets,7]
+
+        return {"prediction": pred, "x": x}
+
+    BaseModel.predict_step = _predict_step_multi
+
+# Activate the patch once at import time
+monkey_patch_predict_step()
+
+# -----------------------------------------------------------------------
+
+
+
+# -----------------------------------------------------------------------
+# Disable PF's plotting/logging hooks to avoid shape-related crashes
+# during sanity check / validation. We still compute losses & metrics.
+# -----------------------------------------------------------------------
+try:
+    from pytorch_forecasting.models.base._base_model import BaseModel
+    import matplotlib.pyplot as plt
+
+    def _noop_plot(self, *args, **kwargs):
+        # return an empty Figure so callers expecting a Figure won't error
+        fig = plt.figure()
+        return fig
+
+    def _noop_log_prediction(self, *args, **kwargs):
+        return  # do nothing
+
+    BaseModel.plot_prediction = _noop_plot
+    BaseModel.log_prediction = _noop_log_prediction
+    print("[INFO] Disabled PF plotting/logging for validation to avoid size-mismatch errors.")
+except Exception as _e:
+    print(f"[WARN] Could not disable PF plotting: {_e}")
+
+# -----------------------------------------------------------------------
+# Compute / device configuration (optimised for NVIDIA L4 on GCP)
+# -----------------------------------------------------------------------
+if torch.cuda.is_available():
+    ACCELERATOR = "gpu"
+    DEVICES = "auto"          # use all visible GPUs if more than one
+    PRECISION = "bf16-mixed"  # L4 supports fast bf16
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+    except Exception:
+        pass
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
+elif getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+    ACCELERATOR = "mps"
+    DEVICES = 1
+    PRECISION = "16-mixed"
+else:
+    ACCELERATOR = "cpu"
+    DEVICES = 1
+    PRECISION = 32
+
+# -----------------------------------------------------------------------
+# CLI overrides for common CONFIG knobs
+# -----------------------------------------------------------------------
+parser = argparse.ArgumentParser(description="TFT training with optional permutation importance")
+parser.add_argument("--max_encoder_length", type=int, default= 64, help="Max encoder length")
+parser.add_argument("--max_epochs", type=int, default=20, help="Max training epochs")
+parser.add_argument("--batch_size", type=int, default=1024, help="Training batch size")
+parser.add_argument("--early_stop_patience", "--patience", type=int, default=20, help="Early stopping patience")
+parser.add_argument("--perm_len", type=int, default=288, help="Permutation block length for importance")
+parser.add_argument(
+    "--enable_perm_importance", "--enable-feature-importance",
+    type=lambda s: str(s).lower() in ("1","true","t","yes","y","on"),
+    default=None,
+    help="Enable permutation feature importance (true/false)"
+)
+ARGS = parser.parse_args()
+
+# -----------------------------------------------------------------------
+# CONFIG – tweak as required (GCS-aware)
+# -----------------------------------------------------------------------
+GCS_BUCKET = os.environ.get("GCS_BUCKET", "river-ml-bucket")
+GCS_DATA_PREFIX = f"gs://{GCS_BUCKET}/CleanedData"
+GCS_OUTPUT_PREFIX = f"gs://{GCS_BUCKET}/Dissertation/Feature_Ablation"
+
+# Local ephemerals (good for GCE/Vertex)
+LOCAL_DATA_DIR = Path(os.environ.get("LOCAL_DATA_DIR", "/tmp/data/CleanedData"))
+LOCAL_OUTPUT_DIR = Path(os.environ.get("LOCAL_OUTPUT_DIR", "/tmp/feature_ablation"))
+LOCAL_RUN_DIR = Path(os.environ.get("LOCAL_RUN_DIR", "/tmp/tft_run"))
+LOCAL_LOG_DIR = LOCAL_RUN_DIR / "lightning_logs"
+LOCAL_CKPT_DIR = LOCAL_RUN_DIR / "checkpoints"
+for p in [LOCAL_DATA_DIR, LOCAL_OUTPUT_DIR, LOCAL_CKPT_DIR, LOCAL_LOG_DIR]:
+    p.mkdir(parents=True, exist_ok=True)
+
+# ---------------- TensorBoard Logger ----------------
+logger = TensorBoardLogger(save_dir=str(LOCAL_LOG_DIR.parent), name=LOCAL_LOG_DIR.name)
+
+# Remote checkpoint prefix on GCS
+CKPT_GCS_PREFIX = f"{GCS_OUTPUT_PREFIX}/checkpoints"
+
+# ---- Upload helper (GCS-aware) ----
+def upload_file_to_gcs(local_path: str, gcs_uri: str):
+    if fs is None:
+        print(f"[WARN] GCS not available (gcsfs not installed); skipping upload: {gcs_uri}")
+        return
+    try:
+        with fsspec.open(gcs_uri, "wb") as f_out, open(local_path, "rb") as f_in:
+            shutil.copyfileobj(f_in, f_out)
+        print(f"✓ Uploaded {local_path} → {gcs_uri}")
+    except Exception as e:
+        print(f"[WARN] Failed to upload {local_path} to {gcs_uri}: {e}")
+
+
+# Prefer GCS if the files exist there
+try:
+    fs = fsspec.filesystem("gcs")
+except Exception:
+    fs = None  # gcsfs not installed / protocol unavailable
+
+def gcs_exists(path: str) -> bool:
+    if fs is None:
+        return False
+    try:
+        return fs.exists(path)
+    except Exception:
+        return False
+
+TRAIN_URI = f"{GCS_DATA_PREFIX}/universal_train.parquet"
+VAL_URI   = f"{GCS_DATA_PREFIX}/universal_val.parquet"
+TEST_URI  = f"{GCS_DATA_PREFIX}/universal_test.parquet"
+
+if not all(map(gcs_exists, [TRAIN_URI, VAL_URI, TEST_URI])):
+    # Fallback to your original local paths
+    DATA_DIR = Path("/Users/riverwest-gomila/Desktop/Data/CleanedData")
+    TRAIN_FILE = DATA_DIR / "universal_train.parquet"
+    VAL_FILE   = DATA_DIR / "universal_val.parquet"
+    TEST_FILE  = DATA_DIR / "universal_test.parquet"
+    READ_PATHS = [str(TRAIN_FILE), str(VAL_FILE), str(TEST_FILE)]
+else:
+    READ_PATHS = [TRAIN_URI, VAL_URI, TEST_URI]
+
+def get_resume_ckpt_path():
+    # Prefer newest local checkpoint
+    try:
+        local_ckpts = sorted(LOCAL_CKPT_DIR.glob("*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if local_ckpts:
+            return str(local_ckpts[0])
+    except Exception:
+        pass
+    # Fallback: try GCS "last.ckpt" then the lexicographically latest .ckpt
+    try:
+        if fs is not None:
+            last_uri = f"{CKPT_GCS_PREFIX}/last.ckpt"
+            if fs.exists(last_uri):
+                dst = LOCAL_CKPT_DIR / "last.ckpt"
+                with fsspec.open(last_uri, "rb") as f_in, open(dst, "wb") as f_out:
+                    shutil.copyfileobj(f_in, f_out)
+                return str(dst)
+            # else get the latest by name (filenames contain ISO timestamps)
+            entries = fs.glob(f"{CKPT_GCS_PREFIX}/*.ckpt") or []
+            if entries:
+                latest = sorted(entries)[-1]
+                dst = LOCAL_CKPT_DIR / Path(latest).name
+                with fsspec.open(latest, "rb") as f_in, open(dst, "wb") as f_out:
+                    shutil.copyfileobj(f_in, f_out)
+                return str(dst)
+    except Exception as e:
+        print(f"[WARN] Could not fetch resume checkpoint from GCS: {e}")
+    return None
+
+def mirror_local_ckpts_to_gcs():
+    if fs is None:
+        print("[WARN] GCS not available; skipping checkpoint upload.")
+        return
+    try:
+        for p in LOCAL_CKPT_DIR.glob("*.ckpt"):
+            remote = f"{CKPT_GCS_PREFIX}/{p.name}"
+            with fsspec.open(remote, "wb") as f_out, open(p, "rb") as f_in:
+                shutil.copyfileobj(f_in, f_out)
+            print(f"✓ Mirrored checkpoint {p} → {remote}")
+    except Exception as e:
+        print(f"[WARN] Failed to mirror checkpoints: {e}")
+
+class MirrorCheckpoints(pl.Callback):
+    def on_validation_end(self, trainer, pl_module):
+        mirror_local_ckpts_to_gcs()
+    def on_exception(self, trainer, pl_module, err):
+        mirror_local_ckpts_to_gcs()
+    def on_train_end(self, trainer, pl_module):
+        mirror_local_ckpts_to_gcs()
+
+GROUP_ID: List[str] = ["asset"]
+TIME_COL = "Time"
+TARGETS  = ["realised_vol", "direction"]
+
+MAX_ENCODER_LENGTH = 64
+MAX_PRED_LENGTH    = 1
+
+EMBEDDING_CARDINALITY = {}
+
+BATCH_SIZE   = 1024
+MAX_EPOCHS   = 20
+EARLY_STOP_PATIENCE = 20
+PERM_BLOCK_SIZE = 288
+
+# Artifacts are written locally then uploaded to GCS
+from datetime import datetime, timezone, timedelta
+RUN_SUFFIX = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+MODEL_SAVE_PATH = (LOCAL_CKPT_DIR / f"tft_realised_vol_e{MAX_EPOCHS}_{RUN_SUFFIX}.ckpt")
+
+SEED = 50
+WEIGHT_DECAY = 0.00578350719515325     # weight decay for AdamW
+GRADIENT_CLIP_VAL = 0.78    # gradient clipping value for Trainer
+# Feature-importance controls
+ENABLE_FEATURE_IMPORTANCE = True   # gate FI so you can toggle it
+FI_MAX_BATCHES = 25               # number of val batches to sample for FI
+
+# ---- Apply CLI overrides (only when provided) ----
+if ARGS.batch_size is not None:
+    BATCH_SIZE = int(ARGS.batch_size)
+if ARGS.max_encoder_length is not None:
+    MAX_ENCODER_LENGTH = int(ARGS.max_encoder_length)
+if ARGS.max_epochs is not None:
+    MAX_EPOCHS = int(ARGS.max_epochs)
+if ARGS.early_stop_patience is not None:
+    EARLY_STOP_PATIENCE = int(ARGS.early_stop_patience)
+if ARGS.perm_len is not None:
+    PERM_BLOCK_SIZE = int(ARGS.perm_len)
+if ARGS.enable_perm_importance is not None:
+    ENABLE_FEATURE_IMPORTANCE = bool(ARGS.enable_perm_importance)
+
+# -----------------------------------------------------------------------
+# Utility functions
+# -----------------------------------------------------------------------
+def load_split(path: str) -> pd.DataFrame:
+    """
+    Load a parquet split and guarantee we have usable `id` and timestamp columns.
+
+    1. Converts `TIME_COL` to pandas datetime.
+    2. Ensures an identifier column called `id` (or whatever `GROUP_ID[0]` is).
+       If not present, auto-detects common synonyms and renames
+    """
+    path_str = str(path)
+    df = pd.read_parquet(path)
+    df = df.reset_index(drop=True).copy()
+
+    # --- convert timestamp ---
+    df[TIME_COL] = pd.to_datetime(df[TIME_COL])
+
+    # --- identifier column handling ---
+    if GROUP_ID[0] not in df.columns:
+        cand = next(
+            (c for c in df.columns if c.lower() in
+             {"symbol", "ticker", "asset", "security_id", "instrument"}), None
+        )
+        if cand is None:
+            raise ValueError(
+                f"No identifier column '{GROUP_ID[0]}' in {path_str}. Edit GROUP_ID or rename your column."
+            )
+
+        df.rename(columns={cand: GROUP_ID[0]}, inplace=True)
+        print(f"[INFO] Renamed '{cand}' ➜ '{GROUP_ID[0]}'")
+
+    df[GROUP_ID[0]] = df[GROUP_ID[0]].astype(str)
+
+    # --- target alias handling ------------------------------------------------
+    TARGET_ALIASES = {
+        "realised_vol": ["Realised_Vol", "rs_sigma", "realized_vol", "rv"],
+        "direction":    ["Sign_Label", "sign_label", "Direction", "direction_label"],
+    }
+    for canonical, aliases in TARGET_ALIASES.items():
+        if canonical not in df.columns:
+            alias_found = next((a for a in aliases if a in df.columns), None)
+            if alias_found:
+                df.rename(columns={alias_found: canonical}, inplace=True)
+                print(f"[INFO] Renamed '{alias_found}' ➜ '{canonical}'")
+            else:
+                # Only warn; the downstream code will raise if the column is truly required
+                print(f"[WARN] Column '{canonical}' not found in {path_str} and no alias detected.")
+
+    return df
+
+
+def add_time_idx(df: pd.DataFrame) -> pd.DataFrame:
+    """Add monotonically increasing integer time index per asset."""
+    df = df.sort_values(GROUP_ID + [TIME_COL])
+    df["time_idx"] = (
+        df.groupby(GROUP_ID)
+          .cumcount()
+          .astype("int64")
+    )
+    return df
+
+# -----------------------------------------------------------------------
+# Calendar features (help the model learn intraday/weekly seasonality)
+# -----------------------------------------------------------------------
+def add_calendar_features(df: pd.DataFrame) -> pd.DataFrame:
+    minute_of_day = df[TIME_COL].dt.hour * 60 + df[TIME_COL].dt.minute
+    df["sin_tod"] = np.sin(2 * np.pi * minute_of_day / 1440.0).astype("float32")
+    df["cos_tod"] = np.cos(2 * np.pi * minute_of_day / 1440.0).astype("float32")
+    dow = df[TIME_COL].dt.dayofweek
+    df["sin_dow"] = np.sin(2 * np.pi * dow / 7.0).astype("float32")
+    df["cos_dow"] = np.cos(2 * np.pi * dow / 7.0).astype("float32")
+    df["Is_Weekend"] = (dow >= 5).astype("int8")
+    return df
+
+
+# -----------------------------------------------------------------------
+# Data preparation
+# -----------------------------------------------------------------------
+if __name__ == "__main__":
+    print(
+        f"[CONFIG] batch_size={BATCH_SIZE} | encoder={MAX_ENCODER_LENGTH} | epochs={MAX_EPOCHS} | "
+        f"patience={EARLY_STOP_PATIENCE} | perm_len={PERM_BLOCK_SIZE} | "
+        f"perm_importance={'on' if ENABLE_FEATURE_IMPORTANCE else 'off'}"
+    )
+    print("▶ Loading data …")
+    train_df = add_time_idx(load_split(READ_PATHS[0]))
+    val_df   = add_time_idx(load_split(READ_PATHS[1]))
+    test_df  = add_time_idx(load_split(READ_PATHS[2]))
+    # -------------------------------------------------------------------
+    # Compute per‑asset median realised_vol scale (rv_scale) **once** on the TRAIN split
+    # and attach it to every split. This is used only as a **fallback** for manual decode
+    # if a normaliser decode is not available.
+    # -------------------------------------------------------------------
+    asset_scales = (
+        train_df.groupby("asset", observed=True)["realised_vol"]
+                .median()
+                .clip(lower=1e-8)                 # guard against zeros
+                .rename("rv_scale")
+                .reset_index()
+    )
+
+    # Attach rv_scale without using the deprecated/invalid `inplace` kwarg
+    asset_scale_map = asset_scales.set_index("asset")["rv_scale"]
+    for df in (train_df, val_df, test_df):
+        # map() preserves the original row order and keeps dtype float64
+        df["rv_scale"] = df["asset"].map(asset_scale_map)
+        # If an asset appears only in val/test, fall back to overall median
+        df["rv_scale"].fillna(asset_scale_map.median(), inplace=True)
+
+    # Add calendar features to all splits
+    train_df = add_calendar_features(train_df)
+    val_df   = add_calendar_features(val_df)
+    test_df  = add_calendar_features(test_df)
+
+
+    # -----------------------------------------------------------------------
+    # Feature definitions
+    # -----------------------------------------------------------------------
+    static_categoricals = GROUP_ID
+    static_reals: List[str] = []
+
+    base_exclude = set(GROUP_ID + [TIME_COL, "time_idx", "rv_scale"] + TARGETS)
+
+    all_numeric = [c for c, dt in train_df.dtypes.items()
+                   if (c not in base_exclude) and pd.api.types.is_numeric_dtype(dt)]
+
+    # Specify future-known and unknown real features
+    calendar_cols = ["sin_tod", "cos_tod", "sin_dow", "cos_dow"]
+    time_varying_known_reals = calendar_cols + ["Is_Weekend"]
+    time_varying_unknown_reals = [c for c in all_numeric if c not in (calendar_cols + ["Is_Weekend"]) ]
+
+
+
+    # -----------------------------------------------------------------------
+    # TimeSeriesDataSets
+    # -----------------------------------------------------------------------
+    def build_dataset(df: pd.DataFrame, predict: bool) -> TimeSeriesDataSet:
+        return TimeSeriesDataSet(
+            df,
+            time_idx="time_idx",
+            target=TARGETS,
+            group_ids=GROUP_ID,
+            max_encoder_length=MAX_ENCODER_LENGTH,
+            max_prediction_length=MAX_PRED_LENGTH,
+            # ------------------------------------------------------------------
+            # Target normalisation
+            #   • realised_vol → GroupNormalizer(asinh, per‑asset scaling)
+            #   • direction    → identity (classification logits)
+            # ------------------------------------------------------------------
+            target_normalizer = MultiNormalizer([
+                GroupNormalizer(
+                    groups=GROUP_ID,
+                    center=False,
+                    scale_by_group=True,
+                    transformation="asinh",
+                ),
+                TorchNormalizer(method="identity", center=False),   # direction
+            ]),
+            static_categoricals=static_categoricals,
+            static_reals=static_reals,
+            time_varying_known_reals=time_varying_known_reals,   # known at prediction time
+            time_varying_unknown_reals=time_varying_unknown_reals # same set, allows learning lagged targets
+            ,
+            add_relative_time_idx=True,
+            add_target_scales=True,
+            add_encoder_length=True,
+            allow_missing_timesteps=True,
+            predict_mode=predict
+        )
+
+
+    print("▶ Building TimeSeriesDataSets …")
+    training_dataset = build_dataset(train_df, predict=False)
+    validation_dataset = build_dataset(val_df, predict=False)
+    # use predict=False so we obtain one sample **per time‑step**, not just the last step of each series
+    test_dataset = build_dataset(test_df, predict=False)
+
+    batch_size = min(BATCH_SIZE, len(training_dataset))
+
+    worker_cnt = max(2, (os.cpu_count() or 4) - 1)
+    pin = torch.cuda.is_available()
+
+    test_loader = test_dataset.to_dataloader(
+        train=False,
+        batch_size=batch_size,
+        num_workers=worker_cnt,
+        pin_memory=pin,
+    )
+
+    train_dataloader = training_dataset.to_dataloader(
+        train=True,
+        batch_size=batch_size,
+        num_workers=worker_cnt,
+        persistent_workers=True,
+        prefetch_factor=2,
+        pin_memory=pin,
+    )
+    val_dataloader = validation_dataset.to_dataloader(
+        train=False,
+        batch_size=batch_size,
+        num_workers=worker_cnt,
+        persistent_workers=True,
+        prefetch_factor=2,
+        pin_memory=pin,
+    )
+
+    # ---- derive id→asset-name mapping for callbacks ----
+    asset_vocab = (
+        training_dataset.get_parameters()["categorical_encoders"]["asset"].classes_
+    )
+    rev_asset = {i: lbl for i, lbl in enumerate(asset_vocab)}
+
+
+    # -----------------------------------------------------------------------
+    # Model
+    # -----------------------------------------------------------------------
+    seed_everything(SEED, workers=True)
+
+    # Loss and output_size for multi-target: realised_vol (quantile regression), direction (classification)
+
+    tft = TemporalFusionTransformer.from_dataset(
+        training_dataset,
+        hidden_size=64,
+        attention_head_size=2,
+        dropout=0.0833704625250354,
+        hidden_continuous_size=16,
+        learning_rate=0.0017978228305103793,
+        optimizer="adamw",
+        weight_decay=WEIGHT_DECAY,
+        # 7 quantiles for vol + 1 logit for direction
+        output_size=[7, 1],
+        loss=LearnableMultiTaskLoss(
+            loss_vol=AsymmetricQuantileLoss(
+                quantiles=[0.05, 0.165, 0.25, 0.5, 0.75, 0.835, 0.95],
+                underestimation_init=1.115,
+                learnable_under=True,
+                reg_lambda=1e-3,
+            ),
+            loss_dir=LabelSmoothedBCE(smoothing=0.1, init_pos_weight=1.2, ema_beta=0.99, pw_min=0.2, pw_max=5.0),
+            init_weights=(1.0, 0.3),  # weights=[vol, dir] → vol=1.0, dir=0.3
+        ),
+        logging_metrics=[],
+        log_interval=50,
+        log_val_interval=10,
+        reduce_on_plateau_patience=5,
+        reduce_on_plateau_min_lr = 1e-5,
+    )
+
+    # Replace default linear heads with the dual-MLP head
+    dual_head = DualHead(hidden_size=int(getattr(tft.hparams, "hidden_size", 64)))
+    # Initialize direction head bias using p0 derived from pos_weight=1.2
+    p0 = 1.0 / (1.0 + 1.2)
+    bias0 = float(np.log(p0 / (1.0 - p0)))
+    with torch.no_grad():
+        dual_head.dir[-1].bias.data.fill_(bias0)
+    tft.output_layer = DualOutputModule(dual_head.vol, dual_head.dir)
+    # -------------------------------------------------------------------
+    # Override PF's internal MultiLoss with our custom learnable multi-task loss
+    # (PF wraps losses into MultiLoss when output_size is a list; that wrapper
+    # applies generic shape checks which conflict with our quantile head.)
+    # By assigning directly to `tft.loss`, Lightning will use this criterion in
+    # training/validation instead of the PF MultiLoss.
+    # -------------------------------------------------------------------
+    tft.loss = LearnableMultiTaskLoss(
+        loss_vol=AsymmetricQuantileLoss(
+            quantiles=[0.05, 0.165, 0.25, 0.5, 0.75, 0.835, 0.95],
+            underestimation_init=1.115,
+            learnable_under=True,
+            reg_lambda=1e-3,
+        ),
+        loss_dir=LabelSmoothedBCE(
+            smoothing=0.1,
+            init_pos_weight=1.2,
+            ema_beta=0.99,
+            pw_min=0.2,
+            pw_max=5.0,
+        ),
+        init_weights=(1.0, 0.3),  # weights=[vol, dir] → vol=1.0, dir=0.3
+    )
+    # -----------------------------------------------------------------------
+    # Training
+    # -----------------------------------------------------------------------
+
+    class LossHistory(pl.Callback):
+        def __init__(self, path: str = str(LOCAL_RUN_DIR / f"tft_loss_history_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv")):
+            self.path = path
+            self.records = []
+
+        def on_train_epoch_end(self, trainer, pl_module):
+            loss = trainer.callback_metrics.get("train_loss_epoch")
+            if loss is not None:
+                self.records.append(
+                    {"epoch": trainer.current_epoch, "train_loss": float(loss)}
+                )
+
+        def on_train_end(self, trainer, pl_module):
+            if self.records:
+                import pandas as pd
+                pd.DataFrame(self.records).to_csv(self.path, index=False)
+                print(f"✓ Saved loss history → {self.path}")
+                try:
+                    upload_file_to_gcs(self.path, f"{GCS_OUTPUT_PREFIX}/{os.path.basename(self.path)}")
+                except Exception as e:
+                    print(f"[WARN] Could not upload loss history: {e}")
+
+
+    class EpochPrinter(pl.Callback):
+        """Print lightweight, periodic training status updates per epoch.
+        Shows epoch number, train/val loss (if available), and current LR.
+        """
+        def __init__(self, total_epochs: int):
+            super().__init__()
+            self.total = int(total_epochs)
+
+        def _format_lr(self, trainer):
+            try:
+                opt = trainer.optimizers[0]
+                lr = opt.param_groups[0].get("lr", None)
+                return None if lr is None else f"{float(lr):.2e}"
+            except Exception:
+                return None
+
+        def on_train_epoch_start(self, trainer, pl_module):
+            # +1 to present human-friendly epoch numbering
+            print(f"▶ Epoch {trainer.current_epoch + 1}/{self.total} — training …")
+
+        def on_train_epoch_end(self, trainer, pl_module):
+            metrics = trainer.callback_metrics
+            train_loss = metrics.get("train_loss_epoch")
+            val_loss = metrics.get("val_loss")
+            lr_str = self._format_lr(trainer)
+            parts = [f"✓ Epoch {trainer.current_epoch + 1}/{self.total} done"]
+            if train_loss is not None:
+                try:
+                    parts.append(f"train_loss={float(train_loss):.5f}")
+                except Exception:
+                    pass
+            if val_loss is not None:
+                try:
+                    parts.append(f"val_loss={float(val_loss):.5f}")
+                except Exception:
+                    pass
+            if lr_str is not None:
+                parts.append(f"lr={lr_str}")
+            print(" | ".join(parts))
+
+        def on_validation_end(self, trainer, pl_module):
+            # Print the latest best checkpoint path if available
+            try:
+                # `best_ckpt_cb` is defined in the same module where callbacks are assembled
+                from builtins import best_ckpt_cb  # noqa: F401 (hint to linters; safe at runtime)
+            except Exception:
+                pass
+            try:
+                ckpt_cb = None
+                for cb in trainer.callbacks:
+                    if isinstance(cb, pl.callbacks.ModelCheckpoint):
+                        ckpt_cb = cb
+                        break
+                if ckpt_cb and getattr(ckpt_cb, "best_model_path", ""):
+                    print(f"↳ Best so far: {ckpt_cb.best_model_path}")
+            except Exception:
+                pass
+
+    best_ckpt_cb = ModelCheckpoint(
+        monitor="val_loss",
+        mode="min",
+        save_top_k=1,
+        save_last=True,  # writes last.ckpt
+        filename=f"tft_best_e{MAX_EPOCHS}_{RUN_SUFFIX}",
+        dirpath=str(LOCAL_CKPT_DIR),
+    )
+    periodic_ckpt_cb = ModelCheckpoint(
+        every_n_train_steps=2000,              # ≈ frequent snapshots
+        train_time_interval=timedelta(minutes=10),  # or at least every 10 minutes
+        save_top_k=-1,                         # keep all periodic snapshots
+        dirpath=str(LOCAL_CKPT_DIR),
+        filename="tft-snap-{epoch:02d}-{step:06d}",
+    )
+    ckpt_uploader_cb = MirrorCheckpoints()
+
+    callbacks = [
+        best_ckpt_cb,
+        periodic_ckpt_cb,
+        ckpt_uploader_cb,
+        EpochPrinter(MAX_EPOCHS),
+        LearningRateMonitor(logging_interval="epoch"),
+        EarlyStopping(monitor="val_loss", patience=EARLY_STOP_PATIENCE, mode="min"),
+        LossHistory(),
+        PerAssetMetrics(
+            rev_asset,
+            vol_normalizer=(training_dataset.target_normalizer.normalizers[0]
+                            if hasattr(training_dataset.target_normalizer, "normalizers")
+                            else training_dataset.target_normalizer),
+        ),
+    ]
+    trainer = Trainer(
+        logger=logger,
+        max_epochs=MAX_EPOCHS,
+        gradient_clip_val=GRADIENT_CLIP_VAL,
+        callbacks=callbacks,
+        precision=PRECISION,
+        accelerator=ACCELERATOR,
+        devices=DEVICES,
+        strategy="auto",
+        detect_anomaly=False,
+    )
+
+    print("▶ Training TFT …")
+    print(type(tft))
+    print(isinstance(tft, torch.nn.Module))
+    print(isinstance(tft, pl.LightningModule))
+    resume_ckpt = get_resume_ckpt_path()
+    if resume_ckpt:
+        print(f"▶ Resuming from checkpoint: {resume_ckpt}")
+    trainer.fit(tft, train_dataloader, val_dataloader, ckpt_path=resume_ckpt)
+    # Load best checkpoint (by val_loss) if available
+    if best_ckpt_cb.best_model_path:
+        try:
+            tft = TemporalFusionTransformer.load_from_checkpoint(best_ckpt_cb.best_model_path)
+            # Reattach custom dual head and bias (matches training-time architecture)
+            dual_head = DualHead(hidden_size=int(getattr(tft.hparams, "hidden_size", 64)))
+            p0 = 1.0 / (1.0 + 1.2)
+            bias0 = float(np.log(p0 / (1.0 - p0)))
+            with torch.no_grad():
+                dual_head.dir[-1].bias.data.fill_(bias0)
+            tft.output_layer = DualOutputModule(dual_head.vol, dual_head.dir)
+            print(f"✓ Loaded best model from: {best_ckpt_cb.best_model_path}")
+        except Exception as e:
+            print(f"[WARN] Could not load best checkpoint: {e}")
+
+    # Save checkpoint
+    trainer.save_checkpoint(str(MODEL_SAVE_PATH))
+    mirror_local_ckpts_to_gcs()
+
+    # -----------------------------------------------------------------------
+    # Evaluation on test set (same process, no multiprocessing issues)
+    # -----------------------------------------------------------------------
+    print("▶ Evaluating …")
+    test_metrics = trainer.validate(
+        tft,
+        dataloaders=test_dataset.to_dataloader(
+            train=False,
+            batch_size=batch_size,
+            num_workers=0            # keep single‑process to avoid spawn issues
+        )
+    )
+    print("Test metrics:", test_metrics)
+        
+# -------------------------------------------------------------------
+# Permutation Feature Importance (validation loss delta)
+#   - permute within (asset, block_id) where block_id = time_idx // PERM_BLOCK_SIZE
+#   - rebuild validation dataset from the *training* spec to keep encoders/scalers identical
+# -------------------------------------------------------------------
+
+if __name__ == "__main__":
+    from pytorch_forecasting import TimeSeriesDataSet
+
+    print("▶ Permutation feature importance …")
+
+    # 1) Baseline val loss (uses your LearnableMultiTaskLoss)
+    baseline_row = trainer.validate(model=tft, dataloaders=val_dataloader, verbose=False)[0]
+    baseline_val_loss = float(baseline_row["val_loss"])
+    print(f"[BASELINE] val_loss = {baseline_val_loss:.6f}")
+
+    # 2) Candidate features to test (derive directly from our dataset spec)
+    # Use the features we explicitly passed into TimeSeriesDataSet instead of
+    # relying on `.get_parameters()` which can be empty/misaligned across PF versions.
+    candidates = list(dict.fromkeys(
+        static_reals + time_varying_known_reals + time_varying_unknown_reals
+    ))
+
+    # Never permute IDs, time, targets, or helper scales
+    do_not_touch = set(GROUP_ID + [TIME_COL, "time_idx"] + TARGETS + ["rv_scale"])        
+
+    # Keep only columns that exist in the validation dataframe and are safe to shuffle
+    features_to_test = [f for f in candidates if (f in val_df.columns and f not in do_not_touch)]
+
+    if not features_to_test:
+        raise RuntimeError("No candidate features to permute — check your dataset feature lists.")
+
+    def permute_within_blocks(df_in: pd.DataFrame, feature: str) -> pd.DataFrame:
+        """Shuffle 'feature' within (asset, block_id) groups to preserve local structure."""
+        df = df_in.copy()
+        if "time_idx" not in df.columns:
+            raise ValueError("time_idx not found in validation dataframe.")
+        df["_block_id"] = (df["time_idx"] // PERM_BLOCK_SIZE).astype(np.int64)
+        # group by (asset, block)
+        gcols = GROUP_ID + ["_block_id"]
+        # sample with a fresh seed per group for reproducibility but variability
+        rng = np.random.default_rng(12345)
+        df[feature] = (
+            df.groupby(gcols, group_keys=False)[feature]
+              .apply(lambda s: s.sample(frac=1.0, random_state=int(rng.integers(0, 2**31 - 1))))
+              .values
+        )
+        df.drop(columns=["_block_id"], inplace=True)
+        return df
+
+    results = []
+    for feat in features_to_test:
+        try:
+            # 3) Permute a single column on the raw val dataframe
+            val_perm = permute_within_blocks(val_df, feat)
+
+            # 4) Rebuild a validation dataset from the training spec (keeps encoders/scalers)
+            perm_ds = TimeSeriesDataSet.from_dataset(training_dataset, val_perm, predict=False, stop_randomization=True)
+            perm_dl = perm_ds.to_dataloader(train=False, batch_size=val_dataloader.batch_size, num_workers=0)
+
+            # 5) Evaluate the permuted loss
+            perm_row = trainer.validate(model=tft, dataloaders=perm_dl, verbose=False)[0]
+            perm_val_loss = float(perm_row["val_loss"]) 
+
+            results.append({
+                "feature": feat,
+                "baseline_val_loss": baseline_val_loss,
+                "perm_val_loss": perm_val_loss,
+                "delta_val_loss": perm_val_loss - baseline_val_loss,
+            })
+            print(f"  • {feat:>30s}  Δloss = {perm_val_loss - baseline_val_loss:+.6f}")
+        except Exception as e:
+            print(f"[WARN] Permutation failed for '{feat}': {e}")
+
+    # 6) Save CSV (sorted by importance: bigger Δloss = more important)
+    perm_df = pd.DataFrame(results).sort_values("delta_val_loss", ascending=False)
+    perm_path = LOCAL_OUTPUT_DIR / f"tft_permutation_importance_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv"
+    perm_df.to_csv(perm_path, index=False)
+    print(f"✓ Saved permutation importance → {perm_path}")
+    try:
+        upload_file_to_gcs(str(perm_path), f"{GCS_OUTPUT_PREFIX}/{perm_path.name}")
+    except Exception as e:
+        print(f"[WARN] Could not upload permutation importance: {e}")
+    print(perm_df.head(25).to_string(index=False))
