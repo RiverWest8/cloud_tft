@@ -870,11 +870,11 @@ else:
 # CLI overrides for common CONFIG knobs
 # -----------------------------------------------------------------------
 parser = argparse.ArgumentParser(description="TFT training with optional permutation importance", add_help=True)
-parser.add_argument("--max_encoder_length", type=int, default=64, help="Max encoder length")
-parser.add_argument("--max_epochs", type=int, default=1, help="Max training epochs")
-parser.add_argument("--batch_size", type=int, default=1024, help="Training batch size")
-parser.add_argument("--early_stop_patience", "--patience", type=int, default=20, help="Early stopping patience")
-parser.add_argument("--perm_len", type=int, default=288, help="Permutation block length for importance")
+parser.add_argument("--max_encoder_length", type=int, default=None, help="Max encoder length")
+parser.add_argument("--max_epochs", type=int, default=None, help="Max training epochs")
+parser.add_argument("--batch_size", type=int, default=None, help="Training batch size")
+parser.add_argument("--early_stop_patience", "--patience", type=int, default=None, help="Early stopping patience")
+parser.add_argument("--perm_len", type=int, default=None, help="Permutation block length for importance")
 parser.add_argument(
     "--enable_perm_importance", "--enable-feature-importance",
     type=lambda s: str(s).lower() in ("1","true","t","yes","y","on"),
