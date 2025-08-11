@@ -1582,7 +1582,13 @@ if __name__ == "__main__":
     # Load best checkpoint (by val_loss) if available
     if best_ckpt_cb.best_model_path:
         try:
-            tft = TemporalFusionTransformer.load_from_checkpoint(best_ckpt_cb.best_model_path)
+            # PF expects `loss` to be a Metric subclass when reconstructing. Provide a dummy and override after load.
+            from pytorch_forecasting.metrics import QuantileLoss as _PFQuantileLoss
+            tft = TemporalFusionTransformer.load_from_checkpoint(
+                best_ckpt_cb.best_model_path,
+                loss=_PFQuantileLoss(),
+                logging_metrics=[],
+            )
             # Reattach custom dual head and bias (matches training-time architecture)
             dual_head = DualHead(hidden_size=int(getattr(tft.hparams, "hidden_size", 64)))
             p0 = 1.0 / (1.0 + 1.2)
@@ -1590,9 +1596,26 @@ if __name__ == "__main__":
             with torch.no_grad():
                 dual_head.dir[-1].bias.data.fill_(bias0)
             tft.output_layer = DualOutputModule(dual_head.vol, dual_head.dir)
+            # Restore our custom multi-task loss
+            tft.loss = LearnableMultiTaskLoss(
+                loss_vol=AsymmetricQuantileLoss(
+                    quantiles=[0.05, 0.165, 0.25, 0.5, 0.75, 0.835, 0.95],
+                    underestimation_init=1.115,
+                    learnable_under=True,
+                    reg_lambda=1e-3,
+                ),
+                loss_dir=LabelSmoothedBCE(
+                    smoothing=0.1,
+                    init_pos_weight=1.2,
+                    ema_beta=0.99,
+                    pw_min=0.2,
+                    pw_max=5.0,
+                ),
+                init_weights=(1.0, 0.3),
+            )
             print(f"✓ Loaded best model from: {best_ckpt_cb.best_model_path}")
         except Exception as e:
-            print(f"[WARN] Could not load best checkpoint: {e}")
+            print(f"[WARN] Could not load best checkpoint even with PF Metric shim: {e}")
 
     # Save checkpoint
     trainer.save_checkpoint(str(MODEL_SAVE_PATH))
