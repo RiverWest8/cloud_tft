@@ -37,9 +37,6 @@ What the script does:
 Adjust hyper‑parameters in the CONFIG section below.
 """
 
-# -----------------------------------------------------------------------
-# Imports
-# -----------------------------------------------------------------------
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -55,6 +52,15 @@ from lightning.pytorch import Trainer, seed_everything
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+# ------------------ Added imports for new FI block ------------------
+import time
+import numpy as np
+import torch
+import json
+import os
+from datetime import datetime
+import subprocess
 
 from pytorch_forecasting import (
     TemporalFusionTransformer,
@@ -172,7 +178,7 @@ class LabelSmoothedBCE(nn.Module):
     - Initializes pos_weight from an Optuna-provided value.
     - Tracks an EMA of the positive rate over batches and updates pos_weight.
     """
-    def __init__(self, smoothing: float = 0.1, init_pos_weight: float = 1.2,
+    def __init__(self, smoothing: float = 0.1, init_pos_weight: float = 1.4,
                  ema_beta: float = 0.99, pw_min: float = 0.2, pw_max: float = 5.0):
         super().__init__()
         self.smoothing = float(smoothing)
@@ -466,6 +472,25 @@ class FixedMultiTaskLoss(nn.Module):
             return [vol, torch.sigmoid(d)]
         return [parameters]
 
+
+# ---------------------------------------------------------------------
+# Probability-space BCE loss with optional pos_weight
+# ---------------------------------------------------------------------
+class WeightedBCELoss(nn.Module):
+    """Binary cross-entropy on probabilities (no logits), with optional pos_weight.
+    Expects y_pred to already be in [0,1].
+    """
+    def __init__(self, pos_weight: float = 1.17, eps: float = 1e-7):
+        super().__init__()
+        self.pos_weight = float(pos_weight)
+        self.eps = float(eps)
+    def forward(self, y_pred, y_true):
+        y = y_true.float()
+        p = torch.clamp(y_pred, self.eps, 1.0 - self.eps)
+        # per-element weighted BCE on probabilities
+        loss = -( self.pos_weight * y * torch.log(p) + (1.0 - y) * torch.log(1.0 - p) )
+        return loss.mean()
+
 # -----------------------------------------------------------------------
 # Mini-MLP dual head: one branch for volatility quantiles, one for direction logit
 # -----------------------------------------------------------------------
@@ -479,13 +504,17 @@ class DualHead(nn.Module):
             nn.Dropout(0.10),
             nn.Linear(h, quantiles),
         )
+        # Direction head outputs probabilities (no logits)
         dir_out = 1 if dir_classes == 2 else int(dir_classes)
-        self.dir = nn.Sequential(
+        dir_layers = [
             nn.Linear(hidden_size, h),
             nn.ReLU(),
             nn.Dropout(0.10),
-            nn.Linear(h, dir_out),  # 1 for binary logit; C for multiclass
-        )
+            nn.Linear(h, dir_out),
+        ]
+        if dir_out == 1:
+            dir_layers.append(nn.Sigmoid())
+        self.dir = nn.Sequential(*dir_layers)
 
     def forward(self, x):
         vol_out = self.vol(x)
@@ -1125,6 +1154,9 @@ else:
 # -----------------------------------------------------------------------
 # CLI overrides for common CONFIG knobs
 # -----------------------------------------------------------------------
+# -----------------------------------------------------------------------
+# CLI overrides for common CONFIG knobs
+# -----------------------------------------------------------------------
 parser = argparse.ArgumentParser(description="TFT training with optional permutation importance", add_help=True)
 parser.add_argument("--max_encoder_length", type=int, default=None, help="Max encoder length")
 parser.add_argument("--max_epochs", type=int, default=None, help="Max training epochs")
@@ -1149,8 +1181,7 @@ parser.add_argument("--prefetch_factor", type=int, default=8, help="DataLoader p
 # Performance / input control
 parser.add_argument("--check_val_every_n_epoch", type=int, default=1, help="Validate every N epochs")
 parser.add_argument("--log_every_n_steps", type=int, default=200, help="How often to log train steps")
-parser.add_argument("--fi_max_batches", type=int, default=None,
-                    help="Max number of validation batches to use for feature importance (baseline + per-feature). 0 or None = use all.")
+parser.add_argument("--fi_max_batches", type=int, default=20, help="Max val batches per feature in FI.")
 # Parse known args so stray platform args do not crash the script
 ARGS, _UNKNOWN = parser.parse_known_args()
 
@@ -1579,10 +1610,10 @@ if __name__ == "__main__":
         attention_head_size=2,
         dropout=0.0833704625250354,
         hidden_continuous_size=16,
-        learning_rate=0.0024978228305103793,
+        learning_rate=0.0034978228305103793,
         optimizer="adamw",
         weight_decay=WEIGHT_DECAY,
-        # 7 quantiles for vol + 1 logit for direction
+        # 7 quantiles for vol + 1 prob for direction
         output_size=[7, 1],
         loss=FixedMultiTaskLoss(
             loss_vol=AsymmetricQuantileLoss(
@@ -1591,8 +1622,8 @@ if __name__ == "__main__":
                 learnable_under=False,
                 reg_lambda=1e-3,
             ),
-            loss_dir=nn.BCEWithLogitsLoss(pos_weight=torch.tensor(1.2)),
-            weights=(1.0, 1.0),
+            loss_dir=WeightedBCELoss(pos_weight=1.3),
+            weights=(1, 0.2),
         ),
         logging_metrics=[],
         log_interval=50,
@@ -1603,11 +1634,18 @@ if __name__ == "__main__":
 
     # Replace default linear heads with the dual-MLP head
     dual_head = DualHead(hidden_size=int(getattr(tft.hparams, "hidden_size", 64)))
-    # Initialize direction head bias using p0 derived from pos_weight=1.2
-    p0 = 1.0 / (1.0 + 1.2)
+    # Initialize direction head bias using p0 derived from pos_weight=1.3
+    p0 = 1.0 / (1.0 + 1.3)
     bias0 = float(np.log(p0 / (1.0 - p0)))
     with torch.no_grad():
-        dual_head.dir[-1].bias.data.fill_(bias0)
+        # set bias on the final Linear layer (now at index -2 since Sigmoid is last)
+        last_linear = None
+        for m in reversed(dual_head.dir):
+            if isinstance(m, nn.Linear):
+                last_linear = m
+                break
+        if last_linear is not None and last_linear.bias is not None:
+            last_linear.bias.data.fill_(bias0)
     tft.output_layer = DualOutputModule(dual_head.vol, dual_head.dir)
     # -------------------------------------------------------------------
     # Override PF's internal MultiLoss with our custom learnable multi-task loss
@@ -1623,8 +1661,8 @@ if __name__ == "__main__":
             learnable_under=False,
             reg_lambda=1e-3,
         ),
-        loss_dir=nn.BCEWithLogitsLoss(pos_weight=torch.tensor(1.2)),
-        weights=(1.0, 1.0),
+        loss_dir=WeightedBCELoss(pos_weight=1.17),
+        weights=(1, 0.2),
     )
     # -----------------------------------------------------------------------
     # Training
@@ -1635,7 +1673,6 @@ if __name__ == "__main__":
           super().__init__()
           self.path = path
           self.rows = []
-
       def _row(self, trainer, pl_module, phase: str):
           try:
               loss_mod = getattr(pl_module, "loss", None)
@@ -1664,7 +1701,6 @@ if __name__ == "__main__":
               return r
           except Exception:
               return None
-
       def on_train_epoch_end(self, trainer, pl_module):
           r = self._row(trainer, pl_module, "train")
           if r:
@@ -1681,7 +1717,6 @@ if __name__ == "__main__":
                   print(msg)
               except Exception:
                   pass
-
       def on_validation_epoch_end(self, trainer, pl_module):
           r = self._row(trainer, pl_module, "val")
           if r:
@@ -1698,7 +1733,6 @@ if __name__ == "__main__":
                   print(msg)
               except Exception:
                   pass
-
       def on_train_end(self, trainer, pl_module):
           try:
               import pandas as pd
@@ -1712,21 +1746,16 @@ if __name__ == "__main__":
           except Exception as e:
               print(f"[WARN] Could not save component losses: {e}")
 
-    
-    
     class LossHistory(pl.Callback):
       def __init__(self, path: str = str(LOCAL_RUN_DIR / f"tft_loss_history_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv")):
           self.path = path
           self.records = []
-
       def on_train_epoch_end(self, trainer, pl_module):
           loss = trainer.callback_metrics.get("train_loss_epoch")
           if loss is not None:
               self.records.append(
                   {"epoch": trainer.current_epoch, "train_loss": float(loss)}
               )
-
-
       def on_train_end(self, trainer, pl_module):
           if self.records:
               import pandas as pd
@@ -1744,7 +1773,6 @@ if __name__ == "__main__":
         def __init__(self, total_epochs: int):
             super().__init__()
             self.total = int(total_epochs)
-
         def _format_lr(self, trainer):
             try:
                 opt = trainer.optimizers[0]
@@ -1752,11 +1780,9 @@ if __name__ == "__main__":
                 return None if lr is None else f"{float(lr):.2e}"
             except Exception:
                 return None
-
         def on_train_epoch_start(self, trainer, pl_module):
             # +1 to present human-friendly epoch numbering
             print(f"▶ Epoch {trainer.current_epoch + 1}/{self.total} — training …")
-
         def on_train_epoch_end(self, trainer, pl_module):
             metrics = trainer.callback_metrics
             train_loss = metrics.get("train_loss_epoch")
@@ -1776,7 +1802,6 @@ if __name__ == "__main__":
             if lr_str is not None:
                 parts.append(f"lr={lr_str}")
             print(" | ".join(parts))
-
         def on_validation_end(self, trainer, pl_module):
             # Print the latest best checkpoint path if available
             try:
@@ -1817,191 +1842,4 @@ if __name__ == "__main__":
             rev_asset,
             vol_normalizer=(training_dataset.target_normalizer.normalizers[0]
                             if hasattr(training_dataset.target_normalizer, "normalizers")
-                            else training_dataset.target_normalizer),
-        ),
-    ]
-    trainer = Trainer(
-        logger=logger,
-        max_epochs=MAX_EPOCHS,
-        gradient_clip_val=GRADIENT_CLIP_VAL,
-        callbacks=callbacks,
-        precision=PRECISION,
-        accelerator=ACCELERATOR,
-        devices=DEVICES,
-        strategy="auto",
-        detect_anomaly=False,
-        check_val_every_n_epoch=int(getattr(ARGS, "check_val_every_n_epoch", 1)),
-        log_every_n_steps=int(getattr(ARGS, "log_every_n_steps", 200)),
-    )
-
-    print("▶ Training TFT …")
-    print(type(tft))
-    print(isinstance(tft, torch.nn.Module))
-    print(isinstance(tft, pl.LightningModule))
-    resume_ckpt = get_resume_ckpt_path()
-    if resume_ckpt:
-        print(f"▶ Resuming from checkpoint: {resume_ckpt}")
-    trainer.fit(tft, train_dataloader, val_dataloader, ckpt_path=resume_ckpt)
-    # Load best checkpoint (by val_loss) if available
-    if best_ckpt_cb.best_model_path:
-        try:
-            # Torch 2.6: default weights_only=True. Allowlist PF globals, then try safe load.
-            try:
-                from torch.serialization import add_safe_globals
-                try:
-                    from pytorch_forecasting.data.encoders import MultiNormalizer as _PFMultiNorm
-                    add_safe_globals([_PFMultiNorm])
-                except Exception:
-                    pass
-            except Exception:
-                pass
-            ckpt = None
-            try:
-                ckpt = torch.load(best_ckpt_cb.best_model_path, map_location="cpu", weights_only=True)
-            except TypeError:
-                # older torch without weights_only kwarg
-                ckpt = torch.load(best_ckpt_cb.best_model_path, map_location="cpu")
-            except Exception:
-                # trusted source; fall back to full load
-                ckpt = torch.load(best_ckpt_cb.best_model_path, map_location="cpu", weights_only=False)
-            state = ckpt.get("state_dict", ckpt)
-            missing, unexpected = tft.load_state_dict(state, strict=False)
-            if missing or unexpected:
-                print(f"[INFO] Loaded best weights with missing={len(missing)} unexpected={len(unexpected)}")
-            print(f"✓ Loaded best weights into current model from: {best_ckpt_cb.best_model_path}")
-        except Exception as e:
-            print(f"[WARN] Could not load best checkpoint state_dict: {e}")
-
-    # Save checkpoint
-    trainer.save_checkpoint(str(MODEL_SAVE_PATH))
-    mirror_local_ckpts_to_gcs()
-
-    # -----------------------------------------------------------------------
-    # Evaluation on test set (same process, no multiprocessing issues)
-    # -----------------------------------------------------------------------
-    print("▶ Evaluating …")
-    test_metrics = trainer.validate(
-        tft,
-        dataloaders=test_dataset.to_dataloader(
-            train=False,
-            batch_size=batch_size,
-            num_workers=0            # keep single‑process to avoid spawn issues
-        )
-    )
-    print("Test metrics:", test_metrics)
-        
-# -------------------------------------------------------------------
-# Permutation Feature Importance (validation loss delta)
-#   - permute within (asset, block_id) where block_id = time_idx // PERM_BLOCK_SIZE
-#   - rebuild validation dataset from the *training* spec to keep encoders/scalers identical
-# -------------------------------------------------------------------
-
-if __name__ == "__main__" and ENABLE_FEATURE_IMPORTANCE:
-    from pytorch_forecasting import TimeSeriesDataSet
-
-    print("▶ Permutation feature importance …")
-
-    from itertools import islice
-
-    class _HeadDataLoader:
-        """Wrapper that exposes only the first N batches of an existing DataLoader."""
-        def __init__(self, dl, max_batches: int):
-            self.dl = dl
-            self.max_batches = int(max_batches)
-        def __iter__(self):
-            return iter(islice(self.dl, self.max_batches))
-        def __len__(self):
-            try:
-                return min(self.max_batches, len(self.dl))
-            except Exception:
-                return self.max_batches
-
-    def _limit_batches(dl, n):
-        try:
-            n_int = int(n)
-            return _HeadDataLoader(dl, n_int) if n_int > 0 else dl
-        except Exception:
-            return dl
-
-    if FI_MAX_BATCHES is not None and int(FI_MAX_BATCHES) > 0:
-        print(f"[FI] Using at most {int(FI_MAX_BATCHES)} validation batches per evaluation.")
-
-    # 1) Baseline val loss (uses your LearnableMultiTaskLoss)
-    baseline_dl = _limit_batches(val_dataloader, FI_MAX_BATCHES)
-    baseline_row = trainer.validate(model=tft, dataloaders=baseline_dl, verbose=False)[0]
-    baseline_val_loss = float(baseline_row["val_loss"])
-    print(f"[BASELINE] val_loss = {baseline_val_loss:.6f}")
-
-    # 2) Candidate features to test (derive directly from our dataset spec)
-    # Use the features we explicitly passed into TimeSeriesDataSet instead of
-    # relying on `.get_parameters()` which can be empty/misaligned across PF versions.
-    candidates = list(dict.fromkeys(
-        static_reals + time_varying_known_reals + time_varying_unknown_reals
-    ))
-
-    # Never permute IDs, time, targets, or helper scales
-    do_not_touch = set(GROUP_ID + [TIME_COL, "time_idx"] + TARGETS + ["rv_scale"])        
-
-    # Keep only columns that exist in the validation dataframe and are safe to shuffle
-    features_to_test = [f for f in candidates if (f in val_df.columns and f not in do_not_touch)]
-
-    if not features_to_test:
-        raise RuntimeError("No candidate features to permute — check your dataset feature lists.")
-
-    def permute_within_blocks(df_in: pd.DataFrame, feature: str) -> pd.DataFrame:
-        """Shuffle 'feature' within (asset, block_id) groups to preserve local structure."""
-        df = df_in.copy()
-        if "time_idx" not in df.columns:
-            raise ValueError("time_idx not found in validation dataframe.")
-        df["_block_id"] = (df["time_idx"] // PERM_BLOCK_SIZE).astype(np.int64)
-        # group by (asset, block)
-        gcols = GROUP_ID + ["_block_id"]
-        # sample with a fresh seed per group for reproducibility but variability
-        rng = np.random.default_rng(12345)
-        df[feature] = (
-            df.groupby(gcols, group_keys=False)[feature]
-              .apply(lambda s: s.sample(frac=1.0, random_state=int(rng.integers(0, 2**31 - 1))))
-              .values
-        )
-        df.drop(columns=["_block_id"], inplace=True)
-        return df
-
-    results = []
-    for feat in features_to_test:
-        try:
-            # 3) Permute a single column on the raw val dataframe
-            val_perm = permute_within_blocks(val_df, feat)
-
-            # 4) Rebuild a validation dataset from the training spec (keeps encoders/scalers)
-            perm_ds = TimeSeriesDataSet.from_dataset(training_dataset, val_perm, predict=False, stop_randomization=True)
-            perm_dl = perm_ds.to_dataloader(train=False, batch_size=val_dataloader.batch_size, num_workers=0)
-
-            # 5) Evaluate the permuted loss
-            perm_row = trainer.validate(model=tft, dataloaders=_limit_batches(perm_dl, FI_MAX_BATCHES), verbose=False)[0]
-            perm_val_loss = float(perm_row["val_loss"]) 
-
-            results.append({
-                "feature": feat,
-                "baseline_val_loss": baseline_val_loss,
-                "perm_val_loss": perm_val_loss,
-                "delta_val_loss": perm_val_loss - baseline_val_loss,
-            })
-            print(f"  • {feat:>30s}  Δloss = {perm_val_loss - baseline_val_loss:+.6f}")
-        except Exception as e:
-            print(f"[WARN] Permutation failed for '{feat}': {e}")
-
-    # 6) Save CSV (sorted by importance: bigger Δloss = more important)
-    perm_df = pd.DataFrame(results).sort_values("delta_val_loss", ascending=False)
-    perm_path = LOCAL_OUTPUT_DIR / f"tft_permutation_importance_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv"
-    perm_df.to_csv(perm_path, index=False)
-    print(f"✓ Saved permutation importance → {perm_path}")
-    try:
-        upload_file_to_gcs(str(perm_path), f"{GCS_OUTPUT_PREFIX}/{perm_path.name}")
-    except Exception as e:
-        print(f"[WARN] Could not upload permutation importance: {e}")
-    print(perm_df.head(25).to_string(index=False))
-else:
-    print("▶ Permutation feature importance is disabled. Set --enable_perm_importance true to enable.")
-
-
-df_pred.describe()
+                       <truncated__content/>
