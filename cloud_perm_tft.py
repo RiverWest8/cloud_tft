@@ -875,9 +875,9 @@ def gcs_exists(path: str) -> bool:
     except Exception:
         return False
 
-TRAIN_URI = f"{GCS_DATA_PREFIX}/universal_train.parquet_10k"
-VAL_URI   = f"{GCS_DATA_PREFIX}/universal_val.parquet_10k"
-TEST_URI  = f"{GCS_DATA_PREFIX}/universal_test.parquet_10k"
+TRAIN_URI = f"{GCS_DATA_PREFIX}/universal_train.parquet"
+VAL_URI   = f"{GCS_DATA_PREFIX}/universal_val.parquet"
+TEST_URI  = f"{GCS_DATA_PREFIX}/universal_test.parquet"
 READ_PATHS = [str(TRAIN_URI), str(VAL_URI), str(TEST_URI)]
 '''
 # If a local data folder is explicitly provided, use it and skip GCS
@@ -1600,7 +1600,7 @@ if ENABLE_FEATURE_IMPORTANCE:
             if best_ckpt_path and os.path.exists(best_ckpt_path):
                 print(f"[FI] Loading best model checkpoint: {best_ckpt_path}")
                 tft = tft.__class__.load_from_checkpoint(best_ckpt_path)
-                tft.to(device)
+                # Trainer will move the model to the correct device during validate()
             else:
                 print("[FI][WARN] No best checkpoint found; using current model state.")
         except Exception as e:
@@ -1651,7 +1651,7 @@ if ENABLE_FEATURE_IMPORTANCE:
                 m = fi_trainer.validate(tft, dataloaders=perm_loader, verbose=False)
                 perm_loss = float(m[0].get("val_loss", np.nan)) if m else np.nan
                 delta = perm_loss - baseline if (np.isfinite(perm_loss) and np.isfinite(baseline)) else np.nan
-                # print(f"  • {feat:>30s} Δloss = {delta:+.6f}")
+                print(f"  • {feat:>30s} Δloss = {delta:+.6f}")
                 fi_rows.append({"feature": feat, "baseline_val_loss": baseline, "perm_val_loss": perm_loss, "delta": delta})
                 # Append the row to the checkpoint file
                 try:
