@@ -1267,6 +1267,13 @@ if __name__ == "__main__":
     # Training
     # -----------------------------------------------------------------------
 
+    # ----------------- Permutation importance loss scaling helper -----------------
+    def _scale_loss(val):
+        try:
+            return (val - 0.3) * 10.0
+        except Exception:
+            return val
+
     class ComponentLossLogger(pl.Callback):
       def __init__(self, path: str = str(LOCAL_RUN_DIR / f"tft_component_losses_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv")):
           super().__init__()
@@ -1548,8 +1555,7 @@ print("▶ Starting training …")
 trainer.fit(tft, train_dataloader, val_dataloader, ckpt_path=resume_ckpt)
 # -----------------------------------------------------------------------
 # Permutation Feature Importance (fast, limited val batches)
-# -----------------------------------------------------------------------
-print("✓ Training finished.")
+
 if ENABLE_FEATURE_IMPORTANCE:
     try:
         print("▶ Running permutation feature importance …")
@@ -1596,26 +1602,41 @@ if ENABLE_FEATURE_IMPORTANCE:
         # Candidate features: both unknown and known reals used by the model
         fi_features = list(dict.fromkeys(time_varying_unknown_reals + time_varying_known_reals))
 
+        # Use single-threaded DataLoader for FI to avoid spawning many worker pools
+        fi_num_workers = 0
+        fi_persist = False
+        fi_pin = False
+        loader_kwargs = dict(
+            train=False,
+            batch_size=batch_size,
+            num_workers=fi_num_workers,
+            persistent_workers=fi_persist,
+            pin_memory=fi_pin,
+        )
+
         fi_rows = []
         for feat in fi_features:
             try:
                 perm_df = _permute_by_blocks(val_df, feat)
                 perm_ds = build_dataset(perm_df, predict=False)
-                perm_loader = perm_ds.to_dataloader(
-                    train=False,
-                    batch_size=batch_size,
-                    num_workers=worker_cnt,
-                    persistent_workers=use_persist,
-                    pin_memory=pin,
-                    prefetch_factor=prefetch,
-                )
+                perm_loader = perm_ds.to_dataloader(**loader_kwargs)
                 m = fi_trainer.validate(tft, dataloaders=perm_loader, verbose=False)
                 perm_loss = float(m[0].get("val_loss", np.nan)) if m else np.nan
                 delta = perm_loss - baseline if (np.isfinite(perm_loss) and np.isfinite(baseline)) else np.nan
                 print(f"[FI] {feat}: val_loss={perm_loss:.8f} Δ={delta:.8f}")
                 fi_rows.append({"feature": feat, "baseline_val_loss": baseline, "perm_val_loss": perm_loss, "delta": delta})
+                try:
+                    del perm_loader
+                    del perm_ds
+                except Exception:
+                    pass
+                import gc as _gc
+                _gc.collect()
             except Exception as e:
                 print(f"[FI][WARN] Failed on feature '{feat}': {e}")
+
+        import gc as _gc
+        _gc.collect()
 
         # Save to CSV locally and upload to GCS
         try:
