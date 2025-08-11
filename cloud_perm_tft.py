@@ -305,8 +305,12 @@ class LearnableMultiTaskLoss(nn.Module):
         else:
             L2 = torch.tensor(0.0, device=p_vol.device, dtype=p_vol.dtype)
 
-        # Combine with learnable weights; include the log-variance term only for active tasks
-        weights = torch.exp(-self.s)  # [2]
+        # Combine with learnable weights; incl
+        weights = torch.exp(-self.s) 
+        try:
+            self.last_w = weights.detach().float().clone()
+        except Exception:
+            pass
         total = weights[0] * L1 + (weights[1] * L2 if do_dir else 0.0) + (self.s[0] + (self.s[1] if do_dir else 0.0))
         return total
 
@@ -875,6 +879,7 @@ parser.add_argument("--max_epochs", type=int, default=None, help="Max training e
 parser.add_argument("--batch_size", type=int, default=None, help="Training batch size")
 parser.add_argument("--early_stop_patience", "--patience", type=int, default=None, help="Early stopping patience")
 parser.add_argument("--perm_len", type=int, default=None, help="Permutation block length for importance")
+parser.add_argument("--perm_block_size", type=int, default=None, help="Alias for --perm_len (permutation block length)")
 parser.add_argument(
     "--enable_perm_importance", "--enable-feature-importance",
     type=lambda s: str(s).lower() in ("1","true","t","yes","y","on"),
@@ -1374,28 +1379,87 @@ if __name__ == "__main__":
     # Training
     # -----------------------------------------------------------------------
 
+    class ComponentLossLogger(pl.Callback):
+      def __init__(self, path: str = str(LOCAL_RUN_DIR / f"tft_component_losses_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv")):
+          super().__init__()
+          self.path = path
+          self.rows = []
+
+      def _row(self, trainer, pl_module, phase: str):
+          try:
+              loss_mod = getattr(pl_module, "loss", None)
+              L1 = float(loss_mod.last_L1.cpu().item()) if hasattr(loss_mod, "last_L1") else None
+              L2 = float(loss_mod.last_L2.cpu().item()) if hasattr(loss_mod, "last_L2") else None
+              s = loss_mod.last_s.cpu().tolist() if hasattr(loss_mod, "last_s") else [None, None]
+              w = loss_mod.last_w.cpu().tolist() if hasattr(loss_mod, "last_w") else [None, None]
+              r = {
+                  "epoch": trainer.current_epoch,
+                  "phase": phase,
+                  "L1": L1,
+                  "L2": L2,
+                  "s1": s[0] if s else None,
+                  "s2": s[1] if s and len(s) > 1 else None,
+                  "w1": w[0] if w else None,
+                  "w2": w[1] if w and len(w) > 1 else None,
+              }
+              # quick TB logs if available
+              try:
+                  if L1 is not None:
+                      trainer.logger.experiment.add_scalar(f"components/{phase}_L1_vol", L1, trainer.global_step)
+                  if L2 is not None:
+                      trainer.logger.experiment.add_scalar(f"components/{phase}_L2_dir", L2, trainer.global_step)
+              except Exception:
+                  pass
+              return r
+          except Exception:
+              return None
+
+      def on_train_epoch_end(self, trainer, pl_module):
+          r = self._row(trainer, pl_module, "train")
+          if r:
+              self.rows.append(r)
+
+      def on_validation_epoch_end(self, trainer, pl_module):
+          r = self._row(trainer, pl_module, "val")
+          if r:
+              self.rows.append(r)
+
+      def on_train_end(self, trainer, pl_module):
+          try:
+              import pandas as pd
+              if self.rows:
+                  pd.DataFrame(self.rows).to_csv(self.path, index=False)
+                  print(f"✓ Saved component losses → {self.path}")
+                  try:
+                      upload_file_to_gcs(self.path, f"{GCS_OUTPUT_PREFIX}/{os.path.basename(self.path)}")
+                  except Exception as e:
+                      print(f"[WARN] Could not upload component losses: {e}")
+          except Exception as e:
+              print(f"[WARN] Could not save component losses: {e}")
+
+    
+    
     class LossHistory(pl.Callback):
-        def __init__(self, path: str = str(LOCAL_RUN_DIR / f"tft_loss_history_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv")):
-            self.path = path
-            self.records = []
+      def __init__(self, path: str = str(LOCAL_RUN_DIR / f"tft_loss_history_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv")):
+          self.path = path
+          self.records = []
 
-        def on_train_epoch_end(self, trainer, pl_module):
-            loss = trainer.callback_metrics.get("train_loss_epoch")
-            if loss is not None:
-                self.records.append(
-                    {"epoch": trainer.current_epoch, "train_loss": float(loss)}
-                )
+      def on_train_epoch_end(self, trainer, pl_module):
+          loss = trainer.callback_metrics.get("train_loss_epoch")
+          if loss is not None:
+              self.records.append(
+                  {"epoch": trainer.current_epoch, "train_loss": float(loss)}
+              )
 
-        def on_train_end(self, trainer, pl_module):
-            if self.records:
-                import pandas as pd
-                pd.DataFrame(self.records).to_csv(self.path, index=False)
-                print(f"✓ Saved loss history → {self.path}")
-                try:
-                    upload_file_to_gcs(self.path, f"{GCS_OUTPUT_PREFIX}/{os.path.basename(self.path)}")
-                except Exception as e:
-                    print(f"[WARN] Could not upload loss history: {e}")
-
+      def on_train_end(self, trainer, pl_module):
+          if self.records:
+              import pandas as pd
+              pd.DataFrame(self.records).to_csv(self.path, index=False)
+              print(f"✓ Saved loss history → {self.path}")
+              try:
+                  upload_file_to_gcs(self.path, f"{GCS_OUTPUT_PREFIX}/{os.path.basename(self.path)}")
+              except Exception as e:
+                  print(f"[WARN] Could not upload loss history: {e}")
 
     class EpochPrinter(pl.Callback):
         """Print lightweight, periodic training status updates per epoch.
@@ -1478,6 +1542,7 @@ if __name__ == "__main__":
         EpochPrinter(MAX_EPOCHS),
         LearningRateMonitor(logging_interval="epoch"),
         EarlyStopping(monitor="val_loss", patience=EARLY_STOP_PATIENCE, mode="min"),
+        ComponentLossLogger(),
         LossHistory(),
         PerAssetMetrics(
             rev_asset,
