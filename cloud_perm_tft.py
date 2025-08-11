@@ -790,11 +790,29 @@ class PerAssetMetrics(pl.Callback):
         ratio_all    = sigma2_p_all / sigma2_all
         overall_qlike = (ratio_all - torch.log(ratio_all) - 1.0).mean().item()
 
-        # —— expose decoded MAE as a proper Lightning metric for callbacks ——
+        # —— expose decoded metrics & a composite val_loss (MAE + 0.4 * dir_BCE) ——
         try:
             import torch as _torch
+            # Direction BCE (logits-aware) over all collected val samples
+            dir_bce = None
+            if yd_cpu is not None and pd_cpu is not None and yd_cpu.numel() > 0 and pd_cpu.numel() > 0:
+                yt = yd_cpu.float()
+                pt = pd_cpu
+                # if looks like logits, use BCEWithLogits; else plain BCE on probs
+                if _torch.isfinite(pt).any() and (pt.min() < 0 or pt.max() > 1):
+                    # label smoothing 0.1 (same as training)
+                    yt_s = yt * 0.9 + 0.05
+                    dir_bce = F.binary_cross_entropy_with_logits(pt, yt_s)
+                else:
+                    p = _torch.clamp(pt, 1e-7, 1 - 1e-7)
+                    yt_s = yt * 0.9 + 0.05
+                    dir_bce = F.binary_cross_entropy(p, yt_s)
+                dir_bce = float(dir_bce.item())
+            # Composite validation loss
+            comp_val = float(overall_mae) + 0.4 * (float(dir_bce) if dir_bce is not None else 0.0)
             trainer.callback_metrics["val_mae_dec"] = _torch.tensor(float(overall_mae))
-            trainer.callback_metrics["val_qlike_dec"] = _torch.tensor(float(overall_qlike))
+            trainer.callback_metrics["val_dir_bce"] = _torch.tensor(float(dir_bce)) if dir_bce is not None else _torch.tensor(float('nan'))
+            trainer.callback_metrics["val_loss"] = _torch.tensor(comp_val)
         except Exception:
             pass
 
@@ -1197,11 +1215,10 @@ def gcs_exists(path: str) -> bool:
     except Exception:
         return False
 
-TRAIN_URI = f"{GCS_DATA_PREFIX}/universal_train.parquet_10k"
-VAL_URI   = f"{GCS_DATA_PREFIX}/universal_val.parquet_10k"
-TEST_URI  = f"{GCS_DATA_PREFIX}/universal_test.parquet_10k"
-READ_PATHS = [TRAIN_URI, VAL_URI, TEST_URI]
-'''
+TRAIN_URI = f"{GCS_DATA_PREFIX}/universal_train.parquet"
+VAL_URI   = f"{GCS_DATA_PREFIX}/universal_val.parquet"
+TEST_URI  = f"{GCS_DATA_PREFIX}/universal_test.parquet"
+
 # If a local data folder is explicitly provided, use it and skip GCS
 if getattr(ARGS, "data_dir", None):
     DATA_DIR = Path(ARGS.data_dir).expanduser().resolve()
@@ -1218,7 +1235,6 @@ elif not all(map(gcs_exists, [TRAIN_URI, VAL_URI, TEST_URI])):
     READ_PATHS = [str(TRAIN_FILE), str(VAL_FILE), str(TEST_FILE)]
 else:
     READ_PATHS = [TRAIN_URI, VAL_URI, TEST_URI]
-    '''
 
 # --- Validate data availability early with helpful errors ---
 
@@ -1708,6 +1724,7 @@ if __name__ == "__main__":
             metrics = trainer.callback_metrics
             train_loss = metrics.get("train_loss_epoch")
             val_loss = metrics.get("val_loss")
+            val_mae_dec = metrics.get("val_mae_dec")
             lr_str = self._format_lr(trainer)
             parts = [f"✓ Epoch {trainer.current_epoch + 1}/{self.total} done"]
             if train_loss is not None:
@@ -1717,7 +1734,12 @@ if __name__ == "__main__":
                     pass
             if val_loss is not None:
                 try:
-                    parts.append(f"val_loss={float(val_loss):.5f}")
+                    parts.append(f"val_loss={float(val_loss):.6f}")
+                except Exception:
+                    pass
+            if val_mae_dec is not None:
+                try:
+                    parts.append(f"val_mae_dec={float(val_mae_dec):.6f}")
                 except Exception:
                     pass
             if lr_str is not None:
@@ -1742,7 +1764,7 @@ if __name__ == "__main__":
                 pass
 
     best_ckpt_cb = ModelCheckpoint(
-        monitor="val_mae_dec",
+        monitor="val_loss",
         mode="min",
         save_top_k=1,
         save_last=True,  # writes last.ckpt
@@ -1756,7 +1778,7 @@ if __name__ == "__main__":
         ckpt_uploader_cb,
         EpochPrinter(MAX_EPOCHS),
         LearningRateMonitor(logging_interval="epoch"),
-        EarlyStopping(monitor="val_mae_dec", patience=EARLY_STOP_PATIENCE, mode="min"),
+        EarlyStopping(monitor="val_loss", patience=EARLY_STOP_PATIENCE, mode="min"),
         ComponentLossLogger(),
         LossHistory(),
         PerAssetMetrics(
@@ -1767,7 +1789,7 @@ if __name__ == "__main__":
                 else training_dataset.target_normalizer
             ),
         ),
-]
+    ]
     print("▶ Creating Trainer …")
 trainer = Trainer(
     max_epochs=MAX_EPOCHS,
