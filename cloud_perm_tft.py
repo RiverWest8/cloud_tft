@@ -1076,7 +1076,7 @@ WEIGHT_DECAY = 0.00578350719515325     # weight decay for AdamW
 GRADIENT_CLIP_VAL = 0.78    # gradient clipping value for Trainer
 # Feature-importance controls
 ENABLE_FEATURE_IMPORTANCE = True   # gate FI so you can toggle it
-FI_MAX_BATCHES = 10         # number of val batches to sample for FI
+FI_MAX_BATCHES = 5       # number of val batches to sample for FI
 
 # ---- Apply CLI overrides (only when provided) ----
 if ARGS.batch_size is not None:
