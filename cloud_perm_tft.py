@@ -450,7 +450,7 @@ class PerAssetMetrics(pl.Callback):
         ratio_all    = sigma2_p_all / sigma2_all
         overall_qlike = (ratio_all - torch.log(ratio_all) - 1.0).mean().item()
 
-        # —— expose decoded metrics & a composite val_loss (MAE + 0.4 * dir_BCE) ——
+        # —— expose decoded metrics, but DO NOT override PF's native val_loss ——
         try:
             import torch as _torch
             # Direction BCE (logits-aware) over all collected val samples
@@ -472,7 +472,7 @@ class PerAssetMetrics(pl.Callback):
             comp_val = float(overall_mae) + 0.4 * (float(dir_bce) if dir_bce is not None else 0.0)
             trainer.callback_metrics["val_mae_dec"] = _torch.tensor(float(overall_mae))
             trainer.callback_metrics["val_dir_bce"] = _torch.tensor(float(dir_bce)) if dir_bce is not None else _torch.tensor(float('nan'))
-            trainer.callback_metrics["val_loss"] = _torch.tensor(comp_val)
+            trainer.callback_metrics["val_loss_decoded"] = _torch.tensor(comp_val)
         except Exception:
             pass
 
