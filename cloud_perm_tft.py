@@ -1,6 +1,4 @@
-# To run this script on macOS with Apple MPS fallback enabled in zsh/bash:
-#   source ~/.venvs/tft-mps/bin/activate    # (tft-mps) environment
-#   python /Users/riverwest-gomila/Desktop/Data/Scripts/permutationTFT.py
+
 
 """
 Temporal Fusion Transformer (TFT) pipeline
@@ -834,9 +832,43 @@ class PerAssetMetrics(pl.Callback):
                     df_out = df_out.iloc[:Lm].copy()
                     df_out["y_dir"] = yd_cpu[:Lm].numpy().tolist()
                     df_out["y_dir_prob"] = pdp[:Lm].numpy().tolist()
-                pred_path = LOCAL_OUTPUT_DIR / f"tft_val_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv"
-                df_out.to_csv(pred_path, index=False)
-                print(f"✓ Saved validation predictions → {pred_path}")
+                # --- Attach real timestamps from a source DataFrame, if available ---
+                try:
+                    # Look for a likely source dataframe that contains ['asset','time_idx','Time']
+                    candidate_names = ["raw_df", "raw_data", "full_df", "df", "val_df", "train_df", "test_df"]
+                    src_df = None
+                    for _name in candidate_names:
+                        obj = globals().get(_name)
+                        if isinstance(obj, pd.DataFrame) and {"asset", "time_idx", "Time"}.issubset(obj.columns):
+                            src_df = obj[["asset", "time_idx", "Time"]].copy()
+                            break
+                    if src_df is not None:
+                        # Harmonise dtypes prior to merge
+                        src_df["asset"] = src_df["asset"].astype(str)
+                        src_df["time_idx"] = pd.to_numeric(src_df["time_idx"], errors="coerce").astype("Int64").astype("int64")
+                        df_out["asset"] = df_out["asset"].astype(str)
+                        df_out["time_idx"] = pd.to_numeric(df_out["time_idx"], errors="coerce").astype("Int64").astype("int64")
+
+                        # Merge on ['asset','time_idx'] to bring in the real Time column
+                        df_out = df_out.merge(src_df, on=["asset", "time_idx"], how="left", validate="m:1")
+
+                        # Coerce Time to timezone-naive pandas datetimes
+                        df_out["Time"] = pd.to_datetime(df_out["Time"], errors="coerce")
+                        try:
+                            # If tz-aware, drop timezone info; if already naive this may raise — ignore
+                            df_out["Time"] = df_out["Time"].dt.tz_localize(None)
+                        except Exception:
+                            pass
+                    else:
+                        print(
+                            "[WARN] Could not locate a source dataframe with ['asset','time_idx','Time'] among candidates: "
+                            "raw_df, raw_data, full_df, df (also checked val_df/train_df/test_df)."
+                        )
+                except Exception as e:
+                    print(f"[WARN] Failed to attach real timestamps: {e}")
+                pred_path = LOCAL_OUTPUT_DIR / f"tft_val_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
+                df_out.to_parquet(pred_path, index=False)
+                print(f"✓ Saved validation predictions (Parquet) → {pred_path}")
                 try:
                     upload_file_to_gcs(str(pred_path), f"{GCS_OUTPUT_PREFIX}/{pred_path.name}")
                 except Exception as e:
