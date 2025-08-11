@@ -1661,17 +1661,10 @@ if __name__ == "__main__":
         filename=f"tft_best_e{MAX_EPOCHS}_{RUN_SUFFIX}",
         dirpath=str(LOCAL_CKPT_DIR),
     )
-    periodic_ckpt_cb = ModelCheckpoint(
-        train_time_interval=timedelta(minutes=10),  # save at least every 10 minutes
-        save_top_k=-1,
-        dirpath=str(LOCAL_CKPT_DIR),
-        filename="tft-snap-time-{epoch:02d}-{step:06d}",
-    )
     ckpt_uploader_cb = MirrorCheckpoints()
 
     callbacks = [
         best_ckpt_cb,
-        periodic_ckpt_cb,
         ckpt_uploader_cb,
         EpochPrinter(MAX_EPOCHS),
         LearningRateMonitor(logging_interval="epoch"),
