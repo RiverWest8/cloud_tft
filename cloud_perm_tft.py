@@ -366,6 +366,106 @@ class LearnableMultiTaskLoss(nn.Module):
         else:
             return [parameters]
 
+
+# ---------------------------------------------------------------------
+# Fixed Multi-Task Loss with Constant Weights
+# ---------------------------------------------------------------------
+class FixedMultiTaskLoss(nn.Module):
+    """
+    Two-loss combiner with **fixed** weights (no learnable s). Returns L1 + L2.
+    Keeps .last_* attributes for logging compatibility.
+    Expects y_pred to be a list/tuple [pred_vol, pred_dir] or a stacked tensor
+    shaped [..., 2, 7] as produced by DualOutputModule.
+    """
+    def __init__(self, loss_vol: nn.Module, loss_dir: nn.Module, weights=(1.0, 1.0)):
+        super().__init__()
+        self.loss_vol = loss_vol
+        self.loss_dir = loss_dir
+        w1, w2 = float(weights[0]), float(weights[1])
+        self.register_buffer("w", torch.tensor([w1, w2], dtype=torch.float32))
+        # defaults for logger
+        self.last_L1 = torch.tensor(0.0)
+        self.last_L2 = torch.tensor(0.0)
+        self.last_s  = torch.tensor([0.0, 0.0])
+        self.last_w  = torch.tensor([w1, w2])
+
+    def _extract_heads(self, y_pred):
+        # Mirrors the extraction logic from LearnableMultiTaskLoss
+        if isinstance(y_pred, (list, tuple)) and len(y_pred) >= 2:
+            return y_pred[0], y_pred[1]
+        if torch.is_tensor(y_pred):
+            t = y_pred
+            if t.ndim >= 3 and t.size(-2) == 2 and t.size(-1) == 7:
+                return t[..., 0, :], t[..., 1, 3:4]
+            if t.ndim >= 2 and t.size(-1) == 14:
+                y_resh = t.view(*t.shape[:-1], 2, 7)
+                return y_resh[..., 0, :], y_resh[..., 1, 3:4]
+            return y_pred, None
+        return y_pred, None
+
+    def _extract_targets(self, target):
+        yv, yd = None, None
+        if torch.is_tensor(target):
+            t = target
+            if t.ndim == 3:
+                if t.size(-1) >= 2:
+                    yv, yd = t[..., 0], t[..., 1]
+                else:
+                    yv = t[..., 0]
+            elif t.ndim == 2:
+                if t.size(-1) >= 2:
+                    yv, yd = t[:, 0], t[:, 1]
+                else:
+                    yv = t[:, 0]
+            elif t.ndim == 1:
+                yv = t
+        elif isinstance(target, (list, tuple)):
+            if len(target) >= 1: yv = target[0]
+            if len(target) >= 2: yd = target[1]
+            if torch.is_tensor(yv) and yv.ndim >= 3 and yv.size(-1) == 1: yv = yv[..., 0]
+            if torch.is_tensor(yd) and yd is not None and yd.ndim >= 3 and yd.size(-1) == 1: yd = yd[..., 0]
+        return yv, yd
+
+    def forward(self, y_pred, target, **kwargs):
+        p_vol, p_dir = self._extract_heads(y_pred)
+        yv, yd = self._extract_targets(target)
+        if yv is None:
+            raise ValueError("Volatility target is missing; cannot compute primary loss.")
+        L1 = self.loss_vol(p_vol, yv)
+        if L1.ndim > 0: L1 = L1.mean()
+        do_dir = (p_dir is not None) and (yd is not None)
+        if do_dir:
+            L2 = self.loss_dir(p_dir, yd)
+            if L2.ndim > 0: L2 = L2.mean()
+        else:
+            L2 = torch.tensor(0.0, device=p_vol.device, dtype=p_vol.dtype)
+        # logging compatibility
+        self.last_L1 = L1.detach()
+        self.last_L2 = L2.detach()
+        self.last_s  = torch.tensor([0.0, 0.0], device=L1.device)
+        self.last_w  = self.w.detach()
+        return self.w[0] * L1 + self.w[1] * L2
+
+    # keep PF hooks as no-ops/identity
+    def rescale_parameters(self, parameters, target_scale=None, **kwargs):
+        return parameters
+    def to_prediction(self, parameters, **kwargs):
+        return parameters
+    def to_quantiles(self, parameters, quantiles=None, **kwargs):
+        if isinstance(parameters, (list, tuple)) and len(parameters) >= 2:
+            vol, d = parameters[0], parameters[1]
+            if torch.is_tensor(d):
+                if d.ndim >= 1 and d.size(-1) == 1:
+                    d = d.repeat_interleave(7, dim=-1)
+                elif d.ndim >= 1 and d.size(-1) == 2:
+                    d = d.softmax(-1)[..., 1].unsqueeze(-1).repeat_interleave(7, dim=-1)
+            return [vol, torch.sigmoid(d) if torch.is_tensor(d) else d]
+        if torch.is_tensor(parameters) and parameters.ndim >= 3 and parameters.size(-2) == 2 and parameters.size(-1) == 7:
+            vol = parameters[..., 0, :]
+            d   = parameters[..., 1, :]
+            return [vol, torch.sigmoid(d)]
+        return [parameters]
+
 # -----------------------------------------------------------------------
 # Mini-MLP dual head: one branch for volatility quantiles, one for direction logit
 # -----------------------------------------------------------------------
@@ -1460,15 +1560,15 @@ if __name__ == "__main__":
         weight_decay=WEIGHT_DECAY,
         # 7 quantiles for vol + 1 logit for direction
         output_size=[7, 1],
-        loss=LearnableMultiTaskLoss(
+        loss=FixedMultiTaskLoss(
             loss_vol=AsymmetricQuantileLoss(
                 quantiles=[0.05, 0.165, 0.25, 0.5, 0.75, 0.835, 0.95],
                 underestimation_init=1.115,
-                learnable_under=True,
+                learnable_under=False,
                 reg_lambda=1e-3,
             ),
-            loss_dir = nn.BCEWithLogitsLoss()  # simple, stable baseline#loss_dir=LabelSmoothedBCE(smoothing=0.1, init_pos_weight=1.2, ema_beta=0.99, pw_min=0.2, pw_max=5.0),
-            init_weights=(1.0, 0.3),  # weights=[vol, dir] → vol=1.0, dir=0.3
+            loss_dir=nn.BCEWithLogitsLoss(pos_weight=torch.tensor(1.2)),
+            weights=(1.0, 1.0),
         ),
         logging_metrics=[],
         log_interval=50,
@@ -1492,21 +1592,15 @@ if __name__ == "__main__":
     # By assigning directly to `tft.loss`, Lightning will use this criterion in
     # training/validation instead of the PF MultiLoss.
     # -------------------------------------------------------------------
-    tft.loss = LearnableMultiTaskLoss(
+    tft.loss = FixedMultiTaskLoss(
         loss_vol=AsymmetricQuantileLoss(
             quantiles=[0.05, 0.165, 0.25, 0.5, 0.75, 0.835, 0.95],
             underestimation_init=1.115,
-            learnable_under=True,
+            learnable_under=False,
             reg_lambda=1e-3,
         ),
-        loss_dir=LabelSmoothedBCE(
-            smoothing=0.1,
-            init_pos_weight=1.2,
-            ema_beta=0.99,
-            pw_min=0.2,
-            pw_max=5.0,
-        ),
-        init_weights=(1.0, 0.3),  # weights=[vol, dir] → vol=1.0, dir=0.3
+        loss_dir=nn.BCEWithLogitsLoss(pos_weight=torch.tensor(1.2)),
+        weights=(1.0, 1.0),
     )
     # -----------------------------------------------------------------------
     # Training
@@ -1860,3 +1954,6 @@ if __name__ == "__main__" and ENABLE_FEATURE_IMPORTANCE:
     print(perm_df.head(25).to_string(index=False))
 else:
     print("▶ Permutation feature importance is disabled. Set --enable_perm_importance true to enable.")
+
+
+df_pred.describe()
