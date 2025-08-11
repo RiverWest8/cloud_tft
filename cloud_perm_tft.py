@@ -1238,14 +1238,14 @@ if __name__ == "__main__":
 
     # Loss and output_size for multi-target: realised_vol (quantile regression), direction (classification)
     print("▶ Building model …")
-    print(f"[LR] learning_rate={LR_OVERRIDE if LR_OVERRIDE is not None else 0.001797}")
+    print(f"[LR] learning_rate={LR_OVERRIDE if LR_OVERRIDE is not None else 0.00275}")
     tft = TemporalFusionTransformer.from_dataset(
         training_dataset,
         hidden_size=64,
         attention_head_size=2,
         dropout=0.0833704625250354,
         hidden_continuous_size=16,
-        learning_rate=(LR_OVERRIDE if LR_OVERRIDE is not None else 0.001797),
+        learning_rate=(LR_OVERRIDE if LR_OVERRIDE is not None else 0.00275),
         optimizer="AdamW",
         optimizer_params={"weight_decay": WEIGHT_DECAY},
         output_size=[7, 1],  # 7 quantiles + 1 logit
@@ -1594,6 +1594,18 @@ if ENABLE_FEATURE_IMPORTANCE:
             enable_progress_bar=False,
         )
 
+        # Reload best checkpoint before FI for consistent evaluation
+        try:
+            best_ckpt_path = best_ckpt_cb.best_model_path
+            if best_ckpt_path and os.path.exists(best_ckpt_path):
+                print(f"[FI] Loading best model checkpoint: {best_ckpt_path}")
+                tft = tft.__class__.load_from_checkpoint(best_ckpt_path)
+                tft.to(device)
+            else:
+                print("[FI][WARN] No best checkpoint found; using current model state.")
+        except Exception as e:
+            print(f"[FI][WARN] Failed to load best checkpoint: {e}")
+
         # Baseline loss on the *original* validation set (limited batches)
         base_metrics = fi_trainer.validate(tft, dataloaders=val_dataloader, verbose=False)
         baseline = float(base_metrics[0].get("val_loss", np.nan)) if base_metrics else np.nan
@@ -1614,8 +1626,24 @@ if ENABLE_FEATURE_IMPORTANCE:
             pin_memory=fi_pin,
         )
 
+        # Checkpoint file to allow resuming FI if interrupted (stable name)
+        fi_ckpt_path = LOCAL_OUTPUT_DIR / "tft_perm_importance_checkpoint.csv"
+        done_features = set()
+        if fi_ckpt_path.exists():
+            try:
+                import pandas as _pd
+                _ck = _pd.read_csv(fi_ckpt_path)
+                if "feature" in _ck.columns:
+                    done_features = set(_ck["feature"].astype(str).tolist())
+                    print(f"[FI] Resume detected: {len(done_features)} features already computed, will skip them.")
+            except Exception as _e:
+                print(f"[FI][WARN] Could not read FI checkpoint: {_e}")
+
         fi_rows = []
         for feat in fi_features:
+            if feat in done_features:
+                # print(f"[FI] {feat}: skipped (already in checkpoint)")
+                continue
             try:
                 perm_df = _permute_by_blocks(val_df, feat)
                 perm_ds = build_dataset(perm_df, predict=False)
@@ -1623,8 +1651,15 @@ if ENABLE_FEATURE_IMPORTANCE:
                 m = fi_trainer.validate(tft, dataloaders=perm_loader, verbose=False)
                 perm_loss = float(m[0].get("val_loss", np.nan)) if m else np.nan
                 delta = perm_loss - baseline if (np.isfinite(perm_loss) and np.isfinite(baseline)) else np.nan
-                print(f"[FI] {feat}: val_loss={perm_loss:.8f} Δ={delta:.8f}")
+                # print(f"  • {feat:>30s} Δloss = {delta:+.6f}")
                 fi_rows.append({"feature": feat, "baseline_val_loss": baseline, "perm_val_loss": perm_loss, "delta": delta})
+                # Append the row to the checkpoint file
+                try:
+                    import pandas as _pd
+                    _row_df = _pd.DataFrame([fi_rows[-1]])
+                    _row_df.to_csv(fi_ckpt_path, mode="a", header=not fi_ckpt_path.exists(), index=False)
+                except Exception as _e:
+                    print(f"[FI][WARN] Could not append FI checkpoint: {_e}")
                 try:
                     del perm_loader
                     del perm_ds
@@ -1638,18 +1673,31 @@ if ENABLE_FEATURE_IMPORTANCE:
         import gc as _gc
         _gc.collect()
 
-        # Save to CSV locally and upload to GCS
+        # Save to CSV locally and upload to GCS (merge checkpoint + current rows)
         try:
             import pandas as _pd
-            fi_path = LOCAL_OUTPUT_DIR / f"tft_perm_importance_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv"
-            _pd.DataFrame(fi_rows).sort_values("delta", ascending=False).to_csv(fi_path, index=False)
-            print(f"✓ Saved permutation importance → {fi_path}")
-            try:
-                upload_file_to_gcs(str(fi_path), f"{GCS_OUTPUT_PREFIX}/{fi_path.name}")
-            except Exception as ue:
-                print(f"[WARN] Could not upload FI CSV: {ue}")
+            _all_rows = fi_rows.copy()
+            if fi_ckpt_path.exists():
+                try:
+                    _prev = _pd.read_csv(fi_ckpt_path)
+                    _all_rows.extend(_prev.to_dict("records"))
+                except Exception as _e:
+                    print(f"[FI][WARN] Could not merge FI checkpoint: {_e}")
+            # Drop duplicates by feature, keep last (current run wins)
+            _df = _pd.DataFrame(_all_rows)
+            if not _df.empty:
+                _df = _df.drop_duplicates(subset=["feature"], keep="last")
+                fi_path = LOCAL_OUTPUT_DIR / f"tft_perm_importance_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv"
+                _df.sort_values("delta", ascending=False).to_csv(fi_path, index=False)
+                print(f"✓ Saved permutation importance → {fi_path}")
+                try:
+                    upload_file_to_gcs(str(fi_path), f"{GCS_OUTPUT_PREFIX}/{fi_path.name}")
+                except Exception as ue:
+                    print(f"[WARN] Could not upload FI CSV: {ue}")
+            else:
+                print("[FI][WARN] No FI rows collected; nothing to save.")
         except Exception as se:
-            print(f"[WARN] Could not save FI CSV: {se}")
+            print(f"[FI][WARN] Could not save FI CSV: {se}")
 
     except Exception as e:
         print(f"[FI][WARN] Permutation importance failed: {e}")
