@@ -830,6 +830,30 @@ class PerAssetMetrics(pl.Callback):
             "yd": yd_cpu,
             "pd": pd_cpu,
         }
+        # ---- concise per-epoch validation metrics printout ----
+        try:
+            epoch_num = int(getattr(trainer, "current_epoch", -1)) + 1
+        except Exception:
+            epoch_num = None
+        try:
+            ov = self._last_overall
+            msg = f"[VAL EPOCH {epoch_num}] MAE={ov['mae']:.6f} RMSE={ov['rmse']:.6f} QLIKE={ov['qlike']:.6f}"
+            # quick direction accuracy snapshot if available
+            dir_acc = None
+            if yd is not None and pd is not None and yd.numel() > 0 and pd.numel() > 0:
+                p1 = pd
+                try:
+                    if torch.isfinite(p1).any() and (p1.min() < 0 or p1.max() > 1):
+                        p1 = torch.sigmoid(p1)
+                except Exception:
+                    p1 = torch.sigmoid(p1)
+                p1 = torch.clamp(p1, 0.0, 1.0)
+                dir_acc = ((p1 >= 0.5).int() == yd.int()).float().mean().item()
+            if dir_acc is not None:
+                msg += f" | DIR_ACC={dir_acc:.3f}"
+            print(msg)
+        except Exception:
+            pass
 
     @torch.no_grad()
     def on_fit_end(self, trainer, pl_module):
@@ -1645,11 +1669,35 @@ if __name__ == "__main__":
           r = self._row(trainer, pl_module, "train")
           if r:
               self.rows.append(r)
+              try:
+                  ep = int(getattr(trainer, "current_epoch", -1)) + 1
+                  l1 = r.get("L1")
+                  l2 = r.get("L2")
+                  w1 = r.get("w1")
+                  w2 = r.get("w2")
+                  msg = f"[TRAIN EPOCH {ep}] L1_vol={l1:.6f} L2_dir={l2:.6f}"
+                  if w1 is not None and w2 is not None:
+                      msg += f" | w=({w1:.3f},{w2:.3f})"
+                  print(msg)
+              except Exception:
+                  pass
 
       def on_validation_epoch_end(self, trainer, pl_module):
           r = self._row(trainer, pl_module, "val")
           if r:
               self.rows.append(r)
+              try:
+                  ep = int(getattr(trainer, "current_epoch", -1)) + 1
+                  l1 = r.get("L1")
+                  l2 = r.get("L2")
+                  w1 = r.get("w1")
+                  w2 = r.get("w2")
+                  msg = f"[VAL   EPOCH {ep}] L1_vol={l1:.6f} L2_dir={l2:.6f}"
+                  if w1 is not None and w2 is not None:
+                      msg += f" | w=({w1:.3f},{w2:.3f})"
+                  print(msg)
+              except Exception:
+                  pass
 
       def on_train_end(self, trainer, pl_module):
           try:
