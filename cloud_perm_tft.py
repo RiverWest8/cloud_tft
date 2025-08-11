@@ -894,8 +894,11 @@ parser.add_argument("--gcs_output_prefix", type=str, default=None, help="Full GC
 parser.add_argument("--data_dir", type=str, default=None, help="Local folder containing universal_*.parquet; if set, prefer local over GCS")
 parser.add_argument("--num_workers", type=int, default=None, help="DataLoader workers (defaults to CPU count - 1)")
 parser.add_argument("--prefetch_factor", type=int, default=8, help="DataLoader prefetch factor (per worker)")
+# Performance / input control
 parser.add_argument("--check_val_every_n_epoch", type=int, default=1, help="Validate every N epochs")
 parser.add_argument("--log_every_n_steps", type=int, default=200, help="How often to log train steps")
+parser.add_argument("--fi_max_batches", type=int, default=None,
+                    help="Max number of validation batches to use for feature importance (baseline + per-feature). 0 or None = use all.")
 # Parse known args so stray platform args do not crash the script
 ARGS, _UNKNOWN = parser.parse_known_args()
 
@@ -1088,6 +1091,8 @@ if ARGS.perm_len is not None:
     PERM_BLOCK_SIZE = int(ARGS.perm_len)
 if ARGS.enable_perm_importance is not None:
     ENABLE_FEATURE_IMPORTANCE = bool(ARGS.enable_perm_importance)
+if getattr(ARGS, "fi_max_batches", None) is not None:
+    FI_MAX_BATCHES = int(ARGS.fi_max_batches)
 
 # -----------------------------------------------------------------------
 # Utility functions
@@ -1172,7 +1177,7 @@ if __name__ == "__main__":
     print(
         f"[CONFIG] batch_size={BATCH_SIZE} | encoder={MAX_ENCODER_LENGTH} | epochs={MAX_EPOCHS} | "
         f"patience={EARLY_STOP_PATIENCE} | perm_len={PERM_BLOCK_SIZE} | "
-        f"perm_importance={'on' if ENABLE_FEATURE_IMPORTANCE else 'off'}"
+        f"perm_importance={'on' if ENABLE_FEATURE_IMPORTANCE else 'off'} | fi_max_batches={FI_MAX_BATCHES}"
     )
     print("▶ Loading data …")
     train_df = add_time_idx(load_split(READ_PATHS[0]))
@@ -1618,8 +1623,34 @@ if __name__ == "__main__" and ENABLE_FEATURE_IMPORTANCE:
 
     print("▶ Permutation feature importance …")
 
+    from itertools import islice
+
+    class _HeadDataLoader:
+        """Wrapper that exposes only the first N batches of an existing DataLoader."""
+        def __init__(self, dl, max_batches: int):
+            self.dl = dl
+            self.max_batches = int(max_batches)
+        def __iter__(self):
+            return iter(islice(self.dl, self.max_batches))
+        def __len__(self):
+            try:
+                return min(self.max_batches, len(self.dl))
+            except Exception:
+                return self.max_batches
+
+    def _limit_batches(dl, n):
+        try:
+            n_int = int(n)
+            return _HeadDataLoader(dl, n_int) if n_int > 0 else dl
+        except Exception:
+            return dl
+
+    if FI_MAX_BATCHES is not None and int(FI_MAX_BATCHES) > 0:
+        print(f"[FI] Using at most {int(FI_MAX_BATCHES)} validation batches per evaluation.")
+
     # 1) Baseline val loss (uses your LearnableMultiTaskLoss)
-    baseline_row = trainer.validate(model=tft, dataloaders=val_dataloader, verbose=False)[0]
+    baseline_dl = _limit_batches(val_dataloader, FI_MAX_BATCHES)
+    baseline_row = trainer.validate(model=tft, dataloaders=baseline_dl, verbose=False)[0]
     baseline_val_loss = float(baseline_row["val_loss"])
     print(f"[BASELINE] val_loss = {baseline_val_loss:.6f}")
 
@@ -1668,7 +1699,7 @@ if __name__ == "__main__" and ENABLE_FEATURE_IMPORTANCE:
             perm_dl = perm_ds.to_dataloader(train=False, batch_size=val_dataloader.batch_size, num_workers=0)
 
             # 5) Evaluate the permuted loss
-            perm_row = trainer.validate(model=tft, dataloaders=perm_dl, verbose=False)[0]
+            perm_row = trainer.validate(model=tft, dataloaders=_limit_batches(perm_dl, FI_MAX_BATCHES), verbose=False)[0]
             perm_val_loss = float(perm_row["val_loss"]) 
 
             results.append({
