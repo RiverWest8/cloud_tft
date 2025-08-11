@@ -1840,6 +1840,10 @@ if __name__ == "__main__":
         LossHistory(),
         PerAssetMetrics(
             rev_asset,
-            vol_normalizer=(training_dataset.target_normalizer.normalizers[0]
-                            if hasattr(training_dataset.target_normalizer, "normalizers")
-                       <truncated__content/>
+            vol_normalizer=(
+                training_dataset.target_normalizer.normalizers[0]
+                if hasattr(training_dataset.target_normalizer, "normalizers")
+                else training_dataset.target_normalizer
+            ),
+        ),
+    ]
