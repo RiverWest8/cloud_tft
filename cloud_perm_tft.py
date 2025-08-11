@@ -1054,7 +1054,7 @@ MAX_PRED_LENGTH    = 1
 EMBEDDING_CARDINALITY = {}
 
 BATCH_SIZE   = 2048
-MAX_EPOCHS   = 1
+MAX_EPOCHS   = 5
 EARLY_STOP_PATIENCE = 20
 PERM_BLOCK_SIZE = 288
 
@@ -1068,7 +1068,7 @@ WEIGHT_DECAY = 0.00578350719515325     # weight decay for AdamW
 GRADIENT_CLIP_VAL = 0.78    # gradient clipping value for Trainer
 # Feature-importance controls
 ENABLE_FEATURE_IMPORTANCE = True   # gate FI so you can toggle it
-FI_MAX_BATCHES = 25               # number of val batches to sample for FI
+FI_MAX_BATCHES = 20              # number of val batches to sample for FI
 
 # ---- Apply CLI overrides (only when provided) ----
 if ARGS.batch_size is not None:
