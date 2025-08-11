@@ -493,6 +493,7 @@ class PerAssetMetrics(pl.Callback):
         self._pv_dev = []  # realised vol pred   (NORMALISED, device)
         self._yd_dev = []  # direction target (device)
         self._pd_dev = []  # direction pred logits/probs (device)
+        self._t_dev = []   # decoder time_idx (device) if provided
         # cached final rows/overall from last epoch
         self._last_rows = None
         self._last_overall = None
@@ -512,6 +513,11 @@ class PerAssetMetrics(pl.Callback):
 
         groups = x.get("groups")
         dec_t = x.get("decoder_target")
+        # optional time index for plotting/joining later
+        dec_time = x.get("decoder_time_idx", None)
+        if dec_time is None:
+            # some PF versions may expose relative index or time via different keys; try a few
+            dec_time = x.get("decoder_relative_idx", None)
         if groups is None or dec_t is None:
             return
 
@@ -606,6 +612,14 @@ class PerAssetMetrics(pl.Callback):
         self._g_dev.append(g.reshape(L))
         self._yv_dev.append(y_vol_t.reshape(L))
         self._pv_dev.append(p_vol.reshape(L))
+        # capture time index if available and shape-compatible
+        if dec_time is not None and torch.is_tensor(dec_time):
+            tvec = dec_time
+            # squeeze to [B]
+            while tvec.ndim > 1 and tvec.size(-1) == 1:
+                tvec = tvec.squeeze(-1)
+            if tvec.numel() >= L:
+                self._t_dev.append(tvec.reshape(-1)[:L])
         if y_dir_t is not None and p_dir is not None:
             L2 = min(L, y_dir_t.numel(), p_dir.numel())
             self._yd_dev.append(y_dir_t.reshape(-1)[:L2])
@@ -747,6 +761,51 @@ class PerAssetMetrics(pl.Callback):
             print(f"✓ Saved per-asset validation metrics (decoded, final) → {path}")
         except Exception as e:
             print(f"[WARN] Could not save final per-asset metrics: {e}")
+
+        # Optionally save per-sample predictions for plotting
+        try:
+            # Recompute decoded tensors from the stored device buffers
+            g_cpu = torch.cat(self._g_dev).detach().cpu() if self._g_dev else None
+            yv_cpu = torch.cat(self._yv_dev).detach().cpu() if self._yv_dev else None
+            pv_cpu = torch.cat(self._pv_dev).detach().cpu() if self._pv_dev else None
+            yd_cpu = torch.cat(self._yd_dev).detach().cpu() if self._yd_dev else None
+            pd_cpu = torch.cat(self._pd_dev).detach().cpu() if self._pd_dev else None
+            # decode vol back to physical scale
+            if g_cpu is not None and yv_cpu is not None and pv_cpu is not None:
+                yv_dec = self.vol_norm.decode(yv_cpu.unsqueeze(-1), group_ids=g_cpu.unsqueeze(-1)).squeeze(-1)
+                pv_dec = self.vol_norm.decode(pv_cpu.unsqueeze(-1), group_ids=g_cpu.unsqueeze(-1)).squeeze(-1)
+                # map group id -> name
+                assets = [self.id_to_name.get(int(i), str(int(i))) for i in g_cpu.tolist()]
+                # time index (may be missing)
+                t_cpu = torch.cat(self._t_dev).detach().cpu() if self._t_dev else None
+                df_out = pd.DataFrame({
+                    "asset": assets,
+                    "time_idx": t_cpu.numpy().tolist() if t_cpu is not None else [None] * len(assets),
+                    "y_vol": yv_dec.numpy().tolist(),
+                    "y_vol_pred": pv_dec.numpy().tolist(),
+                })
+                if yd_cpu is not None and pd_cpu is not None and yd_cpu.numel() > 0 and pd_cpu.numel() > 0:
+                    # ensure pd is probability
+                    pdp = pd_cpu
+                    try:
+                        if torch.isfinite(pdp).any() and (pdp.min() < 0 or pdp.max() > 1):
+                            pdp = torch.sigmoid(pdp)
+                    except Exception:
+                        pdp = torch.sigmoid(pdp)
+                    pdp = torch.clamp(pdp, 0.0, 1.0)
+                    Lm = min(len(df_out), yd_cpu.numel(), pdp.numel())
+                    df_out = df_out.iloc[:Lm].copy()
+                    df_out["y_dir"] = yd_cpu[:Lm].numpy().tolist()
+                    df_out["y_dir_prob"] = pdp[:Lm].numpy().tolist()
+                pred_path = LOCAL_OUTPUT_DIR / f"tft_val_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv"
+                df_out.to_csv(pred_path, index=False)
+                print(f"✓ Saved validation predictions → {pred_path}")
+                try:
+                    upload_file_to_gcs(str(pred_path), f"{GCS_OUTPUT_PREFIX}/{pred_path.name}")
+                except Exception as e:
+                    print(f"[WARN] Could not upload validation predictions: {e}")
+        except Exception as e:
+            print(f"[WARN] Could not save validation predictions: {e}")
             
 
 # -----------------------------------------------------------------------
@@ -1056,14 +1115,14 @@ GROUP_ID: List[str] = ["asset"]
 TIME_COL = "Time"
 TARGETS  = ["realised_vol", "direction"]
 
-MAX_ENCODER_LENGTH = 24
+MAX_ENCODER_LENGTH = 6
 MAX_PRED_LENGTH    = 1
 
 EMBEDDING_CARDINALITY = {}
 
 BATCH_SIZE   = 2048
-MAX_EPOCHS   = 3
-EARLY_STOP_PATIENCE = 20
+MAX_EPOCHS   = 5
+EARLY_STOP_PATIENCE = 3
 PERM_BLOCK_SIZE = 288
 
 # Artifacts are written locally then uploaded to GCS
