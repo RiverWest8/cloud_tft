@@ -1661,9 +1661,9 @@ if __name__ == "__main__":
             learnable_under=False,
             reg_lambda=1e-3,
         ),
-        loss_dir=WeightedBCELoss(pos_weight=1.17),
-        weights=(1, 0.2),
-    )
+        loss_dir=WeightedBCELoss(pos_weight=1.3),
+        weights=(0.3, 1.0),
+)
     # -----------------------------------------------------------------------
     # Training
     # -----------------------------------------------------------------------
@@ -1846,4 +1846,43 @@ if __name__ == "__main__":
                 else training_dataset.target_normalizer
             ),
         ),
-    ]
+]
+    print("▶ Creating Trainer …")
+trainer = Trainer(
+    max_epochs=MAX_EPOCHS,
+    accelerator=ACCELERATOR,
+    devices=DEVICES,
+    precision=PRECISION,
+    default_root_dir=str(LOCAL_RUN_DIR),
+    callbacks=callbacks,
+    logger=logger,
+    check_val_every_n_epoch=int(getattr(ARGS, "check_val_every_n_epoch", 1)),
+    log_every_n_steps=int(getattr(ARGS, "log_every_n_steps", 200)),
+    gradient_clip_val=GRADIENT_CLIP_VAL,
+)
+
+# Resume logic with epoch bump if needed
+resume_ckpt = get_resume_ckpt_path()
+if resume_ckpt:
+    print(f"▶ Resuming from checkpoint: {resume_ckpt}")
+    try:
+        import torch as _torch
+        _meta = _torch.load(resume_ckpt, map_location="cpu")
+        _epoch = None
+        for k in ("epoch", "current_epoch"):
+            if isinstance(_meta, dict) and k in _meta:
+                _epoch = int(_meta[k])
+                break
+        if _epoch is not None:
+            need = int(_epoch) + 1
+            fit_loop = getattr(trainer, "fit_loop", None)
+            if fit_loop is not None and getattr(fit_loop, "max_epochs", None) is not None:
+                if fit_loop.max_epochs < need:
+                    print(f"[INFO] Bumping Trainer.max_epochs {fit_loop.max_epochs} → {need} to match checkpoint epoch {_epoch}.")
+                    fit_loop.max_epochs = need
+    except Exception as e:
+        print(f"[WARN] Could not inspect checkpoint epoch: {e}. Proceeding without bump.")
+
+print("▶ Starting training …")
+trainer.fit(tft, train_dataloader, val_dataloader, ckpt_path=resume_ckpt)
+print("✓ Training finished.")
