@@ -976,7 +976,7 @@ EMBEDDING_CARDINALITY = {}
 
 BATCH_SIZE   = 2048
 MAX_EPOCHS   = 5
-EARLY_STOP_PATIENCE = 3
+EARLY_STOP_PATIENCE = 4
 PERM_BLOCK_SIZE = 288
 
 # Artifacts are written locally then uploaded to GCS
@@ -989,7 +989,7 @@ WEIGHT_DECAY = 0.00578350719515325     # weight decay for AdamW
 GRADIENT_CLIP_VAL = 0.78    # gradient clipping value for Trainer
 # Feature-importance controls
 ENABLE_FEATURE_IMPORTANCE = True   # gate FI so you can toggle it
-FI_MAX_BATCHES = 5       # number of val batches to sample for FI
+FI_MAX_BATCHES = 16       # number of val batches to sample for FI
 
 # ---- Apply CLI overrides (only when provided) ----
 if ARGS.batch_size is not None:
@@ -1546,4 +1546,91 @@ if resume_ckpt:
 
 print("▶ Starting training …")
 trainer.fit(tft, train_dataloader, val_dataloader, ckpt_path=resume_ckpt)
+# -----------------------------------------------------------------------
+# Permutation Feature Importance (fast, limited val batches)
+# -----------------------------------------------------------------------
 print("✓ Training finished.")
+if ENABLE_FEATURE_IMPORTANCE:
+    try:
+        print("▶ Running permutation feature importance …")
+
+        rng = np.random.default_rng(SEED)
+
+        def _permute_by_blocks(df_in: pd.DataFrame, col: str, group_col: str = GROUP_ID[0], block_size: int = PERM_BLOCK_SIZE) -> pd.DataFrame:
+            """Shuffle contiguous blocks of length `block_size` within each group for column `col`.
+            Keeps distribution roughly intact while breaking temporal alignment.
+            """
+            df = df_in.copy()
+            if col not in df.columns:
+                return df
+            for g, sub in df.groupby(group_col, sort=False):
+                idx = sub.index.to_numpy()
+                if idx.size == 0:
+                    continue
+                # Build block index array: [0,0,...,1,1,...,2,2,...]
+                n_blocks = max(1, int(np.ceil(idx.size / float(block_size))))
+                block_ids = np.repeat(np.arange(n_blocks), block_size)[: idx.size]
+                # Permute block order
+                rng.shuffle(block_ids)
+                # Reorder indices by permuted block ids but keep within-block order
+                order = np.argsort(block_ids, kind="stable")
+                df.loc[idx, col] = sub[col].to_numpy()[order]
+            return df
+
+        # Build a lightweight validation-only Trainer with a cap on batches
+        fi_trainer = Trainer(
+            accelerator=ACCELERATOR,
+            devices=DEVICES,
+            precision=PRECISION,
+            logger=False,
+            enable_checkpointing=False,
+            limit_val_batches=int(FI_MAX_BATCHES),
+            enable_progress_bar=False,
+        )
+
+        # Baseline loss on the *original* validation set (limited batches)
+        base_metrics = fi_trainer.validate(tft, dataloaders=val_dataloader, verbose=False)
+        baseline = float(base_metrics[0].get("val_loss", np.nan)) if base_metrics else np.nan
+        print(f"[FI] Baseline val_loss (first {FI_MAX_BATCHES} batches): {baseline:.8f}")
+
+        # Candidate features: both unknown and known reals used by the model
+        fi_features = list(dict.fromkeys(time_varying_unknown_reals + time_varying_known_reals))
+
+        fi_rows = []
+        for feat in fi_features:
+            try:
+                perm_df = _permute_by_blocks(val_df, feat)
+                perm_ds = build_dataset(perm_df, predict=False)
+                perm_loader = perm_ds.to_dataloader(
+                    train=False,
+                    batch_size=batch_size,
+                    num_workers=worker_cnt,
+                    persistent_workers=use_persist,
+                    pin_memory=pin,
+                    prefetch_factor=prefetch,
+                )
+                m = fi_trainer.validate(tft, dataloaders=perm_loader, verbose=False)
+                perm_loss = float(m[0].get("val_loss", np.nan)) if m else np.nan
+                delta = perm_loss - baseline if (np.isfinite(perm_loss) and np.isfinite(baseline)) else np.nan
+                print(f"[FI] {feat}: val_loss={perm_loss:.8f} Δ={delta:.8f}")
+                fi_rows.append({"feature": feat, "baseline_val_loss": baseline, "perm_val_loss": perm_loss, "delta": delta})
+            except Exception as e:
+                print(f"[FI][WARN] Failed on feature '{feat}': {e}")
+
+        # Save to CSV locally and upload to GCS
+        try:
+            import pandas as _pd
+            fi_path = LOCAL_OUTPUT_DIR / f"tft_perm_importance_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv"
+            _pd.DataFrame(fi_rows).sort_values("delta", ascending=False).to_csv(fi_path, index=False)
+            print(f"✓ Saved permutation importance → {fi_path}")
+            try:
+                upload_file_to_gcs(str(fi_path), f"{GCS_OUTPUT_PREFIX}/{fi_path.name}")
+            except Exception as ue:
+                print(f"[WARN] Could not upload FI CSV: {ue}")
+        except Exception as se:
+            print(f"[WARN] Could not save FI CSV: {se}")
+
+    except Exception as e:
+        print(f"[FI][WARN] Permutation importance failed: {e}")
+else:
+    print("[FI] Skipped (ENABLE_FEATURE_IMPORTANCE is False).")
