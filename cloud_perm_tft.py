@@ -61,7 +61,7 @@ from pytorch_forecasting import (
 from pytorch_forecasting.data import GroupNormalizer
 from pytorch_forecasting.data import MultiNormalizer, TorchNormalizer
 
-from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
+from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint, TQDMProgressBar
 from lightning.pytorch.loggers import TensorBoardLogger
 
 # --- Cloud / performance helpers ---
@@ -1353,7 +1353,7 @@ if __name__ == "__main__":
           loss = trainer.callback_metrics.get("train_loss_epoch")
           if loss is not None:
               self.records.append(
-                  {"epoch": trainer.current_epoch, "train_loss": float(loss)}
+                  {"epoch": int(getattr(trainer, "current_epoch", -1)), "train_loss": float(f"{float(loss):.8f}")}
               )
       def on_train_end(self, trainer, pl_module):
           if self.records:
@@ -1364,6 +1364,60 @@ if __name__ == "__main__":
                   upload_file_to_gcs(self.path, f"{GCS_OUTPUT_PREFIX}/{os.path.basename(self.path)}")
               except Exception as e:
                   print(f"[WARN] Could not upload loss history: {e}")
+
+
+    class HighPrecisionTQDM(TQDMProgressBar):
+        """Progress bar that shows key metrics with higher precision."""
+        def get_metrics(self, trainer, pl_module):
+            metrics = super().get_metrics(trainer, pl_module)
+            # Pull raw values from callback_metrics when possible and format to 8 dp
+            keys = (
+                "loss", "train_loss_step", "train_loss", "train_loss_epoch",
+                "val_loss", "val_loss_decoded", "val_mae_dec"
+            )
+            for k in keys:
+                try:
+                    if k in trainer.callback_metrics:
+                        v = float(trainer.callback_metrics[k])
+                        metrics[k] = f"{v:.8f}"
+                    elif k in metrics:
+                        # fallback to whatever Lightning provided
+                        v = float(metrics[k])
+                        metrics[k] = f"{v:.8f}"
+                except Exception:
+                    # ignore non-float or missing
+                    pass
+            return metrics
+
+    class StepLossSaver(pl.Callback):
+        """Saves train_loss_step every logged batch with high precision."""
+        def __init__(self, path: str = str(LOCAL_RUN_DIR / f"tft_step_losses_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv")):
+            self.path = path
+            self.rows = []
+        def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+            try:
+                v = trainer.callback_metrics.get("train_loss_step")
+                if v is not None:
+                    self.rows.append({
+                        "global_step": int(getattr(trainer, "global_step", 0)),
+                        "epoch": int(getattr(trainer, "current_epoch", -1)),
+                        "train_loss_step": float(f"{float(v):.8f}")
+                    })
+            except Exception:
+                pass
+        def on_train_end(self, trainer, pl_module):
+            if not self.rows:
+                return
+            try:
+                import pandas as pd
+                pd.DataFrame(self.rows).to_csv(self.path, index=False)
+                print(f"✓ Saved step loss history → {self.path}")
+                try:
+                    upload_file_to_gcs(self.path, f"{GCS_OUTPUT_PREFIX}/{os.path.basename(self.path)}")
+                except Exception as e:
+                    print(f"[WARN] Could not upload step loss history: {e}")
+            except Exception as e:
+                print(f"[WARN] Could not save step loss history: {e}")
 
     class EpochPrinter(pl.Callback):
         """Print lightweight, periodic training status updates per epoch.
@@ -1391,17 +1445,17 @@ if __name__ == "__main__":
             parts = [f"✓ Epoch {trainer.current_epoch + 1}/{self.total} done"]
             if train_loss is not None:
                 try:
-                    parts.append(f"train_loss={float(train_loss):.5f}")
+                    parts.append(f"train_loss={float(train_loss):.8f}")
                 except Exception:
                     pass
             if val_loss is not None:
                 try:
-                    parts.append(f"val_loss={float(val_loss):.6f}")
+                    parts.append(f"val_loss={float(val_loss):.8f}")
                 except Exception:
                     pass
             if val_mae_dec is not None:
                 try:
-                    parts.append(f"val_mae_dec={float(val_mae_dec):.6f}")
+                    parts.append(f"val_mae_dec={float(val_mae_dec):.8f}")
                 except Exception:
                     pass
             if lr_str is not None:
@@ -1436,6 +1490,7 @@ if __name__ == "__main__":
     ckpt_uploader_cb = MirrorCheckpoints()
 
     callbacks = [
+        HighPrecisionTQDM(),
         best_ckpt_cb,
         ckpt_uploader_cb,
         EpochPrinter(MAX_EPOCHS),
@@ -1443,6 +1498,7 @@ if __name__ == "__main__":
         EarlyStopping(monitor="val_loss", patience=EARLY_STOP_PATIENCE, mode="min"),
         ComponentLossLogger(),
         LossHistory(),
+        StepLossSaver(),
         PerAssetMetrics(
             rev_asset,
             vol_normalizer=(
