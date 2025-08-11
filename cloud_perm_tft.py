@@ -878,7 +878,7 @@ def gcs_exists(path: str) -> bool:
 TRAIN_URI = f"{GCS_DATA_PREFIX}/universal_train_10k.parquet"
 VAL_URI   = f"{GCS_DATA_PREFIX}/universal_val_10k.parquet"
 TEST_URI  = f"{GCS_DATA_PREFIX}/universal_test_10k.parquet"
-READ_PATHS = [str(TRAIN_FILE), str(VAL_FILE), str(TEST_FILE)]
+READ_PATHS = [str(TRAIN_URI), str(VAL_URI), str(TEST_URI)]
 '''
 # If a local data folder is explicitly provided, use it and skip GCS
 if getattr(ARGS, "data_dir", None):
@@ -895,6 +895,7 @@ elif not all(map(gcs_exists, [TRAIN_URI, VAL_URI, TEST_URI])):
     TEST_FILE  = DATA_DIR / "universal_test.parquet"
     READ_PATHS = [str(TRAIN_FILE), str(VAL_FILE), str(TEST_FILE)]
 else:
+    READ_PATHS = [str(TRAIN_URI), str(VAL_URI), str(TEST_URI)]
 '''    
 
 # --- Validate data availability early with helpful errors ---
