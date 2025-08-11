@@ -517,7 +517,9 @@ class PerAssetMetrics(pl.Callback):
         if dec_time is None:
             # some PF versions may expose relative index or time via different keys; try a few
             dec_time = x.get("decoder_relative_idx", None)
-        if groups is None or dec_t is None:
+        # also fetch explicit targets from batch[1] as a fallback
+        y_batch = batch[1] if isinstance(batch, (list, tuple)) and len(batch) >= 2 else None
+        if groups is None:
             return
 
         # groups can be a Tensor or a list[Tensor]; take the first if list
@@ -573,22 +575,22 @@ class PerAssetMetrics(pl.Callback):
             pred = pred["prediction"]
 
         def _extract_heads(pred):
-            # returns (p_vol: [B], p_dir: [B] or None) on DEVICE
-            if isinstance(pred, (list, tuple)):
-                p_vol_t = pred[0]
-                p_dir_t = pred[1] if len(pred) > 1 else None
-            else:
-                p_vol_t, p_dir_t = pred, None
+            """Return (p_vol, p_dir) as 1D tensors [B] on DEVICE.
+            Handles outputs as:
+              • list/tuple: [vol(…,7), dir(…,7 or 1/2)]
+              • tensor [B, 2, 7] (after our predict_step squeeze)
+              • tensor [B, 1, 7] (vol only)
+              • tensor [B, 7] (vol only)
+            """
+            import torch
 
             def _to_median_q(t):
                 if t is None:
                     return None
                 if t.ndim == 3 and t.size(1) == 1:
                     t = t.squeeze(1)  # [B,7]
-                if t.ndim == 2 and t.size(-1) >= 7:
-                    return t[:, t.size(-1) // 2]  # median quantile
-                if t.ndim == 2 and t.size(-1) == 1:
-                    return t[:, 0]
+                if t.ndim == 2 and t.size(-1) >= 1:
+                    return t[:, t.size(-1) // 2]
                 if t.ndim == 1:
                     return t
                 return t.reshape(t.size(0), -1)[:, 0]
@@ -597,18 +599,40 @@ class PerAssetMetrics(pl.Callback):
                 if t is None:
                     return None
                 if t.ndim == 3 and t.size(1) == 1:
-                    t = t.squeeze(1)
-                if t.ndim == 2 and t.size(-1) >= 7:
+                    t = t.squeeze(1)  # [B,7] or [B,1]
+                # if replicated across 7, take middle slot; if single, squeeze
+                if t.ndim == 2 and t.size(-1) >= 1:
                     return t[:, t.size(-1) // 2]
-                if t.ndim == 2 and t.size(-1) == 1:
-                    return t[:, 0]
                 if t.ndim == 1:
                     return t
                 return t.reshape(t.size(0), -1)[:, 0]
 
-            p_vol = _to_median_q(p_vol_t)
-            p_dir = _to_dir_logit(p_dir_t)
-            return p_vol, p_dir
+            # Case 1: PF-style list/tuple per target
+            if isinstance(pred, (list, tuple)):
+                p_vol_t = pred[0]
+                p_dir_t = pred[1] if len(pred) > 1 else None
+                return _to_median_q(p_vol_t), _to_dir_logit(p_dir_t)
+
+            # Case 2: our DualOutputModule returns a stacked tensor
+            if torch.is_tensor(pred):
+                t = pred
+                # squeeze prediction-length dim if present → [B, 2, 7] or [B, 1, 7]
+                if t.ndim == 4 and t.size(1) == 1:
+                    t = t.squeeze(1)
+                # Full two-head output: [B, 2, 7]
+                if t.ndim == 3 and t.size(1) == 2:
+                    vol = t[:, 0, :]  # [B,7]
+                    d   = t[:, 1, :]  # [B,7] replicated direction logit
+                    return _to_median_q(vol), _to_dir_logit(d)
+                # Vol-only variants
+                if t.ndim == 3 and t.size(1) == 1:
+                    vol = t[:, 0, :]  # [B,7]
+                    return _to_median_q(vol), None
+                if t.ndim == 2 and t.size(-1) >= 1:
+                    return _to_median_q(t), None
+
+            # Fallback: treat as vol-only
+            return _to_median_q(pred), None
 
         p_vol, p_dir = _extract_heads(pred)
         if p_vol is None:
@@ -726,12 +750,12 @@ class PerAssetMetrics(pl.Callback):
 
         dir_overall = None
         yd = overall.get("yd", None)
-        pd = overall.get("pd", None)
-        if yd is not None and pd is not None and yd.numel() > 0 and pd.numel() > 0:
+        pd_all = overall.get("pd", None)
+        if yd is not None and pd_all is not None and yd.numel() > 0 and pd_all.numel() > 0:
             try:
-                L = min(yd.numel(), pd.numel())
+                L = min(yd.numel(), pd_all.numel())
                 yd1 = yd[:L].float()
-                pd1 = pd[:L]
+                pd1 = pd_all[:L]
                 try:
                     if torch.isfinite(pd1).any() and (pd1.min() < 0 or pd1.max() > 1):
                         pd1 = torch.sigmoid(pd1)
@@ -776,6 +800,7 @@ class PerAssetMetrics(pl.Callback):
 
         # Optionally save per-sample predictions for plotting
         try:
+            import pandas as pd  # ensure pd is bound locally and not shadowed
             # Recompute decoded tensors from the stored device buffers
             g_cpu = torch.cat(self._g_dev).detach().cpu() if self._g_dev else None
             yv_cpu = torch.cat(self._yv_dev).detach().cpu() if self._yv_dev else None
@@ -1653,7 +1678,25 @@ if __name__ == "__main__":
     # Load best checkpoint (by val_loss) if available
     if best_ckpt_cb.best_model_path:
         try:
-            ckpt = torch.load(best_ckpt_cb.best_model_path, map_location="cpu")
+            # Torch 2.6: default weights_only=True. Allowlist PF globals, then try safe load.
+            try:
+                from torch.serialization import add_safe_globals
+                try:
+                    from pytorch_forecasting.data.encoders import MultiNormalizer as _PFMultiNorm
+                    add_safe_globals([_PFMultiNorm])
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            ckpt = None
+            try:
+                ckpt = torch.load(best_ckpt_cb.best_model_path, map_location="cpu", weights_only=True)
+            except TypeError:
+                # older torch without weights_only kwarg
+                ckpt = torch.load(best_ckpt_cb.best_model_path, map_location="cpu")
+            except Exception:
+                # trusted source; fall back to full load
+                ckpt = torch.load(best_ckpt_cb.best_model_path, map_location="cpu", weights_only=False)
             state = ckpt.get("state_dict", ckpt)
             missing, unexpected = tft.load_state_dict(state, strict=False)
             if missing or unexpected:
