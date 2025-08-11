@@ -1455,7 +1455,7 @@ if __name__ == "__main__":
         attention_head_size=2,
         dropout=0.0833704625250354,
         hidden_continuous_size=16,
-        learning_rate=0.0017978228305103793,
+        learning_rate=0.0024978228305103793,
         optimizer="adamw",
         weight_decay=WEIGHT_DECAY,
         # 7 quantiles for vol + 1 logit for direction
@@ -1467,7 +1467,7 @@ if __name__ == "__main__":
                 learnable_under=True,
                 reg_lambda=1e-3,
             ),
-            loss_dir=LabelSmoothedBCE(smoothing=0.1, init_pos_weight=1.2, ema_beta=0.99, pw_min=0.2, pw_max=5.0),
+            loss_dir = nn.BCEWithLogitsLoss()  # simple, stable baseline#loss_dir=LabelSmoothedBCE(smoothing=0.1, init_pos_weight=1.2, ema_beta=0.99, pw_min=0.2, pw_max=5.0),
             init_weights=(1.0, 0.3),  # weights=[vol, dir] → vol=1.0, dir=0.3
         ),
         logging_metrics=[],
