@@ -44,7 +44,6 @@ import os
 from pathlib import Path
 from typing import List
 import json
-import csv
 import numpy as np
 import pandas as pd
 import lightning as pl
@@ -54,13 +53,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # ------------------ Added imports for new FI block ------------------
-import time
-import numpy as np
-import torch
-import json
-import os
-from datetime import datetime
-import subprocess
 
 from pytorch_forecasting import (
     TemporalFusionTransformer,
@@ -80,7 +72,6 @@ except Exception:
     gcsfs = None
 
 # CUDA perf knobs / utils
-import math
 import shutil
 import argparse
 
@@ -185,337 +176,6 @@ class LabelSmoothedBCE(nn.Module):
             y_pred.squeeze(-1), target.squeeze(-1),
             pos_weight=self.pos_weight,
         )
-
-# ---------------------------------------------------------------------
-# Learnable Multi-Task Loss with Uncertainty-style Weights
-# ---------------------------------------------------------------------
-class LearnableMultiTaskLoss(nn.Module):
-    """
-    Two-loss combiner with learnable uncertainty-style weights.
-    total = exp(-s1) * L1 + exp(-s2) * L2 + (s1 + s2)
-    Initialize with desired starting weights w_i via s_i = -log(w_i).
-    Expects y_pred to be a list/tuple: [pred_vol, pred_dir].
-    """
-    def __init__(self, loss_vol: nn.Module, loss_dir: nn.Module, init_weights=(1.0, 0.4)):
-        super().__init__()
-        self.loss_vol = loss_vol
-        self.loss_dir = loss_dir
-        w1, w2 = float(init_weights[0]), float(init_weights[1])
-        # s_i = -log(w_i) so that exp(-s_i) = w_i at initialization
-        s1 = -np.log(max(w1, 1e-8))
-        s2 = -np.log(max(w2, 1e-8))
-        self.s = nn.Parameter(torch.tensor([s1, s2], dtype=torch.float32))
-
-    def forward(self, y_pred, target, **kwargs):
-                # --- normalize y_pred to (p_vol, p_dir) ---
-        if isinstance(y_pred, (list, tuple)) and len(y_pred) >= 2:
-            p_vol, p_dir = y_pred[0], y_pred[1]
-        elif torch.is_tensor(y_pred):
-            # Accept shapes [..., 2, 7] or [..., 14]
-            if y_pred.ndim >= 3 and y_pred.size(-2) == 2 and y_pred.size(-1) == 7:
-                p_vol = y_pred[..., 0, :]       # [..., 7]
-                # direction logits were replicated across 7; take the median slot and keep last-dim=1
-                p_dir = y_pred[..., 1, 3:4]     # [..., 1]
-            elif y_pred.ndim >= 2 and y_pred.size(-1) == 14:
-                y_resh = y_pred.view(*y_pred.shape[:-1], 2, 7)
-                p_vol = y_resh[..., 0, :]
-                p_dir = y_resh[..., 1, 3:4]
-            else:
-                # assume single-target case
-                p_vol, p_dir = y_pred, None
-        else:
-            p_vol, p_dir = y_pred, None
-
-        # Unpack targets; direction may be missing → set yd=None
-        yv, yd = None, None
-        if torch.is_tensor(target):
-            t = target
-            if t.ndim == 3:
-                # shapes like [B, pred_len, n_targets]
-                if t.size(-1) >= 2:
-                    yv = t[..., 0]
-                    yd = t[..., 1]
-                elif t.size(-1) == 1:
-                    yv = t[..., 0]
-            elif t.ndim == 2:
-                if t.size(-1) >= 2:
-                    yv = t[:, 0]
-                    yd = t[:, 1]
-                elif t.size(-1) == 1:
-                    yv = t[:, 0]
-            elif t.ndim == 1:
-                yv = t
-            else:
-                raise ValueError(f"Unexpected target shape: {t.shape}")
-        elif isinstance(target, (list, tuple)):
-            if len(target) >= 1:
-                yv = target[0]
-            if len(target) >= 2:
-                yd = target[1]
-            # Squeeze trailing singleton dims if present
-            if torch.is_tensor(yv) and yv.ndim >= 3 and yv.size(-1) == 1:
-                yv = yv[..., 0]
-            if torch.is_tensor(yd) and yd is not None and yd.ndim >= 3 and yd.size(-1) == 1:
-                yd = yd[..., 0]
-        else:
-            raise TypeError("LearnableMultiTaskLoss expects target tensor or list/tuple of tensors")
-
-        if yv is None:
-            raise ValueError("Volatility target is missing; cannot compute primary loss.")
-
-        # Compute individual losses
-        L1 = self.loss_vol(p_vol, yv)
-        if L1.ndim > 0:
-            L1 = L1.mean()
-
-        # Direction loss is optional if target/pred is missing
-        do_dir = (p_dir is not None) and (yd is not None)
-        if do_dir:
-            if isinstance(self.loss_dir, nn.CrossEntropyLoss):
-                if p_dir.ndim > 2:
-                    p_dir = p_dir.reshape(p_dir.size(0), -1)
-                yd_ce = yd.long().reshape(-1)
-                L2 = self.loss_dir(p_dir, yd_ce)
-            else:
-                L2 = self.loss_dir(p_dir, yd)
-            if L2.ndim > 0:
-                L2 = L2.mean()
-        else:
-            L2 = torch.tensor(0.0, device=p_vol.device, dtype=p_vol.dtype)
-
-        # Combine with learnable weights; incl
-        weights = torch.exp(-self.s) 
-        try:
-            self.last_w = weights.detach().float().clone()
-        except Exception:
-            pass
-        total = weights[0] * L1 + (weights[1] * L2 if do_dir else 0.0) + (self.s[0] + (self.s[1] if do_dir else 0.0))
-        return total
-
-    # ------------------------------------------------------------------
-    # Minimal PF output-transform interface
-    # ------------------------------------------------------------------
-    def rescale_parameters(self, parameters, target_scale=None, **kwargs):
-        """
-        PF calls `loss.rescale_parameters(params, target_scale=...)` inside
-        `BaseModel.transform_output`. Our heads already produce values in the
-        same normalized space as the targets, so we **no-op** here and return
-        the parameters unchanged.  (Decoding to physical scale is handled
-        explicitly later via the dataset normalizer.)
-        """
-        return parameters
-
-    def to_prediction(self, parameters, **kwargs):
-        """
-        PF may call `loss.to_prediction(params)` when building the output
-        object for logging. For our composite loss, the network already emits
-        predictions (quantiles for vol; logits for direction), so simply
-        pass them through unchanged.
-        """
-        return parameters
-
-    def to_quantiles(self, parameters, quantiles=None, **kwargs):
-        """
-        PF uses this to extract quantile forecasts for logging/plots.
-        Our network outputs either:
-          • list/tuple [vol(…,7), dir(…,1 or 7)]
-          • tensor of shape [..., 2, 7] (we stack vol and repeated-dir over the last 2 axes)
-        Return a list [vol_quantiles, dir_quantiles], where dir_quantiles is a
-        repeated sigmoid(logit) over the 7 slots so the shapes match.
-        """
-        import torch
-        # normalise inputs
-        if isinstance(parameters, (list, tuple)) and len(parameters) >= 2:
-            vol, d = parameters[0], parameters[1]
-            # ensure dir has last-dim length 7
-            if torch.is_tensor(d):
-                if d.ndim >= 1 and d.size(-1) == 1:
-                    d = d.repeat_interleave(7, dim=-1)
-                elif d.ndim >= 1 and d.size(-1) == 2:
-                    d = d.softmax(-1)[..., 1].unsqueeze(-1).repeat_interleave(7, dim=-1)
-            dir_q = torch.sigmoid(d) if torch.is_tensor(d) else d
-            return [vol, dir_q]
-        elif torch.is_tensor(parameters):
-            t = parameters
-            if t.ndim >= 3 and t.size(-2) == 2 and t.size(-1) == 7:
-                vol = t[..., 0, :]
-                d   = t[..., 1, :]
-                return [vol, torch.sigmoid(d)]
-            # fallback: assume single-target quantiles (vol only)
-            return [t]
-        else:
-            return [parameters]
-
-
-# ---------------------------------------------------------------------
-# Fixed Multi-Task Loss with Constant Weights
-# ---------------------------------------------------------------------
-class FixedMultiTaskLoss(nn.Module):
-    """
-    Two-loss combiner with **fixed** weights (no learnable s). Returns L1 + L2.
-    Keeps .last_* attributes for logging compatibility.
-    Expects y_pred to be a list/tuple [pred_vol, pred_dir] or a stacked tensor
-    shaped [..., 2, 7] as produced by DualOutputModule.
-    """
-    def __init__(self, loss_vol: nn.Module, loss_dir: nn.Module, weights=(1.0, 0.4)):
-        super().__init__()
-        self.loss_vol = loss_vol
-        self.loss_dir = loss_dir
-        w1, w2 = float(weights[0]), float(weights[1])
-        self.register_buffer("w", torch.tensor([w1, w2], dtype=torch.float32))
-        # defaults for logger
-        self.last_L1 = torch.tensor(0.0)
-        self.last_L2 = torch.tensor(0.0)
-        self.last_s  = torch.tensor([0.0, 0.0])
-        self.last_w  = torch.tensor([w1, w2])
-
-    def _extract_heads(self, y_pred):
-        # Mirrors the extraction logic from LearnableMultiTaskLoss
-        if isinstance(y_pred, (list, tuple)) and len(y_pred) >= 2:
-            return y_pred[0], y_pred[1]
-        if torch.is_tensor(y_pred):
-            t = y_pred
-            if t.ndim >= 3 and t.size(-2) == 2 and t.size(-1) == 7:
-                return t[..., 0, :], t[..., 1, 3:4]
-            if t.ndim >= 2 and t.size(-1) == 14:
-                y_resh = t.view(*t.shape[:-1], 2, 7)
-                return y_resh[..., 0, :], y_resh[..., 1, 3:4]
-            return y_pred, None
-        return y_pred, None
-
-    def _extract_targets(self, target):
-        yv, yd = None, None
-        if torch.is_tensor(target):
-            t = target
-            if t.ndim == 3:
-                if t.size(-1) >= 2:
-                    yv, yd = t[..., 0], t[..., 1]
-                else:
-                    yv = t[..., 0]
-            elif t.ndim == 2:
-                if t.size(-1) >= 2:
-                    yv, yd = t[:, 0], t[:, 1]
-                else:
-                    yv = t[:, 0]
-            elif t.ndim == 1:
-                yv = t
-        elif isinstance(target, (list, tuple)):
-            if len(target) >= 1: yv = target[0]
-            if len(target) >= 2: yd = target[1]
-            if torch.is_tensor(yv) and yv.ndim >= 3 and yv.size(-1) == 1: yv = yv[..., 0]
-            if torch.is_tensor(yd) and yd is not None and yd.ndim >= 3 and yd.size(-1) == 1: yd = yd[..., 0]
-        return yv, yd
-
-    def forward(self, y_pred, target, **kwargs):
-        p_vol, p_dir = self._extract_heads(y_pred)
-        yv, yd = self._extract_targets(target)
-        if yv is None:
-            raise ValueError("Volatility target is missing; cannot compute primary loss.")
-        L1 = self.loss_vol(p_vol, yv)
-        if L1.ndim > 0: L1 = L1.mean()
-        do_dir = (p_dir is not None) and (yd is not None)
-        if do_dir:
-            L2 = self.loss_dir(p_dir, yd)
-            if L2.ndim > 0: L2 = L2.mean()
-        else:
-            L2 = torch.tensor(0.0, device=p_vol.device, dtype=p_vol.dtype)
-        # logging compatibility
-        self.last_L1 = L1.detach()
-        self.last_L2 = L2.detach()
-        self.last_s  = torch.tensor([0.0, 0.0], device=L1.device)
-        self.last_w  = self.w.detach()
-        return self.w[0] * L1 + self.w[1] * L2
-
-    # keep PF hooks as no-ops/identity
-    def rescale_parameters(self, parameters, target_scale=None, **kwargs):
-        return parameters
-    def to_prediction(self, parameters, **kwargs):
-        return parameters
-    def to_quantiles(self, parameters, quantiles=None, **kwargs):
-        if isinstance(parameters, (list, tuple)) and len(parameters) >= 2:
-            vol, d = parameters[0], parameters[1]
-            if torch.is_tensor(d):
-                if d.ndim >= 1 and d.size(-1) == 1:
-                    d = d.repeat_interleave(7, dim=-1)
-                elif d.ndim >= 1 and d.size(-1) == 2:
-                    d = d.softmax(-1)[..., 1].unsqueeze(-1).repeat_interleave(7, dim=-1)
-            return [vol, torch.sigmoid(d) if torch.is_tensor(d) else d]
-        if torch.is_tensor(parameters) and parameters.ndim >= 3 and parameters.size(-2) == 2 and parameters.size(-1) == 7:
-            vol = parameters[..., 0, :]
-            d   = parameters[..., 1, :]
-            return [vol, torch.sigmoid(d)]
-        return [parameters]
-
-
-# ---------------------------------------------------------------------
-# Probability-space BCE loss with optional pos_weight
-# ---------------------------------------------------------------------
-class WeightedBCELoss(nn.Module):
-    """Binary cross-entropy on probabilities (no logits), with optional pos_weight.
-    Expects y_pred to already be in [0,1].
-    """
-    def __init__(self, pos_weight: float = 1.17, eps: float = 1e-7):
-        super().__init__()
-        self.pos_weight = float(pos_weight)
-        self.eps = float(eps)
-    def forward(self, y_pred, y_true):
-        y = y_true.float()
-        p = torch.clamp(y_pred, self.eps, 1.0 - self.eps)
-        # per-element weighted BCE on probabilities
-        loss = -( self.pos_weight * y * torch.log(p) + (1.0 - y) * torch.log(1.0 - p) )
-        return loss.mean()
-
-# -----------------------------------------------------------------------
-# Mini-MLP dual head: one branch for volatility quantiles, one for direction logit
-# -----------------------------------------------------------------------
-class DualHead(nn.Module):
-    def __init__(self, hidden_size: int, quantiles: int = 7, dir_classes: int = 2):
-        super().__init__()
-        h = hidden_size // 2
-        self.vol = nn.Sequential(
-            nn.Linear(hidden_size, h),
-            nn.ReLU(),
-            nn.Dropout(0.10),
-            nn.Linear(h, quantiles),
-        )
-        # Direction head outputs probabilities (no logits)
-        dir_out = 1 if dir_classes == 2 else int(dir_classes)
-        dir_layers = [
-            nn.Linear(hidden_size, h),
-            nn.ReLU(),
-            nn.Dropout(0.10),
-            nn.Linear(h, dir_out),
-        ]
-        if dir_out == 1:
-            dir_layers.append(nn.Sigmoid())
-        self.dir = nn.Sequential(*dir_layers)
-
-    def forward(self, x):
-        vol_out = self.vol(x)
-        dir_out = self.dir(x)
-        return torch.cat([vol_out, dir_out], dim=-1)
-
-# -----------------------------------------------------------------------
-# DualOutputModule: Wrap two heads (vol, dir) as a callable output_layer
-# -----------------------------------------------------------------------
-class DualOutputModule(nn.Module):
-    """Wrap two heads (vol, dir) and return a list [vol_pred, dir_pred].
-    This satisfies PyTorch‑Forecasting's expectation that `output_layer`
-    is callable (has `forward`) while keeping our multi‑head separation.
-    """
-    def __init__(self, vol_head: nn.Module, dir_head: nn.Module):
-        super().__init__()
-        self.vol = vol_head
-        self.dir = dir_head
-
-    def forward(self, x):
-        # x: [B, pred_len, hidden]
-        vol = self.vol(x)  # [B, pred_len, 7]
-        dir = self.dir(x)  # [B, pred_len, 1] (binary logit)
-        # replicate direction logit across 7 positions so downstream ops work uniformly
-        dir_rep = dir.repeat_interleave(vol.size(-1), dim=-1)  # [B, pred_len, 7]
-        # stack targets along a new axis => [B, pred_len, 2, 7]
-        return torch.stack([vol, dir_rep], dim=2)
 
 class AsymmetricQuantileLoss(QuantileLoss):
     """
@@ -1215,10 +875,11 @@ def gcs_exists(path: str) -> bool:
     except Exception:
         return False
 
-TRAIN_URI = f"{GCS_DATA_PREFIX}/universal_train.parquet"
-VAL_URI   = f"{GCS_DATA_PREFIX}/universal_val.parquet"
-TEST_URI  = f"{GCS_DATA_PREFIX}/universal_test.parquet"
-
+TRAIN_URI = f"{GCS_DATA_PREFIX}/universal_train.parquet_10k"
+VAL_URI   = f"{GCS_DATA_PREFIX}/universal_val.parquet_10k"
+TEST_URI  = f"{GCS_DATA_PREFIX}/universal_test.parquet_10k"
+READ_PATHS = [str(TRAIN_FILE), str(VAL_FILE), str(TEST_FILE)]
+'''
 # If a local data folder is explicitly provided, use it and skip GCS
 if getattr(ARGS, "data_dir", None):
     DATA_DIR = Path(ARGS.data_dir).expanduser().resolve()
@@ -1234,7 +895,7 @@ elif not all(map(gcs_exists, [TRAIN_URI, VAL_URI, TEST_URI])):
     TEST_FILE  = DATA_DIR / "universal_test.parquet"
     READ_PATHS = [str(TRAIN_FILE), str(VAL_FILE), str(TEST_FILE)]
 else:
-    READ_PATHS = [TRAIN_URI, VAL_URI, TEST_URI]
+'''    
 
 # --- Validate data availability early with helpful errors ---
 
