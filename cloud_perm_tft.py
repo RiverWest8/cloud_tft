@@ -790,6 +790,14 @@ class PerAssetMetrics(pl.Callback):
         ratio_all    = sigma2_p_all / sigma2_all
         overall_qlike = (ratio_all - torch.log(ratio_all) - 1.0).mean().item()
 
+        # —— expose decoded MAE as a proper Lightning metric for callbacks ——
+        try:
+            import torch as _torch
+            trainer.callback_metrics["val_mae_dec"] = _torch.tensor(float(overall_mae))
+            trainer.callback_metrics["val_qlike_dec"] = _torch.tensor(float(overall_qlike))
+        except Exception:
+            pass
+
         self._last_rows = sorted(rows, key=lambda r: r[-1], reverse=True)
         self._last_overall = {
             "mae": overall_mae,
@@ -1550,7 +1558,7 @@ if __name__ == "__main__":
         attention_head_size=2,
         dropout=0.0833704625250354,
         hidden_continuous_size=16,
-        learning_rate=0.0034978228305103793,
+        learning_rate=0.001797,
         optimizer="AdamW",
         optimizer_params={"weight_decay": WEIGHT_DECAY},
         output_size=[7, 1],  # 7 quantiles + 1 logit
@@ -1725,7 +1733,7 @@ if __name__ == "__main__":
                 pass
 
     best_ckpt_cb = ModelCheckpoint(
-        monitor="val_loss",
+        monitor="val_mae_dec",
         mode="min",
         save_top_k=1,
         save_last=True,  # writes last.ckpt
@@ -1739,7 +1747,7 @@ if __name__ == "__main__":
         ckpt_uploader_cb,
         EpochPrinter(MAX_EPOCHS),
         LearningRateMonitor(logging_interval="epoch"),
-        EarlyStopping(monitor="val_loss", patience=EARLY_STOP_PATIENCE, mode="min"),
+        EarlyStopping(monitor="val_mae_dec", patience=EARLY_STOP_PATIENCE, mode="min"),
         ComponentLossLogger(),
         LossHistory(),
         PerAssetMetrics(
