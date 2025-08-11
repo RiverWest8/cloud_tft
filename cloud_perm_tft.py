@@ -168,48 +168,22 @@ if not hasattr(GroupNormalizer, "decode"):
 
 
 
-from pytorch_forecasting.metrics import QuantileLoss
+from pytorch_forecasting.metrics import QuantileLoss, MultiLoss
 
 
 
 class LabelSmoothedBCE(nn.Module):
-    """
-    BCE-with-logits + ε-label smoothing with EMA-adaptive pos_weight.
-    - Initializes pos_weight from an Optuna-provided value.
-    - Tracks an EMA of the positive rate over batches and updates pos_weight.
-    """
-    def __init__(self, smoothing: float = 0.1, init_pos_weight: float = 1.4,
-                 ema_beta: float = 0.99, pw_min: float = 0.2, pw_max: float = 5.0):
+    def __init__(self, smoothing: float = 0.1, pos_weight: float = 1.4):
         super().__init__()
-        self.smoothing = float(smoothing)
-        self.ema_beta = float(ema_beta)
-        self.pw_min = float(pw_min)
-        self.pw_max = float(pw_max)
-        # Derive initial prevalence from pos_weight: w = (1-p)/p  =>  p = 1/(1+w)
-        p0 = 1.0 / (1.0 + max(float(init_pos_weight), 1e-6))
-        self.register_buffer("pos_rate_ema", torch.tensor(p0, dtype=torch.float32))
-
-    def _current_pos_weight(self, device):
-        p = torch.clamp(self.pos_rate_ema.to(device), 1e-6, 1 - 1e-6)
-        w = (1.0 - p) / p
-        return torch.clamp(w, self.pw_min, self.pw_max)
+        self.smoothing = smoothing
+        self.register_buffer("pos_weight", torch.tensor(pos_weight))
 
     def forward(self, y_pred, target):
         target = target.float()
-        # EMA update only during training mode
-        if self.training:
-            with torch.no_grad():
-                try:
-                    batch_p = target.mean().to(self.pos_rate_ema.device)
-                    if torch.isfinite(batch_p):
-                        self.pos_rate_ema.mul_(self.ema_beta).add_(batch_p * (1.0 - self.ema_beta))
-                except Exception:
-                    pass
-        # Label smoothing toward 0.5
         target = target * (1.0 - self.smoothing) + 0.5 * self.smoothing
-        pos_weight = self._current_pos_weight(y_pred.device)
         return F.binary_cross_entropy_with_logits(
-            y_pred.squeeze(-1), target.squeeze(-1), pos_weight=pos_weight
+            y_pred.squeeze(-1), target.squeeze(-1),
+            pos_weight=self.pos_weight,
         )
 
 # ---------------------------------------------------------------------
@@ -222,7 +196,7 @@ class LearnableMultiTaskLoss(nn.Module):
     Initialize with desired starting weights w_i via s_i = -log(w_i).
     Expects y_pred to be a list/tuple: [pred_vol, pred_dir].
     """
-    def __init__(self, loss_vol: nn.Module, loss_dir: nn.Module, init_weights=(1.0, 0.5)):
+    def __init__(self, loss_vol: nn.Module, loss_dir: nn.Module, init_weights=(1.0, 0.4)):
         super().__init__()
         self.loss_vol = loss_vol
         self.loss_dir = loss_dir
@@ -383,7 +357,7 @@ class FixedMultiTaskLoss(nn.Module):
     Expects y_pred to be a list/tuple [pred_vol, pred_dir] or a stacked tensor
     shaped [..., 2, 7] as produced by DualOutputModule.
     """
-    def __init__(self, loss_vol: nn.Module, loss_dir: nn.Module, weights=(1.0, 1.0)):
+    def __init__(self, loss_vol: nn.Module, loss_dir: nn.Module, weights=(1.0, 0.4)):
         super().__init__()
         self.loss_vol = loss_vol
         self.loss_dir = loss_dir
@@ -545,61 +519,27 @@ class DualOutputModule(nn.Module):
 
 class AsymmetricQuantileLoss(QuantileLoss):
     """
-    Pinball (quantile) loss with a **learnable** multiplier applied only when the
-    prediction is BELOW the ground‑truth value. The multiplier is parameterized as
-    alpha = 1 + softplus(u), initialized from an Optuna-provided value.
-    Includes an optional monotonicity penalty and a tiny L2 prior toward alpha=1.
+    Pinball (quantile) loss with an extra multiplier applied *only* when the
+    prediction is BELOW the ground‑truth value (i.e. under‑prediction).
+    Setting ``underestimation_factor`` > 1 makes the model pay a larger
+    penalty for forecasts that are too low.
     """
-    def __init__(self, quantiles, underestimation_init: float = 1.115,
-                 learnable_under: bool = True, reg_lambda: float = 1e-3,
-                 monotone_lambda: float = 0.02, **kwargs):
+    def __init__(self, quantiles, underestimation_factor: float = 10, **kwargs):
         super().__init__(quantiles=quantiles, **kwargs)
-        self.learnable_under = bool(learnable_under)
-        self.reg_lambda = float(reg_lambda)
-        self.monotone_lambda = float(monotone_lambda)
-        # Inverse softplus for (alpha_init - 1)
-        a0 = max(float(underestimation_init), 1.0)
-        u0 = np.log(np.expm1(a0 - 1.0) + 1e-12)
-        param = torch.tensor(u0, dtype=torch.float32)
-        if self.learnable_under:
-            self.u = nn.Parameter(param)
-        else:
-            self.register_buffer("u", param)
-
-    def _alpha(self):
-        return 1.0 + F.softplus(self.u)
+        self.underestimation_factor = float(underestimation_factor)
 
     def loss_per_prediction(self, y_pred, target):
+        import torch
         diff = target.unsqueeze(-1) - y_pred  # positive ⇒ under‑prediction
-        q = torch.tensor(self.quantiles, device=y_pred.device, dtype=y_pred.dtype).view(
+        q = torch.tensor(self.quantiles, device=y_pred.device).view(
             *([1] * (diff.ndim - 1)), -1
         )
-        alpha = self._alpha().to(y_pred.device, dtype=y_pred.dtype)
         loss = torch.where(
             diff >= 0,
-            alpha * q * diff,
-            (1 - q) * (-diff),
+            self.underestimation_factor * q * diff,  # heavier penalty when under‑predicting
+            (1 - q) * (-diff),                       # standard pinball for over‑prediction
         )
         return loss
-
-    def forward(self, y_pred, target, **kwargs):
-        base = super().forward(y_pred, target, **kwargs)
-        # Monotonicity penalty on quantiles: penalize q_{i+1} < q_i
-        if y_pred is not None and y_pred.ndim >= 1 and y_pred.size(-1) >= 2 and self.monotone_lambda > 0:
-            diffs = y_pred[..., 1:] - y_pred[..., :-1]
-            pen = torch.relu(-diffs).mean()
-            base = base + self.monotone_lambda * pen
-        # L2 prior toward alpha=1
-        if self.reg_lambda > 0:
-            alpha = self._alpha()
-            base = base + self.reg_lambda * (alpha - 1.0) ** 2
-        return base
-
-    def current_underestimation(self) -> float:
-        try:
-            return float((1.0 + F.softplus(self.u)).detach().cpu().item())
-        except Exception:
-            return float("nan")
 
 
 class PerAssetMetrics(pl.Callback):
@@ -1611,20 +1551,16 @@ if __name__ == "__main__":
         dropout=0.0833704625250354,
         hidden_continuous_size=16,
         learning_rate=0.0034978228305103793,
-        optimizer="adamw",
-        weight_decay=WEIGHT_DECAY,
-        # 7 quantiles for vol + 1 prob for direction
-        output_size=[7, 1],
-        loss=FixedMultiTaskLoss(
-            loss_vol=AsymmetricQuantileLoss(
+        optimizer="AdamW",
+        optimizer_params={"weight_decay": WEIGHT_DECAY},
+        output_size=[7, 1],  # 7 quantiles + 1 logit
+        loss=MultiLoss([
+            AsymmetricQuantileLoss(
                 quantiles=[0.05, 0.165, 0.25, 0.5, 0.75, 0.835, 0.95],
-                underestimation_init=1.115,
-                learnable_under=False,
-                reg_lambda=1e-3,
+                underestimation_factor=1.115,
             ),
-            loss_dir=WeightedBCELoss(pos_weight=1.3),
-            weights=(1, 0.2),
-        ),
+            LabelSmoothedBCE(smoothing=0.1),
+        ], weights=[1.0, 0.4]),
         logging_metrics=[],
         log_interval=50,
         log_val_interval=10,
@@ -1632,38 +1568,6 @@ if __name__ == "__main__":
         reduce_on_plateau_min_lr = 1e-5,
     )
 
-    # Replace default linear heads with the dual-MLP head
-    dual_head = DualHead(hidden_size=int(getattr(tft.hparams, "hidden_size", 64)))
-    # Initialize direction head bias using p0 derived from pos_weight=1.3
-    p0 = 1.0 / (1.0 + 1.3)
-    bias0 = float(np.log(p0 / (1.0 - p0)))
-    with torch.no_grad():
-        # set bias on the final Linear layer (now at index -2 since Sigmoid is last)
-        last_linear = None
-        for m in reversed(dual_head.dir):
-            if isinstance(m, nn.Linear):
-                last_linear = m
-                break
-        if last_linear is not None and last_linear.bias is not None:
-            last_linear.bias.data.fill_(bias0)
-    tft.output_layer = DualOutputModule(dual_head.vol, dual_head.dir)
-    # -------------------------------------------------------------------
-    # Override PF's internal MultiLoss with our custom learnable multi-task loss
-    # (PF wraps losses into MultiLoss when output_size is a list; that wrapper
-    # applies generic shape checks which conflict with our quantile head.)
-    # By assigning directly to `tft.loss`, Lightning will use this criterion in
-    # training/validation instead of the PF MultiLoss.
-    # -------------------------------------------------------------------
-    tft.loss = FixedMultiTaskLoss(
-        loss_vol=AsymmetricQuantileLoss(
-            quantiles=[0.05, 0.165, 0.25, 0.5, 0.75, 0.835, 0.95],
-            underestimation_init=1.115,
-            learnable_under=False,
-            reg_lambda=1e-3,
-        ),
-        loss_dir=WeightedBCELoss(pos_weight=1.3),
-        weights=(0.3, 1.0),
-)
     # -----------------------------------------------------------------------
     # Training
     # -----------------------------------------------------------------------
@@ -1676,8 +1580,8 @@ if __name__ == "__main__":
       def _row(self, trainer, pl_module, phase: str):
           try:
               loss_mod = getattr(pl_module, "loss", None)
-              L1 = float(loss_mod.last_L1.cpu().item()) if hasattr(loss_mod, "last_L1") else None
-              L2 = float(loss_mod.last_L2.cpu().item()) if hasattr(loss_mod, "last_L2") else None
+              L1 = float(loss_mod.last_L1.cpu().item()) if hasattr(loss_mod, "last_L1") else float('nan')
+              L2 = float(loss_mod.last_L2.cpu().item()) if hasattr(loss_mod, "last_L2") else float('nan')
               s = loss_mod.last_s.cpu().tolist() if hasattr(loss_mod, "last_s") else [None, None]
               w = loss_mod.last_w.cpu().tolist() if hasattr(loss_mod, "last_w") else [None, None]
               r = {
