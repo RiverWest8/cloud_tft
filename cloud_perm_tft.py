@@ -510,7 +510,6 @@ class PerAssetMetrics(pl.Callback):
         x = batch[0]
         if not isinstance(x, dict):
             return
-
         groups = x.get("groups")
         dec_t = x.get("decoder_target")
         # optional time index for plotting/joining later
@@ -530,35 +529,43 @@ class PerAssetMetrics(pl.Callback):
         if not torch.is_tensor(g):
             return
 
-        # decoder_target can be a Tensor [B, n_targets, 1] OR a list[Tensor per target]
+        # --- Extract targets (try decoder_target first, else fall back to batch[1]) ---
         y_vol_t, y_dir_t = None, None
-        if torch.is_tensor(dec_t):
-            y = dec_t
-            if y.ndim == 3 and y.size(-1) == 1:
-                y = y[..., 0]     # → [B, n_targets]
-            if y.ndim != 2 or y.size(1) < 1:
-                return
-            y_vol_t = y[:, 0]
-            if y.size(1) > 1:
-                y_dir_t = y[:, 1]
-        elif isinstance(dec_t, (list, tuple)) and len(dec_t) >= 1:
-            y_vol_t = dec_t[0]
-            if torch.is_tensor(y_vol_t):
-                if y_vol_t.ndim == 3 and y_vol_t.size(-1) == 1:
-                    y_vol_t = y_vol_t[..., 0]
-                if y_vol_t.ndim == 2 and y_vol_t.size(-1) == 1:
-                    y_vol_t = y_vol_t[:, 0]
-            else:
-                return
-            if len(dec_t) > 1 and torch.is_tensor(dec_t[1]):
-                y_dir_t = dec_t[1]
-                if y_dir_t.ndim == 3 and y_dir_t.size(-1) == 1:
-                    y_dir_t = y_dir_t[..., 0]
-                if y_dir_t.ndim == 2 and y_dir_t.size(-1) == 1:
-                    y_dir_t = y_dir_t[:, 0]
-        else:
+        if dec_t is not None:
+            if torch.is_tensor(dec_t):
+                y = dec_t
+                if y.ndim == 3 and y.size(-1) == 1:
+                    y = y[..., 0]  # → [B, n_targets]
+                if y.ndim == 2 and y.size(1) >= 1:
+                    y_vol_t = y[:, 0]
+                    if y.size(1) > 1:
+                        y_dir_t = y[:, 1]
+            elif isinstance(dec_t, (list, tuple)) and len(dec_t) >= 1:
+                y_vol_t = dec_t[0]
+                if torch.is_tensor(y_vol_t):
+                    if y_vol_t.ndim == 3 and y_vol_t.size(-1) == 1:
+                        y_vol_t = y_vol_t[..., 0]
+                    if y_vol_t.ndim == 2 and y_vol_t.size(-1) == 1:
+                        y_vol_t = y_vol_t[:, 0]
+                if len(dec_t) > 1 and torch.is_tensor(dec_t[1]):
+                    y_dir_t = dec_t[1]
+                    if y_dir_t.ndim == 3 and y_dir_t.size(-1) == 1:
+                        y_dir_t = y_dir_t[..., 0]
+                    if y_dir_t.ndim == 2 and y_dir_t.size(-1) == 1:
+                        y_dir_t = y_dir_t[:, 0]
+        # Fallback: PF sometimes provides targets in batch[1] as [B, pred_len, n_targets]
+        if (y_vol_t is None or y_dir_t is None) and torch.is_tensor(y_batch):
+            yb = y_batch
+            if yb.ndim == 3 and yb.size(1) == 1:
+                yb = yb[:, 0, :]
+            if yb.ndim == 2 and yb.size(1) >= 1:
+                if y_vol_t is None:
+                    y_vol_t = yb[:, 0]
+                if y_dir_t is None and yb.size(1) > 1:
+                    y_dir_t = yb[:, 1]
+        if y_vol_t is None:
             return
-
+      
         # Forward pass to get predictions for this batch
         y_hat = pl_module(x)
         pred = getattr(y_hat, "prediction", y_hat)
@@ -620,10 +627,14 @@ class PerAssetMetrics(pl.Callback):
                 tvec = tvec.squeeze(-1)
             if tvec.numel() >= L:
                 self._t_dev.append(tvec.reshape(-1)[:L])
+
         if y_dir_t is not None and p_dir is not None:
-            L2 = min(L, y_dir_t.numel(), p_dir.numel())
-            self._yd_dev.append(y_dir_t.reshape(-1)[:L2])
-            self._pd_dev.append(p_dir.reshape(-1)[:L2])
+            y_flat = y_dir_t.reshape(-1)
+            p_flat = p_dir.reshape(-1)
+            L2 = min(L, y_flat.numel(), p_flat.numel())
+            if L2 > 0:
+                self._yd_dev.append(y_flat[:L2])
+                self._pd_dev.append(p_flat[:L2])
 
     @torch.no_grad()
     def on_validation_epoch_end(self, trainer, pl_module):
@@ -726,6 +737,7 @@ class PerAssetMetrics(pl.Callback):
                         pd1 = torch.sigmoid(pd1)
                 except Exception:
                     pd1 = torch.sigmoid(pd1)
+                pd1 = torch.clamp(pd1, 0.0, 1.0)
                 acc = ((pd1 >= 0.5).int() == yd1.int()).float().mean().item()
                 brier = ((pd1 - yd1) ** 2).mean().item()
                 auroc = None
@@ -1641,40 +1653,14 @@ if __name__ == "__main__":
     # Load best checkpoint (by val_loss) if available
     if best_ckpt_cb.best_model_path:
         try:
-            # PF expects `loss` to be a Metric subclass when reconstructing. Provide a dummy and override after load.
-            from pytorch_forecasting.metrics import QuantileLoss as _PFQuantileLoss
-            tft = TemporalFusionTransformer.load_from_checkpoint(
-                best_ckpt_cb.best_model_path,
-                loss=_PFQuantileLoss(),
-                logging_metrics=[],
-            )
-            # Reattach custom dual head and bias (matches training-time architecture)
-            dual_head = DualHead(hidden_size=int(getattr(tft.hparams, "hidden_size", 64)))
-            p0 = 1.0 / (1.0 + 1.2)
-            bias0 = float(np.log(p0 / (1.0 - p0)))
-            with torch.no_grad():
-                dual_head.dir[-1].bias.data.fill_(bias0)
-            tft.output_layer = DualOutputModule(dual_head.vol, dual_head.dir)
-            # Restore our custom multi-task loss
-            tft.loss = LearnableMultiTaskLoss(
-                loss_vol=AsymmetricQuantileLoss(
-                    quantiles=[0.05, 0.165, 0.25, 0.5, 0.75, 0.835, 0.95],
-                    underestimation_init=1.115,
-                    learnable_under=True,
-                    reg_lambda=1e-3,
-                ),
-                loss_dir=LabelSmoothedBCE(
-                    smoothing=0.1,
-                    init_pos_weight=1.2,
-                    ema_beta=0.99,
-                    pw_min=0.2,
-                    pw_max=5.0,
-                ),
-                init_weights=(1.0, 0.3),
-            )
-            print(f"✓ Loaded best model from: {best_ckpt_cb.best_model_path}")
+            ckpt = torch.load(best_ckpt_cb.best_model_path, map_location="cpu")
+            state = ckpt.get("state_dict", ckpt)
+            missing, unexpected = tft.load_state_dict(state, strict=False)
+            if missing or unexpected:
+                print(f"[INFO] Loaded best weights with missing={len(missing)} unexpected={len(unexpected)}")
+            print(f"✓ Loaded best weights into current model from: {best_ckpt_cb.best_model_path}")
         except Exception as e:
-            print(f"[WARN] Could not load best checkpoint even with PF Metric shim: {e}")
+            print(f"[WARN] Could not load best checkpoint state_dict: {e}")
 
     # Save checkpoint
     trainer.save_checkpoint(str(MODEL_SAVE_PATH))
