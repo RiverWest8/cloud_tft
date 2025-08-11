@@ -1129,6 +1129,8 @@ parser.add_argument("--prefetch_factor", type=int, default=8, help="DataLoader p
 # Performance / input control
 parser.add_argument("--check_val_every_n_epoch", type=int, default=1, help="Validate every N epochs")
 parser.add_argument("--log_every_n_steps", type=int, default=200, help="How often to log train steps")
+parser.add_argument("--learning_rate", type=float, default=None, help="Override model learning rate")
+parser.add_argument("--resume", type=lambda s: str(s).lower() in ("1","true","t","yes","y","on"), default=True, help="Resume from latest checkpoint if available")
 parser.add_argument("--fi_max_batches", type=int, default=20, help="Max val batches per feature in FI.")
 # Parse known args so stray platform args do not crash the script
 ARGS, _UNKNOWN = parser.parse_known_args()
@@ -1195,9 +1197,9 @@ def gcs_exists(path: str) -> bool:
     except Exception:
         return False
 
-TRAIN_URI = f"{GCS_DATA_PREFIX}/universal_train.parquet"
-VAL_URI   = f"{GCS_DATA_PREFIX}/universal_val.parquet"
-TEST_URI  = f"{GCS_DATA_PREFIX}/universal_test.parquet"
+TRAIN_URI = f"{GCS_DATA_PREFIX}/universal_train.parquet_10k"
+VAL_URI   = f"{GCS_DATA_PREFIX}/universal_val.parquet_10k"
+TEST_URI  = f"{GCS_DATA_PREFIX}/universal_test.parquet_10k"
 
 # If a local data folder is explicitly provided, use it and skip GCS
 if getattr(ARGS, "data_dir", None):
@@ -1324,6 +1326,10 @@ if ARGS.enable_perm_importance is not None:
     ENABLE_FEATURE_IMPORTANCE = bool(ARGS.enable_perm_importance)
 if getattr(ARGS, "fi_max_batches", None) is not None:
     FI_MAX_BATCHES = int(ARGS.fi_max_batches)
+
+# ---- Learning rate and resume CLI overrides ----
+LR_OVERRIDE = float(ARGS.learning_rate) if getattr(ARGS, "learning_rate", None) is not None else None
+RESUME_ENABLED = bool(getattr(ARGS, "resume", True))
 
 # -----------------------------------------------------------------------
 # Utility functions
@@ -1552,13 +1558,14 @@ if __name__ == "__main__":
 
     # Loss and output_size for multi-target: realised_vol (quantile regression), direction (classification)
     print("▶ Building model …")
+    print(f"[LR] learning_rate={LR_OVERRIDE if LR_OVERRIDE is not None else 0.001797}")
     tft = TemporalFusionTransformer.from_dataset(
         training_dataset,
         hidden_size=64,
         attention_head_size=2,
         dropout=0.0833704625250354,
         hidden_continuous_size=16,
-        learning_rate=0.001797,
+        learning_rate=(LR_OVERRIDE if LR_OVERRIDE is not None else 0.001797),
         optimizer="AdamW",
         optimizer_params={"weight_decay": WEIGHT_DECAY},
         output_size=[7, 1],  # 7 quantiles + 1 logit
@@ -1774,7 +1781,7 @@ trainer = Trainer(
 )
 
 # Resume logic with epoch bump if needed
-resume_ckpt = get_resume_ckpt_path()
+resume_ckpt = get_resume_ckpt_path() if RESUME_ENABLED else None
 if resume_ckpt:
     print(f"▶ Resuming from checkpoint: {resume_ckpt}")
     try:
