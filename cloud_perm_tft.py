@@ -1603,7 +1603,7 @@ if __name__ == "__main__":
     seed_everything(SEED, workers=True)
 
     # Loss and output_size for multi-target: realised_vol (quantile regression), direction (classification)
-
+    print("▶ Building model …")
     tft = TemporalFusionTransformer.from_dataset(
         training_dataset,
         hidden_size=64,
