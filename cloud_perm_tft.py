@@ -1142,6 +1142,23 @@ BaseModel.validation_epoch_end = _patched_validation_epoch_end
 print("[INFO] Neutralized PF training_epoch_end/validation_epoch_end to avoid list indexing issues.")
 
 # -----------------------------------------------------------------------
+# Lightning v2 no longer supports training_epoch_end/validation_epoch_end.
+# TemporalFusionTransformer implements these, so override them with no-ops
+# BEFORE model instantiation to avoid Lightning v2 runtime errors.
+# -----------------------------------------------------------------------
+try:
+    from pytorch_forecasting import TemporalFusionTransformer as _TFT
+    def _tft_training_epoch_end(self, outputs):
+        return
+    def _tft_validation_epoch_end(self, outputs):
+        return
+    _TFT.training_epoch_end = _tft_training_epoch_end
+    _TFT.validation_epoch_end = _tft_validation_epoch_end
+    print("[INFO] Neutralized TFT training_epoch_end/validation_epoch_end for Lightning v2 compatibility.")
+except Exception as e:
+    print(f"[WARN] Could not neutralize TFT epoch_end hooks: {e}")
+
+# -----------------------------------------------------------------------
 
 
 
