@@ -1431,7 +1431,21 @@ if __name__ == "__main__":
         log_val_interval=10,
         reduce_on_plateau_patience=5,
         reduce_on_plateau_min_lr=1e-5,
+        log_interpretations=False,
     )
+    # Patch plot_prediction to cast bfloat16 to float32 for matplotlib
+    import torch
+    if hasattr(tft, "plot_prediction"):
+        _orig_plot_prediction = tft.plot_prediction
+
+        def safe_plot_prediction(*args, **kwargs):
+            def cast_tensor(x):
+                return x.float() if torch.is_tensor(x) and x.dtype == torch.bfloat16 else x
+            args = tuple(cast_tensor(a) for a in args)
+            kwargs = {k: cast_tensor(v) for k, v in kwargs.items()}
+            return _orig_plot_prediction(*args, **kwargs)
+
+        tft.plot_prediction = safe_plot_prediction
     optimizer_params={"weight_decay": WEIGHT_DECAY}
     if isinstance(getattr(tft, "output_layer", None), DualOutputModule):
         tft.output_layer = nn.ModuleList([tft.output_layer.vol, tft.output_layer.dir])
