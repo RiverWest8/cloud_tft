@@ -969,21 +969,23 @@ def monkey_patch_to_network_output():
 
         def _to_network_output(self, prediction=None, **kwargs):
             """
-            Normalise PF outputs to a dict with a tensor under 'prediction'.
-            Accepts both the modern signature (prediction=...) and older forms.
+            Normalize PF outputs so we always return a dict with a TENSOR
+            under 'prediction'. Works for both modern (prediction=...) and
+            older positional calls.
             """
             pred = prediction
 
-            # Unwrap PF Output wrappers or dicts if someone passed those through
+            # Unwrap Output wrappers or dicts
             if hasattr(pred, "prediction"):
                 pred = pred.prediction
             elif isinstance(pred, dict) and "prediction" in pred:
                 pred = pred["prediction"]
 
-            # If already a tensor, return it as-is
+            # Already a tensor → done
             if torch.is_tensor(pred):
                 out = {"prediction": pred}
-            # If PF gave a list/tuple (one per target), harmonise and stack
+
+            # List/tuple (one tensor per target) → harmonize & stack
             elif isinstance(pred, (list, tuple)):
                 processed = []
                 for p in pred:
@@ -991,9 +993,9 @@ def monkey_patch_to_network_output():
                         continue
                     # squeeze singleton pred_len/target dims
                     if p.ndim == 4 and p.shape[2] == 1:
-                        p = p.squeeze(2)     # [B,1,7]
+                        p = p.squeeze(2)   # [B,1,7] -> [B,1,7]
                     if p.ndim == 3 and p.shape[1] == 1:
-                        p = p.squeeze(1)     # [B,7]
+                        p = p.squeeze(1)   # [B,7]
                     # replicate single logit or reduce 2‑logit to prob and replicate to K=7
                     if p.ndim >= 2 and p.shape[-1] == 1:
                         p = p.repeat_interleave(7, dim=-1)
@@ -1004,11 +1006,12 @@ def monkey_patch_to_network_output():
                 if processed:
                     pred = torch.stack(processed, dim=1)  # [B, n_targets, 7]
                 out = {"prediction": pred}
+
             else:
-                # Fallback — return whatever we got, under the expected key
+                # Fallback — wrap whatever we got
                 out = {"prediction": pred}
 
-            # pass through other known keys if PF expects them
+            # Pass through other known keys if provided
             for k in ("target", "encoder_lengths", "decoder_lengths", "loss"):
                 if k in kwargs:
                     out[k] = kwargs[k]
