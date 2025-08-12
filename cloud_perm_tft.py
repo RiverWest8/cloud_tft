@@ -1122,6 +1122,25 @@ try:
     BaseModel.training_step = _patched_training_step
     BaseModel.validation_step = _patched_validation_step
     print("[INFO] Patched PF training_step/validation_step to ensure tensor predictions and Tensor loss.")
+
+# -----------------------------------------------------------------------
+# PF epoch-end hooks expect a list of dicts; since we now return plain
+# Tensors from train/val steps, override epoch_end hooks to no-ops to
+# avoid "list index out of range" errors during sanity/validation.
+# -----------------------------------------------------------------------
+try:
+    from pytorch_forecasting.models.base._base_model import BaseModel # type: ignore
+    def _patched_training_epoch_end(self, outputs):
+        # Accept anything and do nothing; Lightning doesn’t require a return here
+        return
+    def _patched_validation_epoch_end(self, outputs):
+        # Accept anything and do nothing
+        return
+    BaseModel.training_epoch_end = _patched_training_epoch_end
+    BaseModel.validation_epoch_end = _patched_validation_epoch_end
+    print("[INFO] Neutralized PF training_epoch_end/validation_epoch_end to avoid list indexing issues.")
+except Exception as e:
+    print(f"[WARN] Could not patch PF epoch_end hooks: {e}")
 except Exception as e:
     print(f"[WARN] Could not patch PF train/val steps: {e}")
 
