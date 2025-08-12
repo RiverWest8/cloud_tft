@@ -687,14 +687,17 @@ class LearnableMultiTaskLoss(nn.Module):
         self.last_L2 = torch.tensor(float("nan"))
         self.last_s = self.s.detach().clone()
         self.last_w = torch.exp(-self.s.detach().clone())
-
     def forward(self, y_pred, target, **kwargs):
         # Unpack predictions
         if isinstance(y_pred, (list, tuple)) and len(y_pred) >= 2:
             p_vol, p_dir = y_pred[0], y_pred[1]
+            # If p_vol or p_dir are wrapped in 1-element lists/tuples, unwrap
+            if isinstance(p_vol, (list, tuple)) and len(p_vol) == 1:
+                p_vol = p_vol[0]
+            if isinstance(p_dir, (list, tuple)) and len(p_dir) == 1:
+                p_dir = p_dir[0]
         else:
             raise TypeError("LearnableMultiTaskLoss expects y_pred as [vol_pred, dir_pred]")
-
         # Unpack targets -> expected shapes [..., pred_len] or [..., pred_len, 1]
         # Accept either a single tensor with last dim >=2 (multi-target) or a list
         if torch.is_tensor(target):
