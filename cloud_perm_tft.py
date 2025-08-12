@@ -1434,63 +1434,84 @@ if __name__ == "__main__":
         reduce_on_plateau_min_lr=1e-5,
     )
     # --- Safe plotting/logging: deep-cast any nested tensors to CPU float32 ---
+    # --- Safe plotting/logging: class-level patch to handle bf16 + integer lengths robustly ---
+
+    from pytorch_forecasting.models.base._base_model import BaseModel
+
     def _deep_cpu_float(x):
         if torch.is_tensor(x):
+            # keep integer tensors as int64; cast others to float32 for matplotlib
+            if x.dtype in (
+                torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8,
+                getattr(torch, "long", torch.int64)
+            ):
+                return x.detach().to(device="cpu", dtype=torch.int64)
             return x.detach().to(device="cpu", dtype=torch.float32)
-
-        # lists: rebuild as list
         if isinstance(x, list):
             return [_deep_cpu_float(v) for v in x]
-
-        # tuples (including namedtuples): try to rebuild preserving the class
         if isinstance(x, tuple):
             casted = tuple(_deep_cpu_float(v) for v in x)
             try:
-                # namedtuple or tuple subclass with positional fields
+                # preserve namedtuple types
                 return x.__class__(*casted)
             except Exception:
-                # fallback: plain tuple
                 return casted
-
-        # dicts: recurse values
         if isinstance(x, dict):
             return {k: _deep_cpu_float(v) for k, v in x.items()}
-
-        # numpy arrays: ensure float32 for plotting if numeric
         if isinstance(x, np.ndarray) and np.issubdtype(x.dtype, np.number):
+            if np.issubdtype(x.dtype, np.integer):
+                return x.astype(np.int64, copy=False)
             return x.astype(np.float32, copy=False)
-
-        # everything else (strings, objects, scalars)
         return x
 
-    # Store the original method
-    _orig_plot_prediction = BaseModel.plot_prediction
+    def _to_numpy_int64_array(v):
+        if torch.is_tensor(v):
+            return v.detach().cpu().long().numpy()
+        if isinstance(v, np.ndarray):
+            return v.astype(np.int64, copy=False)
+        if isinstance(v, (list, tuple)):
+            out = []
+            for el in v:
+                if torch.is_tensor(el):
+                    out.append(int(el.detach().cpu().item()))
+                else:
+                    out.append(int(el))
+            return np.asarray(out, dtype=np.int64)
+        if isinstance(v, (int, np.integer)):
+            return np.asarray([int(v)], dtype=np.int64)
+        return v  # leave unknowns as-is
 
-    def safe_plot_prediction(self, x, *args, **kwargs):
-        # Ensure encoder_lengths are plain ints
-        if "encoder_lengths" in x:
-            if torch.is_tensor(x["encoder_lengths"]):
-                x["encoder_lengths"] = x["encoder_lengths"].cpu().long().tolist()
-            else:
-                # Handle lists of tensors
-                x["encoder_lengths"] = [
-                    int(el.item()) if torch.is_tensor(el) else int(el)
-                    for el in x["encoder_lengths"]
-                ]
-        return _orig_plot_prediction(self, x, *args, **kwargs)
+    def _fix_lengths_in_x(x):
+        # PF expects max() & python slicing with these; make them numpy int64 arrays
+        if isinstance(x, dict):
+            for key in ("encoder_lengths", "decoder_lengths"):
+                if key in x and x[key] is not None:
+                    x[key] = _to_numpy_int64_array(x[key])
+        return x
 
-    # Apply the patch
-    BaseModel.plot_prediction = safe_plot_prediction
+    # Patch BaseModel.plot_prediction so it always receives CPU float32 data and int64 lengths
+    if hasattr(BaseModel, "plot_prediction"):
+        _orig_plot_prediction = BaseModel.plot_prediction
 
+        def _plot_prediction_safe(self, x, *args, **kwargs):
+            x = _fix_lengths_in_x(_deep_cpu_float(x))
+            new_args = tuple(_deep_cpu_float(a) for a in args)
+            new_kwargs = {k: _deep_cpu_float(v) for k, v in kwargs.items()}
+            return _orig_plot_prediction(self, x, *new_args, **new_kwargs)
 
-    # Wrap log_prediction (PF calls this in validation to produce figures)
-    if hasattr(tft, "log_prediction"):
-        _orig_log_prediction = tft.log_prediction
-        def safe_log_prediction(*args, **kwargs):
-            args = tuple(_deep_cpu_float(a) for a in args)
-            kwargs = {k: _deep_cpu_float(v) for k, v in kwargs.items()}
-            return _orig_log_prediction(*args, **kwargs)
-        tft.log_prediction = safe_log_prediction
+        BaseModel.plot_prediction = _plot_prediction_safe
+
+    # Patch BaseModel.log_prediction similarly (this is what calls plot_prediction during val)
+    if hasattr(BaseModel, "log_prediction"):
+        _orig_log_prediction = BaseModel.log_prediction
+
+        def _log_prediction_safe(self, x, *args, **kwargs):
+            x = _fix_lengths_in_x(_deep_cpu_float(x))
+            new_args = tuple(_deep_cpu_float(a) for a in args)
+            new_kwargs = {k: _deep_cpu_float(v) for k, v in kwargs.items()}
+            return _orig_log_prediction(self, x, *new_args, **new_kwargs)
+
+        BaseModel.log_prediction = _log_prediction_safe
 
     # --- Use fixed-weight MultiLoss instead of LearnableMultiTaskLoss ---
     try:
