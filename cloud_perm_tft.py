@@ -1025,6 +1025,82 @@ def monkey_patch_to_network_output():
 monkey_patch_to_network_output()
 
 # -----------------------------------------------------------------------
+# Harden PF train/val steps: always coerce predictions to a tensor and
+# return a plain Tensor loss (Lightning-safe). This avoids any code path
+# that might try to .detach() a Python list.
+# -----------------------------------------------------------------------
+try:
+    from pytorch_forecasting.models.base._base_model import BaseModel
+    import torch
+
+    def _coerce_prediction_tensor(pred):
+        """Normalize PF predictions into a tensor shaped [B, n_targets, K]."""
+        # Unwrap Output wrappers/dicts
+        if hasattr(pred, "prediction"):
+            pred = pred.prediction
+        elif isinstance(pred, dict) and "prediction" in pred:
+            pred = pred["prediction"]
+
+        # Already tensor
+        if torch.is_tensor(pred):
+            # Squeeze pred_len dim if present: [B,1,n_targets,K] or [B,n_targets,1,K]
+            if pred.ndim == 4 and pred.size(2) == 1:
+                pred = pred.squeeze(2)
+            return pred
+
+        # List/tuple of per-target tensors → harmonize and stack
+        if isinstance(pred, (list, tuple)):
+            processed = []
+            for p in pred:
+                if not torch.is_tensor(p):
+                    continue
+                # [B,1,*,K] → [B,*,K]
+                if p.ndim == 4 and p.shape[2] == 1:
+                    p = p.squeeze(2)
+                if p.ndim == 3 and p.shape[1] == 1:
+                    p = p.squeeze(1)
+                # If last dim is 1 (e.g. single logit), repeat to K=7
+                if p.ndim >= 2 and p.shape[-1] == 1:
+                    p = p.repeat_interleave(7, dim=-1)
+                # If last dim is 2 (binary logits), reduce to prob and repeat to K=7
+                elif p.ndim >= 2 and p.shape[-1] == 2:
+                    pos = p.softmax(-1)[..., 1].unsqueeze(-1)
+                    p = pos.repeat_interleave(7, dim=-1)
+                processed.append(p)
+            if processed:
+                return torch.stack(processed, dim=1)  # [B, n_targets, 7]
+        # Fallback: wrap as-is (may still be list/None)
+        return pred
+
+    # Save originals in case needed for debugging
+    _orig_training_step = BaseModel.training_step
+    _orig_validation_step = BaseModel.validation_step
+
+    def _patched_training_step(self, batch, batch_idx):
+        x, y, _w = batch if isinstance(batch, (list, tuple)) and len(batch) >= 2 else (batch, None, None)
+        with torch.no_grad():
+            y_hat = self(x)
+        pred = _coerce_prediction_tensor(y_hat)
+        # Compute loss via model's current loss module (handles list/tensor)
+        loss = self.loss(pred, y) if y is not None else torch.tensor(0.0, device=pred.device if torch.is_tensor(pred) else None)
+        return loss
+
+    def _patched_validation_step(self, batch, batch_idx):
+        x, y, _w = batch if isinstance(batch, (list, tuple)) and len(batch) >= 2 else (batch, None, None)
+        with torch.no_grad():
+            y_hat = self(x)
+        pred = _coerce_prediction_tensor(y_hat)
+        loss = self.loss(pred, y) if y is not None else torch.tensor(0.0, device=pred.device if torch.is_tensor(pred) else None)
+        # Lightning is happy with just a Tensor here
+        return loss
+
+    BaseModel.training_step = _patched_training_step
+    BaseModel.validation_step = _patched_validation_step
+    print("[INFO] Patched PF training_step/validation_step to ensure tensor predictions and Tensor loss.")
+except Exception as e:
+    print(f"[WARN] Could not patch PF train/val steps: {e}")
+
+# -----------------------------------------------------------------------
 
 
 
