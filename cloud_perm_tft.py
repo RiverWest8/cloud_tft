@@ -727,6 +727,20 @@ class LearnableMultiTaskLoss(nn.Module):
         # --- Unpack targets (allow missing direction) ---
         yv, yd = self._unpack_targets(target)
 
+        # --- Ensure quantile dimension matches the configured loss quantiles ---
+        try:
+            q = len(getattr(self.loss_vol, "quantiles", []))
+        except Exception:
+            q = None
+        if q and torch.is_tensor(p_vol) and p_vol.ndim >= 2 and p_vol.size(-1) != q:
+            # If the model produced a single channel, repeat it to all quantiles.
+            if p_vol.size(-1) == 1:
+                p_vol = p_vol.repeat_interleave(q, dim=-1)
+            else:
+                # Fallback: collapse to one channel (mean) and repeat to expected quantiles.
+                p_single = p_vol.mean(dim=-1, keepdim=True)
+                p_vol = p_single.repeat_interleave(q, dim=-1)
+
         # Compute individual losses (allow missing direction target)
         L1 = self.loss_vol(p_vol, yv)
         if hasattr(L1, "mean"):
@@ -740,6 +754,12 @@ class LearnableMultiTaskLoss(nn.Module):
         else:
             # no direction labels present in this batch → zero contribution
             L2 = torch.zeros((), device=p_vol.device, dtype=p_vol.dtype)
+
+        # expose internals for callbacks (safe if not read)
+        self.last_L1 = torch.as_tensor(L1).detach()
+        self.last_L2 = torch.as_tensor(L2).detach() if isinstance(L2, torch.Tensor) else torch.tensor(float(L2))
+        self.last_s  = self.s.detach()
+        self.last_w  = torch.exp(-self.s).detach()
 
         weights = torch.exp(-self.s)
         return weights[0] * L1 + weights[1] * L2 + self.s.sum()
