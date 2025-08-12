@@ -173,8 +173,6 @@ if not hasattr(GroupNormalizer, "decode"):
 
 from pytorch_forecasting.metrics import QuantileLoss, MultiLoss
 
-
-
 class LabelSmoothedBCE(nn.Module):
     def __init__(self, smoothing: float = 0.1, pos_weight: float = 1.1):
         super().__init__()
@@ -996,27 +994,9 @@ def monkey_patch_to_network_output():
             # Already a tensor → done
             if torch.is_tensor(pred):
                 out = {"prediction": pred}
-
-            # List/tuple (one tensor per target) → harmonize & stack
+            
             elif isinstance(pred, (list, tuple)):
-                processed = []
-                for p in pred:
-                    if not torch.is_tensor(p):
-                        continue
-                    # squeeze singleton pred_len/target dims
-                    if p.ndim == 4 and p.shape[2] == 1:
-                        p = p.squeeze(2)   # [B,1,7] -> [B,1,7]
-                    if p.ndim == 3 and p.shape[1] == 1:
-                        p = p.squeeze(1)   # [B,7]
-                    # replicate single logit or reduce 2‑logit to prob and replicate to K=7
-                    if p.ndim >= 2 and p.shape[-1] == 1:
-                        p = p.repeat_interleave(7, dim=-1)
-                    elif p.ndim >= 2 and p.shape[-1] == 2:
-                        pos = p.softmax(-1)[..., 1].unsqueeze(-1)
-                        p = pos.repeat_interleave(7, dim=-1)
-                    processed.append(p)
-                if processed:
-                    pred = torch.stack(processed, dim=1)  # [B, n_targets, 7]
+                # Keep list-of-targets format so MultiLoss receives per-target tensors
                 out = {"prediction": pred}
 
             else:
@@ -1778,6 +1758,8 @@ if __name__ == "__main__":
         reduce_on_plateau_min_lr=1e-5,
     )
     optimizer_params={"weight_decay": WEIGHT_DECAY}
+    if isinstance(getattr(tft, "output_layer", None), DualOutputModule):
+        tft.output_layer = _nn.ModuleList([tft.output_layer.vol, tft.output_layer.dir])
 
     # --- Use fixed-weight MultiLoss instead of LearnableMultiTaskLoss ---
     try:
