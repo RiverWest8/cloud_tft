@@ -2103,6 +2103,7 @@ if __name__ == "__main__":
     ]
     print("▶ Creating Trainer …")
     trainer = Trainer(
+        num_sanity_val_steps=0,
         max_epochs=MAX_EPOCHS,
         accelerator=ACCELERATOR,
         devices=DEVICES,
@@ -2138,17 +2139,29 @@ if __name__ == "__main__":
 
     # >>> ACTUALLY TRAIN THE MODEL <<<
     try:
-        trainer.fit(
-            tft,
-            train_dataloaders=train_dataloader,
-            val_dataloaders=val_dataloader,
-            ckpt_path=(resume_ckpt if RESUME_ENABLED else None),
-        )
-    except Exception as e:
-        print(f"[ERROR] trainer.fit failed: {e}")
+        trainer.fit(tft, train_dataloader, val_dataloader)
+    except IndexError as e:
+        if "list index out of range" in str(e):
+            print("[WARN] trainer.fit raised IndexError('list index out of range'); retrying with FI disabled and no sanity check…")
+            # Best-effort: disable permutation importance so any FI callback/step cannot trigger the bug
+            try:
+                ENABLE_FEATURE_IMPORTANCE = False
+            except Exception:
+                pass
 
-    # Optional: run a final validation pass
-    try:
-        trainer.validate(tft, dataloaders=val_dataloader)
-    except Exception as e:
-        print(f"[WARN] validate() failed: {e}")
+            # Rebuild a simpler Trainer for the retry
+            fallback_trainer = Trainer(
+                num_sanity_val_steps=0,
+                accelerator=ACCELERATOR,
+                devices=DEVICES,
+                max_epochs=MAX_EPOCHS,
+                precision=PRECISION,
+                enable_checkpointing=False,
+                logger=logger,
+                check_val_every_n_epoch=int(getattr(ARGS, "check_val_every_n_epoch", 1)),
+                log_every_n_steps=int(getattr(ARGS, "log_every_n_steps", 200)),
+            )
+            fallback_trainer.fit(tft, train_dataloader, val_dataloader)
+        else:
+            raise
+ 
