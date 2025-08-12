@@ -658,109 +658,93 @@ class PerAssetMetrics(pl.Callback):
         except Exception as e:
             print(f"[WARN] Could not save validation predictions: {e}")
             
-# ---------------------------------------------------------------------
-# Learnable Multi-Task Loss with Uncertainty-style Weights
-# ---------------------------------------------------------------------
 class LearnableMultiTaskLoss(nn.Module):
     """
     Two-loss combiner with learnable uncertainty-style weights.
     total = exp(-s1) * L1 + exp(-s2) * L2 + (s1 + s2)
-    Initialize with desired starting weights w_i via s_i = -log(w_i).
-    Expects y_pred to be a list/tuple: [pred_vol, pred_dir].
 
-    Notes:
-    - Saves last_L1, last_L2, last_s, last_w for logging.
-    - Implements `rescale_parameters` and `to_prediction` so PF can decode outputs.
+    Expects y_pred = [pred_vol, pred_dir] where:
+    - pred_vol shape: [B, T, Q] (tensor) for quantiles
+    - pred_dir shape: [B, T] (tensor) for classification
     """
+
     def __init__(self, loss_vol: nn.Module, loss_dir: nn.Module, init_weights=(1.0, 0.5)):
         super().__init__()
         self.loss_vol = loss_vol
         self.loss_dir = loss_dir
         w1, w2 = float(init_weights[0]), float(init_weights[1])
-        # s_i = -log(w_i) so that exp(-s_i) = w_i at initialization
-        s1 = -np.log(max(w1, 1e-8))
-        s2 = -np.log(max(w2, 1e-8))
-        self.s = nn.Parameter(torch.tensor([s1, s2], dtype=torch.float32))
+        self.s = nn.Parameter(torch.tensor([-np.log(max(w1, 1e-8)),
+                                            -np.log(max(w2, 1e-8))],
+                                           dtype=torch.float32))
 
-        # last values for logging (populated during forward)
-        self.last_L1 = torch.tensor(float("nan"))
-        self.last_L2 = torch.tensor(float("nan"))
-        self.last_s = self.s.detach().clone()
-        self.last_w = torch.exp(-self.s.detach().clone())
+    @staticmethod
+    def _ensure_tensor(x):
+        """Convert any nested list/tuple of tensors into a single torch.Tensor."""
+        if torch.is_tensor(x):
+            return x
+        if isinstance(x, (list, tuple)):
+            # Recursively flatten
+            flat = []
+            for item in x:
+                t = LearnableMultiTaskLoss._ensure_tensor(item)
+                flat.append(t)
+            try:
+                return torch.stack(flat, dim=-1)  # stack into quantile dimension
+            except RuntimeError:
+                # If already stacked correctly, just return the first element
+                return flat[0]
+        raise TypeError(f"Expected Tensor/List/Tuple, got {type(x)}")
+
     def forward(self, y_pred, target, **kwargs):
-        # Unpack predictions
-        if isinstance(y_pred, (list, tuple)) and len(y_pred) >= 2:
-            p_vol, p_dir = y_pred[0], y_pred[1]
-            # If p_vol or p_dir are wrapped in 1-element lists/tuples, unwrap
-            if isinstance(p_vol, (list, tuple)) and len(p_vol) == 1:
-                p_vol = p_vol[0]
-            if isinstance(p_dir, (list, tuple)) and len(p_dir) == 1:
-                p_dir = p_dir[0]
-        else:
+        if not (isinstance(y_pred, (list, tuple)) and len(y_pred) >= 2):
             raise TypeError("LearnableMultiTaskLoss expects y_pred as [vol_pred, dir_pred]")
-        # Unpack targets -> expected shapes [..., pred_len] or [..., pred_len, 1]
-        # Accept either a single tensor with last dim >=2 (multi-target) or a list
+
+        p_vol = self._ensure_tensor(y_pred[0])
+        p_dir = self._ensure_tensor(y_pred[1])
+
+        # --- Unpack targets ---
         if torch.is_tensor(target):
-            t = target
-            # Common PF shapes: [B, pred_len, n_targets] or [B, n_targets]
-            if t.ndim == 3 and t.size(-1) >= 2:
-                yv = t[..., 0]
-                yd = t[..., 1]
-            elif t.ndim == 2 and t.size(-1) >= 2:
-                yv = t[:, 0]
-                yd = t[:, 1]
+            if target.ndim == 3 and target.size(-1) >= 2:
+                yv, yd = target[..., 0], target[..., 1]
+            elif target.ndim == 2 and target.size(-1) >= 2:
+                yv, yd = target[:, 0], target[:, 1]
             else:
-                raise ValueError(f"Unexpected target shape for multi-task: {t.shape}")
+                raise ValueError(f"Unexpected target shape: {target.shape}")
         elif isinstance(target, (list, tuple)) and len(target) >= 2:
-            yv, yd = target[0], target[1]
-            # Squeeze trailing singleton dims if present
+            yv, yd = target
             if torch.is_tensor(yv) and yv.ndim >= 3 and yv.size(-1) == 1:
                 yv = yv[..., 0]
             if torch.is_tensor(yd) and yd.ndim >= 3 and yd.size(-1) == 1:
                 yd = yd[..., 0]
         else:
-            raise TypeError("LearnableMultiTaskLoss expects target tensor with two channels or list of two tensors")
+            raise TypeError("LearnableMultiTaskLoss expects target with two channels or list of two tensors")
 
-        # Compute individual losses (ensure scalars)
+        # --- Compute both losses ---
         L1 = self.loss_vol(p_vol, yv)
         L2 = self.loss_dir(p_dir, yd)
-        if L1.ndim > 0:
+        if hasattr(L1, "mean"):
             L1 = L1.mean()
-        if L2.ndim > 0:
+        if hasattr(L2, "mean"):
             L2 = L2.mean()
 
-        # Save for logging
-        self.last_L1 = L1.detach()
-        self.last_L2 = L2.detach()
-        self.last_s = self.s.detach()
-        self.last_w = torch.exp(-self.s.detach())
-
-        # Combine with learnable weights (Kendall & Gal style)
-        weights = torch.exp(-self.s)  # [2]
+        weights = torch.exp(-self.s)
         total = weights[0] * L1 + weights[1] * L2 + self.s.sum()
         return total
 
-    # ---- PF hooks so BaseModel.transform_output() works ----
+    # ---- PF hooks ----
     def rescale_parameters(self, y_pred, **kwargs):
-        """
-        Rescale only the volatility head using its loss' logic; leave direction as-is.
-        Expected y_pred: [vol_params, dir_logit]
-        """
         if isinstance(y_pred, (list, tuple)) and len(y_pred) >= 1:
-            vol = y_pred[0]
-            dir_ = y_pred[1] if len(y_pred) > 1 else None
+            vol = self._ensure_tensor(y_pred[0])
+            dir_ = self._ensure_tensor(y_pred[1]) if len(y_pred) > 1 else None
             if hasattr(self.loss_vol, "rescale_parameters"):
                 vol = self.loss_vol.rescale_parameters(vol, **kwargs)
             return [vol, dir_]
-        return y_pred  # passthrough fallback
+        return y_pred
 
     def to_prediction(self, y_pred, normalize: bool = False, **kwargs):
-        """
-        Convert parameters to predictions; delegate to vol loss, passthrough for dir.
-        """
         if isinstance(y_pred, (list, tuple)) and len(y_pred) >= 1:
-            vol = y_pred[0]
-            dir_ = y_pred[1] if len(y_pred) > 1 else None
+            vol = self._ensure_tensor(y_pred[0])
+            dir_ = self._ensure_tensor(y_pred[1]) if len(y_pred) > 1 else None
             if hasattr(self.loss_vol, "to_prediction"):
                 vol = self.loss_vol.to_prediction(vol, normalize=normalize, **kwargs)
             return [vol, dir_]
