@@ -489,6 +489,209 @@ class PerAssetMetrics(pl.Callback):
             "yd": yd_cpu,
             "pd": pd_cpu,
         }
+
+        # -----------------------------------------------------------------------
+        # Permutation Importance Helpers (decoded metric = MAE + RMSE)
+        # -----------------------------------------------------------------------
+
+        def _permute_series_inplace(df: pd.DataFrame, col: str, block: int, group_col: str = "asset") -> None:
+            """
+            Permute a feature in-place. If block>1, do a group-wise cyclic roll
+            by a random offset (keeps local structure better). If block<=1, fully
+            shuffle within group.
+            """
+            if col not in df.columns:
+                return
+            if group_col not in df.columns:
+                vals = df[col].values.copy()
+                np.random.shuffle(vals)
+                df[col] = vals
+                return
+            for _, idx in df.groupby(group_col, observed=True).groups.items():
+                idx = np.asarray(list(idx))
+                if block and block > 1:
+                    shift = np.random.randint(1, max(2, len(idx)))
+                    df.loc[idx, col] = df.loc[idx, col].values.take(np.arange(len(idx)) - shift, mode='wrap')
+                else:
+                    vals = df.loc[idx, col].values.copy()
+                    np.random.shuffle(vals)
+                    df.loc[idx, col] = vals
+
+
+        def _extract_norm_from_dataset(ds: TimeSeriesDataSet):
+            """Return the GroupNormalizer used for realised_vol in our MultiNormalizer."""
+            try:
+                norm = ds.get_parameters()["target_normalizer"]
+                if hasattr(norm, "normalizers") and len(norm.normalizers) >= 1:
+                    return norm.normalizers[0]
+            except Exception:
+                pass
+            return None
+
+
+        def _evaluate_decoded_mae_rmse(
+            model,
+            ds: TimeSeriesDataSet,
+            batch_size: int,
+            max_batches: int,
+            num_workers: int,
+            prefetch: int,
+            pin_memory: bool,
+        ):
+            """Run model on up to `max_batches` batches and compute decoded MAE and RMSE."""
+            vol_norm = _extract_norm_from_dataset(ds)
+
+            dl = ds.to_dataloader(
+                train=False,
+                batch_size=batch_size,
+                num_workers=num_workers,
+                persistent_workers=(num_workers > 0),
+                prefetch_factor=prefetch,
+                pin_memory=pin_memory,
+            )
+
+            model.eval()
+            y_all, p_all = [], []
+            with torch.no_grad():
+                for b_idx, batch in enumerate(dl):
+                    if max_batches is not None and b_idx >= int(max_batches):
+                        break
+
+                    # PF dataloaders return (x, y, weight) or (x, y)
+                    if isinstance(batch, (list, tuple)) and len(batch) >= 2:
+                        x, y = batch[0], batch[1]
+                    else:
+                        x, y = batch, None
+
+                    y_hat = model(x)
+                    pred = getattr(y_hat, "prediction", y_hat)
+
+                    # groups for decoding
+                    g = x.get("groups")
+                    if isinstance(g, (list, tuple)):
+                        g = g[0]
+                    if torch.is_tensor(g) and g.ndim > 1 and g.size(-1) == 1:
+                        g = g.squeeze(-1)
+
+                    # decoder target (vol)
+                    dec_t = x.get("decoder_target")
+                    if torch.is_tensor(dec_t):
+                        t = dec_t
+                        if t.ndim == 3 and t.size(-1) == 1:
+                            t = t[..., 0]
+                        y_vol = t[:, 0] if (t.ndim == 2 and t.size(1) >= 1) else None
+                    else:
+                        y_vol = None
+                    if y_vol is None and torch.is_tensor(y):
+                        t = y
+                        if t.ndim == 3 and t.size(1) == 1:
+                            t = t[:, 0, :]
+                        if t.ndim == 2 and t.size(1) >= 1:
+                            y_vol = t[:, 0]
+
+                    # take median quantile for vol
+                    def _median_q(t):
+                        if torch.is_tensor(t) and t.ndim == 3 and t.size(1) == 1:
+                            t = t.squeeze(1)
+                        if torch.is_tensor(t) and t.ndim == 2 and t.size(-1) >= 1:
+                            return t[:, t.size(-1) // 2]
+                        return t
+
+                    if isinstance(pred, (list, tuple)):
+                        p_vol = _median_q(pred[0])
+                    elif torch.is_tensor(pred):
+                        t = pred
+                        if t.ndim == 4 and t.size(1) == 1:
+                            t = t.squeeze(1)
+                        if t.ndim == 3 and t.size(1) >= 2:
+                            p_vol = _median_q(t[:, 0, :])
+                        elif t.ndim >= 2:
+                            p_vol = _median_q(t)
+                        else:
+                            p_vol = t
+                    else:
+                        continue
+
+                    if not (torch.is_tensor(y_vol) and torch.is_tensor(p_vol) and torch.is_tensor(g)):
+                        continue
+
+                    # decode back to physical scale
+                    try:
+                        y_dec = vol_norm.decode(y_vol.unsqueeze(-1), group_ids=g.unsqueeze(-1)).squeeze(-1)
+                        p_dec = vol_norm.decode(p_vol.unsqueeze(-1), group_ids=g.unsqueeze(-1)).squeeze(-1)
+                    except Exception:
+                        y_dec, p_dec = y_vol, p_vol
+
+                    y_all.append(y_dec.detach().cpu())
+                    p_all.append(p_dec.detach().cpu())
+
+            if not y_all:
+                return float("nan"), float("nan"), 0
+
+            y = torch.cat(y_all)
+            p = torch.cat(p_all)
+            mae = (p - y).abs().mean().item()
+            rmse = torch.sqrt(((p - y) ** 2).mean()).item()
+            return mae, rmse, int(y.numel())
+
+
+        def run_permutation_importance(
+            model,
+            base_df: pd.DataFrame,
+            build_ds_fn,
+            features: List[str],
+            block_size: int,
+            batch_size: int,
+            max_batches: int,
+            num_workers: int,
+            prefetch: int,
+            pin_memory: bool,
+            out_csv_path: str,
+            uploader,
+        ) -> None:
+            """
+            Compute FI by permuting each feature and measuring Δ(MAE+RMSE) on decoded scale.
+            Saves a CSV with columns: feature, baseline, permuted, delta, n.
+            """
+            # Baseline
+            ds_base = build_ds_fn(base_df, predict=False)
+            b_mae, b_rmse, n = _evaluate_decoded_mae_rmse(
+                model, ds_base, batch_size, max_batches, num_workers, prefetch, pin_memory
+            )
+            baseline = float(b_mae + b_rmse) if np.isfinite(b_mae) and np.isfinite(b_rmse) else float("nan")
+            print(f"[FI] Baseline (MAE+RMSE) = {baseline:.6f} | N={n}")
+
+            rows = []
+            for feat in features:
+                if feat not in base_df.columns:
+                    print(f"[FI] Skipping missing feature: {feat}")
+                    continue
+                df_p = base_df.copy()
+                _permute_series_inplace(
+                    df_p, feat, block=block_size, group_col=GROUP_ID[0] if GROUP_ID else "asset"
+                )
+                ds_p = build_ds_fn(df_p, predict=False)
+                p_mae, p_rmse, n_p = _evaluate_decoded_mae_rmse(
+                    model, ds_p, batch_size, max_batches, num_workers, prefetch, pin_memory
+                )
+                permuted = float(p_mae + p_rmse) if np.isfinite(p_mae) and np.isfinite(p_rmse) else float("nan")
+                delta = (permuted - baseline) if (np.isfinite(permuted) and np.isfinite(baseline)) else float("nan")
+                print(f"[FI] {feat:>20} | loss_p={permuted:.6f} | Δ={delta:.6f}")
+                rows.append(
+                    {"feature": feat, "baseline": baseline, "permuted": permuted, "delta": delta, "n": n_p}
+                )
+
+            try:
+                _df = pd.DataFrame(rows).sort_values("delta", ascending=False)
+                _df.to_csv(out_csv_path, index=False)
+                print(f"✓ Saved FI → {out_csv_path}")
+                try:
+                    uploader(out_csv_path, f"{GCS_OUTPUT_PREFIX}/" + os.path.basename(out_csv_path))
+                except Exception as e:
+                    print(f"[WARN] Could not upload FI CSV: {e}")
+            except Exception as e:
+                print(f"[WARN] Failed to save FI: {e}")
+
         # ---- concise per-epoch validation metrics printout (overall only) ----
         try:
             epoch_num = int(getattr(trainer, "current_epoch", -1)) + 1
@@ -1061,9 +1264,9 @@ def gcs_exists(path: str) -> bool:
     except Exception:
         return False
 
-TRAIN_URI = f"{GCS_DATA_PREFIX}/universal_train.parquet"
-VAL_URI   = f"{GCS_DATA_PREFIX}/universal_val.parquet"
-TEST_URI  = f"{GCS_DATA_PREFIX}/universal_test.parquet"
+TRAIN_URI = f"{GCS_DATA_PREFIX}/universal_train.parquet_10k"
+VAL_URI   = f"{GCS_DATA_PREFIX}/universal_val.parquet_10k"
+TEST_URI  = f"{GCS_DATA_PREFIX}/universal_test.parquet_10k"
 READ_PATHS = [str(TRAIN_URI), str(VAL_URI), str(TEST_URI)]
 '''
 # If a local data folder is explicitly provided, use it and skip GCS
@@ -1916,233 +2119,30 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"[WARN] Could not bump max_epochs: {e}")
     # >>> ACTUALLY TRAIN THE MODEL <<<
-    trainer.fit(tft, train_dataloader, val_dataloader)
+    trainer.fit(tft, train_dataloader, val_dataloader, ckpt_path = resume_ckpt )
 
-    # -----------------------------------------------------------------------
-    # Permutation Feature Importance (runs after training)
-    # -----------------------------------------------------------------------
-    
+    # ---------------- Permutation Feature Importance (decoded) ----------------
     try:
         if ENABLE_FEATURE_IMPORTANCE:
-            print("▶ Computing permutation feature importance …")
-
-            import numpy as _np
-            import pandas as _pd
-            import torch as _torch
-            from pytorch_forecasting import TimeSeriesDataSet as _TSD
-
-            # --- Robustly obtain the raw validation dataframe ---
-            def _get_val_dataframe():
-                # 1) Prefer the original val_df if it still exists
-                v = globals().get("val_df", None)
-                if isinstance(v, _pd.DataFrame):
-                    return v
-                # 2) Try dataset.data (PF stores the backing frame here on most versions)
-                try:
-                    d = getattr(validation_dataset, "data", None)
-                    if isinstance(d, _pd.DataFrame):
-                        return d
-                except Exception:
-                    pass
-                # 3) Try to_pandas() (available on some versions)
-                try:
-                    d = validation_dataset.to_pandas()
-                    if isinstance(d, _pd.DataFrame):
-                        return d
-                except Exception:
-                    pass
-                raise TypeError("Could not obtain validation DataFrame for FI; val_df/validation_dataset.data missing")
-
-            _val_df_src = _get_val_dataframe().copy()
-            # Basic column sanity and dtype harmonisation
-            required_cols = {"asset", "time_idx"}
-            if not required_cols.issubset(_val_df_src.columns):
-                raise KeyError(f"Validation frame missing required columns {required_cols} — has: {sorted(_val_df_src.columns)}")
-            _val_df_src["asset"] = _val_df_src["asset"].astype(str)
-            _val_df_src["time_idx"] = _pd.to_numeric(_val_df_src["time_idx"], errors="coerce").astype("Int64").astype("int64")
-
- 
-            # Helper: move nested batch to device/dtype
-            def _move_batch_to_device(obj, device, param_dtype):
-                if _torch.is_tensor(obj):
-                    if obj.dtype.is_floating_point:
-                        return obj.to(device=device, dtype=param_dtype, non_blocking=True)
-                    return obj.to(device=device, non_blocking=True)
-                if isinstance(obj, dict):
-                    return {k: _move_batch_to_device(v, device, param_dtype) for k, v in obj.items()}
-                if isinstance(obj, (list, tuple)):
-                    return type(obj)(_move_batch_to_device(v, device, param_dtype) for v in obj)
-                return obj
-
-            def _coerce_prediction(y_hat, model):
-                """Return a plain prediction (list/tuple or Tensor) that the loss can consume.
-                Handles PF's TupleOutputMixIn Output by calling to_network_output first.
-                """
-                # Preferred path: PF utility
-                try:
-                    out = model.to_network_output(y_hat)
-                    if isinstance(out, dict) and "prediction" in out:
-                        return out["prediction"]
-                except Exception:
-                    pass
-                # Namedtuple-like
-                try:
-                    if hasattr(y_hat, "prediction"):
-                        return y_hat.prediction
-                except Exception:
-                    pass
-                # Already plain
-                return y_hat
-
-            def _extract_target_from_batch(x, y):
-                """Build a proper target tensor. Prefer x['decoder_target'] if y is missing/malformed.
-                Final shape accepted by loss: [B, pred_len, n_targets] or [B, n_targets].
-                """
-                import torch as _torch
-
-                if _torch.is_tensor(y):
-                    return y
-
-                if isinstance(x, dict):
-                    dt = x.get("decoder_target", None)
-                    if _torch.is_tensor(dt):
-                        # common: [B, pred_len, n_targets] (pred_len=1 in our setup)
-                        if dt.ndim == 3 and dt.size(1) == 1:
-                            return dt[:, 0, :]      # -> [B, n_targets]
-                        return dt
-                    # Some PF versions may split targets
-                    vol = x.get("decoder_target_realised_vol", None)
-                    dire = x.get("decoder_target_direction", None)
-                    if _torch.is_tensor(vol) and _torch.is_tensor(dire):
-                        v, d = vol, dire
-                        while v.ndim > 1 and v.size(-1) == 1:
-                            v = v.squeeze(-1)
-                        while d.ndim > 1 and d.size(-1) == 1:
-                            d = d.squeeze(-1)
-                        return _torch.stack([v, d], dim=-1)  # [B, 2]
-                return None
-
-            @_torch.no_grad()
-            def _evaluate_val_loss(model, loader, max_batches=None):
-                model.eval()
-                device = next(model.parameters()).device
-                p_dtype = next(model.parameters()).dtype
-                total = 0.0
-                n = 0
-                for b_idx, batch in enumerate(loader):
-                    if (max_batches is not None) and (b_idx >= max_batches):
-                        break
-
-                    # Unpack PF batch
-                    if not isinstance(batch, (list, tuple)) or len(batch) < 1:
-                        continue
-                    x = batch[0]
-                    y = batch[1] if len(batch) > 1 else None
-
-                    # Build a clean target tensor
-                    y = _extract_target_from_batch(x, y)
-                    if y is None or not _torch.is_tensor(y):
-                        # Skip batches without proper targets
-                        continue
-
-                    # Move to device / dtype
-                    x = _move_batch_to_device(x, device, p_dtype)
-                    y = _move_batch_to_device(y, device, p_dtype)
-
-                    # Forward + coerce PF Output ➜ plain pred
-                    y_hat = model(x)
-                    pred = _coerce_prediction(y_hat, model)
-
-                    # Compute loss
-                    try:
-                        loss = model.loss(pred, y)
-                    except Exception as e:
-                        if isinstance(pred, dict) and "prediction" in pred:
-                            loss = model.loss(pred["prediction"], y)
-                        else:
-                            raise e
-
-                    try:
-                        loss = loss.mean()
-                    except Exception:
-                        pass
-
-                    total += float(loss.detach().cpu().item())
-                    n += 1
-
-                return (total / max(n, 1))
-
-            # --- Baseline using the existing validation dataloader ---
-            baseline_loss = _evaluate_val_loss(tft, val_dataloader, max_batches=FI_MAX_BATCHES)
-            print(f"[FI] Baseline val loss (first {FI_MAX_BATCHES} batches): {baseline_loss:.6f}")
-
-            # Candidate features: calendar + unknown reals that are actually present in the frame
-            _candidate_feats = list((calendar_cols + ["Is_Weekend"]) + time_varying_unknown_reals)
-            fi_features = [f for f in _candidate_feats if f in _val_df_src.columns]
-            if not fi_features:
-                raise ValueError("No candidate FI features found in validation frame — nothing to permute.")
-
-            # Group-wise, contiguous-block permutation (per asset)
-            def _permute_blocks_by_asset(df_in: _pd.DataFrame, feature: str, block: int, seed: int) -> _pd.Series:
-                rng = _np.random.default_rng(seed)
-                def _permute_one(s: _pd.Series) -> _pd.Series:
-                    n = len(s)
-                    if n <= 1:
-                        return s
-                    if block is None or block <= 1:
-                        return s.sample(frac=1.0, random_state=seed)
-                    # Build contiguous blocks and shuffle their order
-                    slices = [slice(i, min(i + block, n)) for i in range(0, n, block)]
-                    order = rng.permutation(len(slices))
-                    out = s.copy().to_numpy()
-                    pos = 0
-                    for b in order:
-                        sl = slices[b]
-                        ln = sl.stop - sl.start
-                        out[pos:pos + ln] = s.iloc[sl].to_numpy()
-                        pos += ln
-                    return _pd.Series(out, index=s.index)
-                return df_in.groupby("asset", group_keys=False)[feature].apply(_permute_one)
-
-            results = []
-            for feat in fi_features:
-                try:
-                    print(f"[FI] Permuting feature: {feat}")
-                    dfp = _val_df_src.copy(deep=True)
-                    # The returned Series keeps the original index — assignment by index is safe
-                    dfp[feat] = _permute_blocks_by_asset(dfp, feat, PERM_BLOCK_SIZE, SEED)
-
-                    # Rebuild a validation dataset from the training template to reuse encoders
-                    ds_perm = _TSD.from_dataset(training_dataset, dfp, predict=False, stop_randomization=True)
-                    dl_perm = ds_perm.to_dataloader(
-                        train=False,
-                        batch_size=batch_size,
-                        num_workers=worker_cnt,
-                        persistent_workers=use_persist,
-                        prefetch_factor=prefetch,
-                        pin_memory=pin,
-                    )
-
-                    perm_loss = _evaluate_val_loss(tft, dl_perm, max_batches=FI_MAX_BATCHES)
-                    delta = perm_loss - baseline_loss
-                    results.append((feat, float(perm_loss), float(delta)))
-                    print(f"[FI] {feat:>24s} | loss={perm_loss:.6f} | Δ={delta:.6f}")
-                except Exception as e:
-                    print(f"[FI][WARN] {feat}: {e}")
-
-            if results:
-                res_df = _pd.DataFrame(results, columns=["feature", "perm_loss", "delta_loss"]).sort_values("delta_loss", ascending=False)
-                fi_path = LOCAL_RUN_DIR / f"tft_perm_importance_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv"
-                res_df.to_csv(fi_path, index=False)
-                print(f"✓ Saved permutation importance → {fi_path}")
-                try:
-                    upload_file_to_gcs(str(fi_path), f"{GCS_OUTPUT_PREFIX}/{fi_path.name}")
-                except Exception as e:
-                    print(f"[WARN] Could not upload FI CSV: {e}")
-            else:
-                print("[FI] No results to save (no features permuted or empty validation set).")
-
+            fi_csv = str(LOCAL_OUTPUT_DIR / f"tft_perm_importance_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv")
+            feats = time_varying_unknown_reals.copy()
+            # (optional) drop calendar features from FI to focus on learned signals
+            feats = [f for f in feats if f not in ("sin_tod", "cos_tod", "sin_dow", "cos_dow", "Is_Weekend")]
+            run_permutation_importance(
+                model=tft,
+                base_df=val_df,
+                build_ds_fn=build_dataset,
+                features=feats,
+                block_size=int(PERM_BLOCK_SIZE) if PERM_BLOCK_SIZE else 1,
+                batch_size=batch_size,
+                max_batches=int(FI_MAX_BATCHES) if FI_MAX_BATCHES else 20,
+                num_workers=worker_cnt,
+                prefetch=prefetch,
+                pin_memory=pin,
+                out_csv_path=fi_csv,
+                uploader=upload_file_to_gcs,
+            )
     except Exception as e:
-        print(f"[WARN] FI computation failed: {e}")
-
+        print(f"[WARN] FI failed: {e}")
+        
     
