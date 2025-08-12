@@ -1816,36 +1816,53 @@ if __name__ == "__main__":
         ),
     ]
     print("▶ Creating Trainer …")
-trainer = Trainer(
-    max_epochs=MAX_EPOCHS,
-    accelerator=ACCELERATOR,
-    devices=DEVICES,
-    precision=PRECISION,
-    default_root_dir=str(LOCAL_RUN_DIR),
-    callbacks=callbacks,
-    logger=logger,
-    check_val_every_n_epoch=int(getattr(ARGS, "check_val_every_n_epoch", 1)),
-    log_every_n_steps=int(getattr(ARGS, "log_every_n_steps", 200)),
-    gradient_clip_val=GRADIENT_CLIP_VAL,
-)
+    trainer = Trainer(
+        max_epochs=MAX_EPOCHS,
+        accelerator=ACCELERATOR,
+        devices=DEVICES,
+        precision=PRECISION,
+        default_root_dir=str(LOCAL_RUN_DIR),
+        callbacks=callbacks,
+        logger=logger,
+        check_val_every_n_epoch=int(getattr(ARGS, "check_val_every_n_epoch", 1)),
+        log_every_n_steps=int(getattr(ARGS, "log_every_n_steps", 200)),
+        gradient_clip_val=GRADIENT_CLIP_VAL,
+    )
 
-# Resume logic with epoch bump if needed
-resume_ckpt = get_resume_ckpt_path() if RESUME_ENABLED else None
-if resume_ckpt:
-    print(f"▶ Resuming from checkpoint: {resume_ckpt}")
+    # Resume logic with epoch bump if needed
+    resume_ckpt = get_resume_ckpt_path() if RESUME_ENABLED else None
+    if resume_ckpt:
+        print(f"▶ Resuming from checkpoint: {resume_ckpt}")
+        try:
+            import torch as _torch
+            _meta = _torch.load(resume_ckpt, map_location="cpu")
+            _epoch = None
+            for k in ("epoch", "current_epoch"):
+                if isinstance(_meta, dict) and k in _meta:
+                    _epoch = int(_meta[k])
+                    break
+            if _epoch is not None:
+                need = int(_epoch) + 1
+                fit_loop = getattr(trainer, "fit_loop", None)
+                if fit_loop is not None and getattr(fit_loop, "max_epochs", None) is not None:
+                    if fit_loop.max_epochs < need:
+                        print(f"[INFO] Bumping Trainer.max_epochs to {MAX_EPOCHS} to align logging intervals.")
+        except Exception as e:
+            print(f"[WARN] Could not bump max_epochs: {e}")
+
+    # >>> ACTUALLY TRAIN THE MODEL <<<
     try:
-        import torch as _torch
-        _meta = _torch.load(resume_ckpt, map_location="cpu")
-        _epoch = None
-        for k in ("epoch", "current_epoch"):
-            if isinstance(_meta, dict) and k in _meta:
-                _epoch = int(_meta[k])
-                break
-        if _epoch is not None:
-            need = int(_epoch) + 1
-            fit_loop = getattr(trainer, "fit_loop", None)
-            if fit_loop is not None and getattr(fit_loop, "max_epochs", None) is not None:
-                if fit_loop.max_epochs < need:
-                    print(f"[INFO] Bumping Trainer.max_epochs to {MAX_EPOCHS} to align logging intervals.")
+        trainer.fit(
+            tft,
+            train_dataloaders=train_dataloader,
+            val_dataloaders=val_dataloader,
+            ckpt_path=(resume_ckpt if RESUME_ENABLED else None),
+        )
     except Exception as e:
-        print(f"[WARN] Could not bump max_epochs: {e}")
+        print(f"[ERROR] trainer.fit failed: {e}")
+
+    # Optional: run a final validation pass
+    try:
+        trainer.validate(tft, dataloaders=val_dataloader)
+    except Exception as e:
+        print(f"[WARN] validate() failed: {e}")
