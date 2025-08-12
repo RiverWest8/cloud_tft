@@ -1465,11 +1465,15 @@ if __name__ == "__main__":
     # Wrap plot_prediction (used by PF inside log_prediction)
     if hasattr(tft, "plot_prediction"):
         _orig_plot_prediction = tft.plot_prediction
-        def safe_plot_prediction(*args, **kwargs):
-            args = tuple(_deep_cpu_float(a) for a in args)
-            kwargs = {k: _deep_cpu_float(v) for k, v in kwargs.items()}
-            return _orig_plot_prediction(*args, **kwargs)
-        tft.plot_prediction = safe_plot_prediction
+        def safe_plot_prediction(self, *args, **kwargs):
+            x = args[1] if len(args) > 1 else kwargs.get("x")
+            if isinstance(x, dict) and "encoder_lengths" in x:
+                if torch.is_tensor(x["encoder_lengths"]):
+                    x["encoder_lengths"] = x["encoder_lengths"].cpu()
+                # force scalar conversion for each length
+                if hasattr(x["encoder_lengths"], "__iter__"):
+                    x["encoder_lengths"] = [int(el) for el in x["encoder_lengths"]]
+            return _orig_plot_prediction(self, *args, **kwargs)
 
     # Wrap log_prediction (PF calls this in validation to produce figures)
     if hasattr(tft, "log_prediction"):
