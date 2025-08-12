@@ -1024,11 +1024,6 @@ def monkey_patch_to_network_output():
 # Activate the patch
 monkey_patch_to_network_output()
 
-# -----------------------------------------------------------------------
-# Harden PF train/val steps: always coerce predictions to a tensor and
-# return a plain Tensor loss (Lightning-safe). This avoids any code path
-# that might try to .detach() a Python list.
-# -----------------------------------------------------------------------
 try:
     from pytorch_forecasting.models.base._base_model import BaseModel
     import torch
@@ -1122,6 +1117,8 @@ try:
     BaseModel.training_step = _patched_training_step
     BaseModel.validation_step = _patched_validation_step
     print("[INFO] Patched PF training_step/validation_step to ensure tensor predictions and Tensor loss.")
+except Exception as e:
+    print(f"[WARN] Could not patch PF train/val steps: {e}")
 
 
 # -----------------------------------------------------------------------
