@@ -1435,13 +1435,31 @@ if __name__ == "__main__":
     # --- Safe plotting/logging: deep-cast any nested tensors to CPU float32 ---
     def _deep_cpu_float(x):
         if torch.is_tensor(x):
-            # ensure CPU float32 so numpy/matplotlib can consume it
             return x.detach().to(device="cpu", dtype=torch.float32)
-        if isinstance(x, (list, tuple)):
-            casted = [_deep_cpu_float(v) for v in x]
-            return type(x)(casted)
+
+        # lists: rebuild as list
+        if isinstance(x, list):
+            return [_deep_cpu_float(v) for v in x]
+
+        # tuples (including namedtuples): try to rebuild preserving the class
+        if isinstance(x, tuple):
+            casted = tuple(_deep_cpu_float(v) for v in x)
+            try:
+                # namedtuple or tuple subclass with positional fields
+                return x.__class__(*casted)
+            except Exception:
+                # fallback: plain tuple
+                return casted
+
+        # dicts: recurse values
         if isinstance(x, dict):
             return {k: _deep_cpu_float(v) for k, v in x.items()}
+
+        # numpy arrays: ensure float32 for plotting if numeric
+        if isinstance(x, np.ndarray) and np.issubdtype(x.dtype, np.number):
+            return x.astype(np.float32, copy=False)
+
+        # everything else (strings, objects, scalars)
         return x
 
     # Wrap plot_prediction (used by PF inside log_prediction)
