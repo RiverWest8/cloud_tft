@@ -1941,6 +1941,7 @@ if __name__ == "__main__":
             _val_df_src["asset"] = _val_df_src["asset"].astype(str)
             _val_df_src["time_idx"] = _pd.to_numeric(_val_df_src["time_idx"], errors="coerce").astype("Int64").astype("int64")
 
+ 
             # Helper: move nested batch to device/dtype
             def _move_batch_to_device(obj, device, param_dtype):
                 if _torch.is_tensor(obj):
@@ -1952,6 +1953,55 @@ if __name__ == "__main__":
                 if isinstance(obj, (list, tuple)):
                     return type(obj)(_move_batch_to_device(v, device, param_dtype) for v in obj)
                 return obj
+
+            def _coerce_prediction(y_hat, model):
+                """Return a plain prediction (list/tuple or Tensor) that the loss can consume.
+                Handles PF's TupleOutputMixIn Output by calling to_network_output first.
+                """
+                # Preferred path: PF utility
+                try:
+                    out = model.to_network_output(y_hat)
+                    if isinstance(out, dict) and "prediction" in out:
+                        return out["prediction"]
+                except Exception:
+                    pass
+                # Namedtuple-like
+                try:
+                    if hasattr(y_hat, "prediction"):
+                        return y_hat.prediction
+                except Exception:
+                    pass
+                # Already plain
+                return y_hat
+
+            def _extract_target_from_batch(x, y):
+                """Build a proper target tensor. Prefer x['decoder_target'] if y is missing/malformed.
+                Final shape accepted by loss: [B, pred_len, n_targets] or [B, n_targets].
+                """
+                import torch as _torch
+
+                if _torch.is_tensor(y):
+                    return y
+
+                if isinstance(x, dict):
+                    dt = x.get("decoder_target", None)
+                    if _torch.is_tensor(dt):
+                        # common: [B, pred_len, n_targets] (pred_len=1 in our setup)
+                        if dt.ndim == 3 and dt.size(1) == 1:
+                            return dt[:, 0, :]      # -> [B, n_targets]
+                        return dt
+                    # Some PF versions may split targets
+                    vol = x.get("decoder_target_realised_vol", None)
+                    dire = x.get("decoder_target_direction", None)
+                    if _torch.is_tensor(vol) and _torch.is_tensor(dire):
+                        v, d = vol, dire
+                        while v.ndim > 1 and v.size(-1) == 1:
+                            v = v.squeeze(-1)
+                        while d.ndim > 1 and d.size(-1) == 1:
+                            d = d.squeeze(-1)
+                        return _torch.stack([v, d], dim=-1)  # [B, 2]
+                return None
+
             @_torch.no_grad()
             def _evaluate_val_loss(model, loader, max_batches=None):
                 model.eval()
@@ -1962,75 +2012,44 @@ if __name__ == "__main__":
                 for b_idx, batch in enumerate(loader):
                     if (max_batches is not None) and (b_idx >= max_batches):
                         break
-                    if not isinstance(batch, (list, tuple)) or len(batch) < 2:
+
+                    # Unpack PF batch
+                    if not isinstance(batch, (list, tuple)) or len(batch) < 1:
                         continue
-                    x, y = batch[0], batch[1]
+                    x = batch[0]
+                    y = batch[1] if len(batch) > 1 else None
+
+                    # Build a clean target tensor
+                    y = _extract_target_from_batch(x, y)
+                    if y is None or not _torch.is_tensor(y):
+                        # Skip batches without proper targets
+                        continue
+
+                    # Move to device / dtype
                     x = _move_batch_to_device(x, device, p_dtype)
                     y = _move_batch_to_device(y, device, p_dtype)
 
-                    # Forward
-                    y_pred = model(x)
+                    # Forward + coerce PF Output ➜ plain pred
+                    y_hat = model(x)
+                    pred = _coerce_prediction(y_hat, model)
 
-                    # 1) Try straightforward call
+                    # Compute loss
                     try:
-                        loss = model.loss(y_pred, y)
-                    except Exception as e1:
-                        # 2) If predictions are list-like and y is a multi-target tensor,
-                        #    split y along the last dim so each head gets its target.
-                        try:
-                            if isinstance(y_pred, (list, tuple)) and _torch.is_tensor(y) and y.ndim >= 2:
-                                if y.ndim >= 3 and y.size(-1) >= len(y_pred):
-                                    targ_list = [y[..., i] for i in range(len(y_pred))]
-                                elif y.ndim == 2 and y.size(-1) >= len(y_pred):
-                                    targ_list = [y[:, i] for i in range(len(y_pred))]
-                                else:
-                                    raise RuntimeError("target does not have enough channels for heads")
-                                loss = model.loss(y_pred, targ_list)
-                            else:
-                                raise RuntimeError("fallback split not applicable")
-                        except Exception as e2:
-                            # 3) Last resort: build a stacked tensor [..., 2, K] like our training loss did,
-                            #    then call the model loss once more.
-                            try:
-                                if isinstance(y_pred, (list, tuple)) and len(y_pred) >= 1 and _torch.is_tensor(y):
-                                    vol = y_pred[0]
-                                    dir_ = y_pred[1] if len(y_pred) > 1 else None
-                                    # Try to get [B, K]
-                                    if _torch.is_tensor(vol):
-                                        if vol.ndim == 2:
-                                            volK = vol
-                                        elif vol.ndim >= 3:
-                                            volK = vol.reshape(vol.shape[0], -1)
-                                        else:
-                                            volK = vol.unsqueeze(-1)
-                                    else:
-                                        raise RuntimeError("vol head not tensor")
-
-                                    K = volK.size(-1)
-                                    if _torch.is_tensor(dir_):
-                                        if dir_.ndim >= 2 and dir_.size(-1) > 1:
-                                            dir_logit = dir_[..., dir_.size(-1)//2]
-                                        else:
-                                            dir_logit = dir_.squeeze(-1)
-                                        dir_rep = dir_logit.unsqueeze(-1).repeat_interleave(K, dim=-1)
-                                    else:
-                                        dir_rep = _torch.zeros_like(volK[..., :1]).repeat_interleave(K, dim=-1)
-
-                                    stacked = _torch.stack([volK, dir_rep], dim=-2)  # [..., 2, K]
-                                    loss = model.loss(stacked, y)
-                                else:
-                                    raise e2
-                            except Exception:
-                                print(f"[FI][DEBUG] loss-fallback failed | type(y_pred)={type(y_pred)} | "
-                                    f"y_shape={getattr(y, 'shape', None)}")
-                                raise e1
+                        loss = model.loss(pred, y)
+                    except Exception as e:
+                        if isinstance(pred, dict) and "prediction" in pred:
+                            loss = model.loss(pred["prediction"], y)
+                        else:
+                            raise e
 
                     try:
                         loss = loss.mean()
                     except Exception:
                         pass
+
                     total += float(loss.detach().cpu().item())
                     n += 1
+
                 return (total / max(n, 1))
 
             # --- Baseline using the existing validation dataloader ---
