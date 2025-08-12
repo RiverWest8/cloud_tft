@@ -1748,6 +1748,13 @@ if __name__ == "__main__":
     # Loss and output_size for multi-target: realised_vol (quantile regression), direction (classification)
     print("▶ Building model …")
     print(f"[LR] learning_rate={LR_OVERRIDE if LR_OVERRIDE is not None else 0.00187}")
+    from pytorch_forecasting.metrics import MultiLoss, AsymmetricQuantileLoss
+    from my_losses import LabelSmoothedBCE  # keep your existing import path
+
+    # Fixed weights
+    FIXED_VOL_WEIGHT = 1.0
+    FIXED_DIR_WEIGHT = 0.1
+
     tft = TemporalFusionTransformer.from_dataset(
         training_dataset,
         hidden_size=64,
@@ -1761,10 +1768,10 @@ if __name__ == "__main__":
         loss=MultiLoss([
             AsymmetricQuantileLoss(
                 quantiles=[0.05, 0.165, 0.25, 0.5, 0.75, 0.835, 0.95],
-                underestimation_factor=1.115,
+                underestimation_factor=1.115,  # keep asymmetric penalty
             ),
             LabelSmoothedBCE(smoothing=0.1),
-        ], weights=[1.0, 0.1]),
+        ], weights=[FIXED_VOL_WEIGHT, FIXED_DIR_WEIGHT]),
         logging_metrics=[],
         log_interval=50,
         log_val_interval=10,
@@ -1773,57 +1780,37 @@ if __name__ == "__main__":
     )
     optimizer_params={"weight_decay": WEIGHT_DECAY}
 
-    # --- Swap in LearnableMultiTaskLoss and DualHead (patched) ---
+    # --- Use fixed-weight MultiLoss instead of LearnableMultiTaskLoss ---
     try:
         _LossClass = AsymmetricQuantileLoss  # use your existing AQL if present
     except NameError:
         from pytorch_forecasting.metrics import QuantileLoss
         class AsymmetricQuantileLoss(QuantileLoss):
-            def __init__(self, quantiles, underestimation_init: float = 1.115, learnable_under: bool = True, reg_lambda: float = 1e-3, **kwargs):
+            def __init__(self, quantiles, underestimation_factor: float = 1.115, **kwargs):
                 super().__init__(quantiles=quantiles, **kwargs)
-                self.learnable_under = bool(learnable_under)
-                self.reg_lambda = float(reg_lambda)
-                a0 = max(float(underestimation_init), 1.0)
-                u0 = np.log(np.expm1(a0 - 1.0) + 1e-12)
-                param = torch.tensor(u0, dtype=torch.float32)
-                if self.learnable_under:
-                    self.u = nn.Parameter(param)
-                else:
-                    self.register_buffer("u", param)
-            def _alpha(self): 
-                return 1.0 + F.softplus(self.u)
+                self.underestimation_factor = underestimation_factor
             def loss_per_prediction(self, y_pred, target):
                 diff = target.unsqueeze(-1) - y_pred
-                q = torch.tensor(self.quantiles, device=y_pred.device, dtype=y_pred.dtype).view(*([1] * (diff.ndim - 1)), -1)
-                alpha = self._alpha().to(y_pred.device, dtype=y_pred.dtype)
+                q = torch.tensor(self.quantiles, device=y_pred.device, dtype=y_pred.dtype).view(
+                    *([1] * (diff.ndim - 1)), -1
+                )
+                alpha = self.underestimation_factor
                 return torch.where(diff >= 0, alpha * q * diff, (1 - q) * (-diff))
-            def forward(self, y_pred, target, **kwargs):
-                base = super().forward(y_pred, target, **kwargs)
-                if self.reg_lambda > 0:
-                    base = base + self.reg_lambda * (self._alpha() - 1.0) ** 2
-                return base
-        _LossClass = AsymmetricQuantileLoss
 
-    # Loss: underestimation starts at 1.115; direction pos_weight=1.1
-    # Build vol loss compatible with either AQL variant
-    try:
-        vol_loss = _LossClass(
-            quantiles=[0.05, 0.165, 0.25, 0.5, 0.75, 0.835, 0.95],
-            underestimation_init=1.115,
-            learnable_under=True,
-            reg_lambda=1e-3,
-        )
-    except (TypeError, ValueError):
-        # Older in-file AQL expects `underestimation_factor`
-        vol_loss = _LossClass(
-            quantiles=[0.05, 0.165, 0.25, 0.5, 0.75, 0.835, 0.95],
-            underestimation_factor=1.115,
-        )
+    # Vol loss (fixed 1.115 penalty for underprediction)
+    vol_loss = _LossClass(
+        quantiles=[0.05, 0.165, 0.25, 0.5, 0.75, 0.835, 0.95],
+        underestimation_factor=1.115,
+    )
 
-    tft.loss = LearnableMultiTaskLoss(
-        loss_vol=vol_loss,
-        loss_dir=StaticPosWeightBCE(pos_weight=1.1),
-        init_weights=(1.0, 0.5),
+    # Direction loss
+    dir_loss = StaticPosWeightBCE(pos_weight=1.1)
+
+    # Combine with fixed weights
+    from pytorch_forecasting.metrics import MultiLoss
+    tft.loss = MultiLoss(
+        [vol_loss, dir_loss],
+        weights=[1.0, 0.1]
     )
 
     # Replace default linear heads with DualHead and bias-init direction from pos_weight=1.1
