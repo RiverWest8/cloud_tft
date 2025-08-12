@@ -1117,6 +1117,27 @@ try:
     BaseModel.training_step = _patched_training_step
     BaseModel.validation_step = _patched_validation_step
     print("[INFO] Patched PF training_step/validation_step to ensure tensor predictions and Tensor loss.")
+
+# -----------------------------------------------------------------------
+# Lightning v2 removed training_epoch_end / validation_epoch_end.
+# Delete these from PF BaseModel and TFT so Lightning won't try to call them
+# (overriding with a function still counts as "implemented").
+# -----------------------------------------------------------------------
+try:
+    from pytorch_forecasting.models.base._base_model import BaseModel as _PFBase # type: ignore
+    from pytorch_forecasting import TemporalFusionTransformer as _TFT
+    def _rm(cls, name: str):
+        if hasattr(cls, name):
+            try:
+                delattr(cls, name)
+                print(f"[INFO] Removed {cls.__name__}.{name} (Lightning v2 compatibility)")
+            except Exception as _e:
+                print(f"[WARN] Could not remove {cls.__name__}.{name}: {_e}")
+    for _hook in ("training_epoch_end", "validation_epoch_end"):
+        _rm(_PFBase, _hook)
+        _rm(_TFT, _hook)
+except Exception as e:
+    print(f"[WARN] Epoch-end hook removal failed: {e}")
 except Exception as e:
     print(f"[WARN] Could not patch PF train/val steps: {e}")
 
