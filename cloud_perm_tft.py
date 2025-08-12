@@ -1432,22 +1432,35 @@ if __name__ == "__main__":
         reduce_on_plateau_patience=5,
         reduce_on_plateau_min_lr=1e-5,
     )
-    # Patch plot_prediction to cast bfloat16 to float32 for matplotlib
-    import torch
+    # --- Safe plotting/logging: deep-cast any nested tensors to CPU float32 ---
+    def _deep_cpu_float(x):
+        if torch.is_tensor(x):
+            # ensure CPU float32 so numpy/matplotlib can consume it
+            return x.detach().to(device="cpu", dtype=torch.float32)
+        if isinstance(x, (list, tuple)):
+            casted = [_deep_cpu_float(v) for v in x]
+            return type(x)(casted)
+        if isinstance(x, dict):
+            return {k: _deep_cpu_float(v) for k, v in x.items()}
+        return x
+
+    # Wrap plot_prediction (used by PF inside log_prediction)
     if hasattr(tft, "plot_prediction"):
         _orig_plot_prediction = tft.plot_prediction
-
         def safe_plot_prediction(*args, **kwargs):
-            def cast_tensor(x):
-                return x.float() if torch.is_tensor(x) and x.dtype == torch.bfloat16 else x
-            args = tuple(cast_tensor(a) for a in args)
-            kwargs = {k: cast_tensor(v) for k, v in kwargs.items()}
+            args = tuple(_deep_cpu_float(a) for a in args)
+            kwargs = {k: _deep_cpu_float(v) for k, v in kwargs.items()}
             return _orig_plot_prediction(*args, **kwargs)
-
         tft.plot_prediction = safe_plot_prediction
-    optimizer_params={"weight_decay": WEIGHT_DECAY}
-    if isinstance(getattr(tft, "output_layer", None), DualOutputModule):
-        tft.output_layer = nn.ModuleList([tft.output_layer.vol, tft.output_layer.dir])
+
+    # Wrap log_prediction (PF calls this in validation to produce figures)
+    if hasattr(tft, "log_prediction"):
+        _orig_log_prediction = tft.log_prediction
+        def safe_log_prediction(*args, **kwargs):
+            args = tuple(_deep_cpu_float(a) for a in args)
+            kwargs = {k: _deep_cpu_float(v) for k, v in kwargs.items()}
+            return _orig_log_prediction(*args, **kwargs)
+        tft.log_prediction = safe_log_prediction
 
     # --- Use fixed-weight MultiLoss instead of LearnableMultiTaskLoss ---
     try:
