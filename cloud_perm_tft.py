@@ -416,7 +416,7 @@ class PerAssetMetrics(pl.Callback):
         yv = torch.cat(self._yv_dev).to(device)
         pv = torch.cat(self._pv_dev).to(device)
         yd = torch.cat(self._yd_dev).to(device) if self._yd_dev else None
-        pd = torch.cat(self._pd_dev).to(device) if self._pd_dev else None
+        pdir = torch.cat(self._pd_dev).to(device) if self._pd_dev else None
 
         # decode realised vol in one shot
         try:
@@ -433,7 +433,7 @@ class PerAssetMetrics(pl.Callback):
         yv_dec_all = yv_dec_t.detach().cpu()
         pv_dec_all = pv_dec_t.detach().cpu()
         yd_cpu = yd.detach().cpu() if yd is not None else None
-        pd_cpu = pd.detach().cpu() if pd is not None else None
+        pd_cpu = pdir.detach().cpu() if pdir is not None else None
 
         uniq = torch.unique(g_cpu)
         rows = []
