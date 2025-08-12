@@ -775,11 +775,42 @@ class LearnableMultiTaskLoss(nn.Module):
         return y_pred
 
     def to_prediction(self, y_pred, normalize: bool = False, **kwargs):
+        """Return point predictions for both heads.
+        Older PF QuantileLoss.to_prediction may not accept `normalize`.
+        We try-call with normalize, then without, and finally fall back
+        to taking the median quantile explicitly.
+        """
+        def _median_quantile(t):
+            t = self._ensure_tensor(t)
+            # squeeze [B,1,Q] -> [B,Q]
+            if t.ndim == 3 and t.size(1) == 1:
+                t = t.squeeze(1)
+            # if last dim looks like quantiles, take middle index
+            if t.ndim >= 2 and t.size(-1) > 1:
+                try:
+                    qn = len(getattr(self.loss_vol, "quantiles", []))
+                except Exception:
+                    qn = None
+                idx = (t.size(-1) // 2) if not qn else min(t.size(-1) - 1, qn // 2)
+                return t[..., idx]
+            # else already scalar per sample
+            return t.squeeze(-1)
+
         if isinstance(y_pred, (list, tuple)) and len(y_pred) >= 1:
             vol = self._ensure_tensor(y_pred[0])
             dir_ = self._ensure_tensor(y_pred[1]) if len(y_pred) > 1 else None
+            # Try delegated conversion first
             if hasattr(self.loss_vol, "to_prediction"):
-                vol = self.loss_vol.to_prediction(vol, normalize=normalize, **kwargs)
+                try:
+                    vol = self.loss_vol.to_prediction(vol, normalize=normalize, **kwargs)
+                except TypeError:
+                    # Older signature without `normalize`
+                    try:
+                        vol = self.loss_vol.to_prediction(vol, **kwargs)
+                    except TypeError:
+                        vol = _median_quantile(vol)
+            else:
+                vol = _median_quantile(vol)
             return [vol, dir_]
         return y_pred
 
