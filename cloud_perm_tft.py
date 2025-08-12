@@ -1337,7 +1337,7 @@ if __name__ == "__main__":
     seed_everything(SEED, workers=True)
     # Loss and output_size for multi-target: realised_vol (quantile regression), direction (classification)
     print("▶ Building model …")
-    print(f"[LR] learning_rate={LR_OVERRIDE if LR_OVERRIDE is not None else 0.00275}")
+    print(f"[LR] learning_rate={LR_OVERRIDE if LR_OVERRIDE is not None else 0.00187}")
     tft = TemporalFusionTransformer.from_dataset(
         training_dataset,
         hidden_size=64,
@@ -1393,14 +1393,24 @@ if __name__ == "__main__":
                 return base
         _LossClass = AsymmetricQuantileLoss
 
-    # Loss: learnable underestimation starts at 1.115; direction pos_weight=1.1
-    tft.loss = LearnableMultiTaskLoss(
-        loss_vol=_LossClass(
+    # Loss: underestimation starts at 1.115; direction pos_weight=1.1
+    # Build vol loss compatible with either AQL variant
+    try:
+        vol_loss = _LossClass(
             quantiles=[0.05, 0.165, 0.25, 0.5, 0.75, 0.835, 0.95],
             underestimation_init=1.115,
             learnable_under=True,
             reg_lambda=1e-3,
-        ),
+        )
+    except (TypeError, ValueError):
+        # Older in-file AQL expects `underestimation_factor`
+        vol_loss = _LossClass(
+            quantiles=[0.05, 0.165, 0.25, 0.5, 0.75, 0.835, 0.95],
+            underestimation_factor=1.115,
+        )
+
+    tft.loss = LearnableMultiTaskLoss(
+        loss_vol=vol_loss,
         loss_dir=StaticPosWeightBCE(pos_weight=1.1),
         init_weights=(1.0, 0.5),
     )
