@@ -1759,7 +1759,7 @@ if __name__ == "__main__":
     )
     optimizer_params={"weight_decay": WEIGHT_DECAY}
     if isinstance(getattr(tft, "output_layer", None), DualOutputModule):
-        tft.output_layer = _nn.ModuleList([tft.output_layer.vol, tft.output_layer.dir])
+        tft.output_layer = nn.ModuleList([tft.output_layer.vol, tft.output_layer.dir])
 
     # --- Use fixed-weight MultiLoss instead of LearnableMultiTaskLoss ---
     try:
@@ -1800,7 +1800,7 @@ if __name__ == "__main__":
     bias0 = float(np.log(p0 / (1.0 - p0)))
     with torch.no_grad():
         dual_head.dir[-1].bias.data.fill_(bias0)
-    tft.output_layer = DualOutputModule(dual_head.vol, dual_head.dir)
+    tft.output_layer = nn.ModuleList([dual_head.vol, dual_head.dir])
 
     # -----------------------------------------------------------------------
     # Training
