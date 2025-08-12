@@ -2041,13 +2041,48 @@ if __name__ == "__main__":
 
             print(" | ".join(parts))
 
-        def on_validation_end(self, trainer, pl_module):
+        def on_validation_epoch_end(self, trainer, pl_module):
+            if not getattr(pl_module, "enable_perm_importance", False):
+                return
+
             try:
-                ckpt_cb = next((cb for cb in trainer.callbacks if isinstance(cb, pl.callbacks.ModelCheckpoint)), None)
-                if ckpt_cb and getattr(ckpt_cb, "best_model_path", ""):
-                    print(f"↳ Best so far: {ckpt_cb.best_model_path}")
-            except Exception:
-                pass
+                print("▶ Running permutation feature importance...")
+                # --- Get original validation DataFrame ---
+                if "val_df" in globals() and isinstance(val_df, pd.DataFrame):
+                    base_df = val_df.copy()
+                elif hasattr(validation_dataset, "data") and isinstance(validation_dataset.data, pd.DataFrame):
+                    base_df = validation_dataset.data.copy()
+                else:
+                    print("[WARN] No validation DataFrame available for FI — skipping.")
+                    return
+
+                # Ensure asset & time_idx types are consistent
+                if "asset" in base_df.columns:
+                    base_df["asset"] = base_df["asset"].astype(str)
+                if "time_idx" in base_df.columns:
+                    base_df["time_idx"] = pd.to_numeric(base_df["time_idx"], errors="coerce").astype(int)
+
+                # Pick features that exist in the DataFrame
+                feats = [f for f in time_varying_unknown_reals if f in base_df.columns]
+
+                run_permutation_importance(
+                    model=pl_module,
+                    base_df=base_df,
+                    build_ds_fn=lambda df, predict: TimeSeriesDataSet.from_dataset(training_dataset, df, predict=False),
+                    features=feats,
+                    block_size=int(PERM_BLOCK_SIZE) if PERM_BLOCK_SIZE else 1,
+                    batch_size=batch_size,
+                    max_batches=int(FI_MAX_BATCHES) if FI_MAX_BATCHES else 20,
+                    num_workers=worker_cnt,
+                    prefetch=prefetch,
+                    pin_memory=pin,
+                    out_csv_path=str(LOCAL_RUN_DIR / f"tft_perm_importance_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv"),
+                    uploader=upload_file_to_gcs,
+                )
+
+            except Exception as e:
+                print(f"[WARN] FI computation failed in on_validation_epoch_end: {e}")
+
   
 
 
