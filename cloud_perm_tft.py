@@ -489,28 +489,48 @@ class PerAssetMetrics(pl.Callback):
             "yd": yd_cpu,
             "pd": pd_cpu,
         }
-        # ---- concise per-epoch validation metrics printout ----
+        # ---- concise per-epoch validation metrics printout (overall only) ----
         try:
             epoch_num = int(getattr(trainer, "current_epoch", -1)) + 1
         except Exception:
             epoch_num = None
         try:
-            ov = self._last_overall
-            msg = f"[VAL EPOCH {epoch_num}] MAE={ov['mae']:.6f} RMSE={ov['rmse']:.6f} QLIKE={ov['qlike']:.6f}"
-            # quick direction accuracy snapshot if available
-            dir_acc = None
-            if yd is not None and pd is not None and yd.numel() > 0 and pd.numel() > 0:
-                p1 = pd
+            # Compute overall accuracy if direction available
+            acc = None
+            if yd_cpu is not None and pd_cpu is not None and yd_cpu.numel() > 0 and pd_cpu.numel() > 0:
+                yt = yd_cpu.float()
+                pt = pd_cpu
                 try:
-                    if torch.isfinite(p1).any() and (p1.min() < 0 or p1.max() > 1):
-                        p1 = torch.sigmoid(p1)
+                    if torch.isfinite(pt).any() and (pt.min() < 0 or pt.max() > 1):
+                        pt = torch.sigmoid(pt)
                 except Exception:
-                    p1 = torch.sigmoid(p1)
-                p1 = torch.clamp(p1, 0.0, 1.0)
-                dir_acc = ((p1 >= 0.5).int() == yd.int()).float().mean().item()
-            if dir_acc is not None:
-                msg += f" | DIR_ACC={dir_acc:.3f}"
+                    pt = torch.sigmoid(pt)
+                pt = torch.clamp(pt, 0.0, 1.0)
+                acc = ((pt >= 0.5).int() == yt.int()).float().mean().item()
+
+            N = int(yv_dec_all.numel())
+            msg = (
+                f"[VAL EPOCH {epoch_num}] "
+                f"MAE={overall_mae:.6f} "
+                f"RMSE={overall_rmse:.6f} "
+                f"MSE={overall_mse:.6f} "
+                f"QLIKE={overall_qlike:.6f} "
+                + (f"| ACC={acc:.3f} " if acc is not None else "")
+                + f"| N={N}"
+            )
             print(msg)
+
+            # Expose to callback metrics for progress bar if desired
+            try:
+                trainer.callback_metrics["val_mae_overall"] = torch.tensor(float(overall_mae))
+                trainer.callback_metrics["val_rmse_overall"] = torch.tensor(float(overall_rmse))
+                trainer.callback_metrics["val_mse_overall"] = torch.tensor(float(overall_mse))
+                trainer.callback_metrics["val_qlike_overall"] = torch.tensor(float(overall_qlike))
+                if acc is not None:
+                    trainer.callback_metrics["val_acc_overall"] = torch.tensor(float(acc))
+                trainer.callback_metrics["val_N_overall"] = torch.tensor(float(N))
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -1041,9 +1061,9 @@ def gcs_exists(path: str) -> bool:
     except Exception:
         return False
 
-TRAIN_URI = f"{GCS_DATA_PREFIX}/universal_train.parquet_10k"
-VAL_URI   = f"{GCS_DATA_PREFIX}/universal_val.parquet_10k"
-TEST_URI  = f"{GCS_DATA_PREFIX}/universal_test.parquet_10k"
+TRAIN_URI = f"{GCS_DATA_PREFIX}/universal_train.parquet"
+VAL_URI   = f"{GCS_DATA_PREFIX}/universal_val.parquet"
+TEST_URI  = f"{GCS_DATA_PREFIX}/universal_test.parquet"
 READ_PATHS = [str(TRAIN_URI), str(VAL_URI), str(TEST_URI)]
 '''
 # If a local data folder is explicitly provided, use it and skip GCS
