@@ -667,6 +667,10 @@ class LearnableMultiTaskLoss(nn.Module):
     total = exp(-s1) * L1 + exp(-s2) * L2 + (s1 + s2)
     Initialize with desired starting weights w_i via s_i = -log(w_i).
     Expects y_pred to be a list/tuple: [pred_vol, pred_dir].
+
+    Notes:
+    - Saves last_L1, last_L2, last_s, last_w for logging.
+    - Implements `rescale_parameters` and `to_prediction` so PF can decode outputs.
     """
     def __init__(self, loss_vol: nn.Module, loss_dir: nn.Module, init_weights=(1.0, 0.5)):
         super().__init__()
@@ -677,6 +681,12 @@ class LearnableMultiTaskLoss(nn.Module):
         s1 = -np.log(max(w1, 1e-8))
         s2 = -np.log(max(w2, 1e-8))
         self.s = nn.Parameter(torch.tensor([s1, s2], dtype=torch.float32))
+
+        # last values for logging (populated during forward)
+        self.last_L1 = torch.tensor(float("nan"))
+        self.last_L2 = torch.tensor(float("nan"))
+        self.last_s = self.s.detach().clone()
+        self.last_w = torch.exp(-self.s.detach().clone())
 
     def forward(self, y_pred, target, **kwargs):
         # Unpack predictions
@@ -700,6 +710,7 @@ class LearnableMultiTaskLoss(nn.Module):
                 raise ValueError(f"Unexpected target shape for multi-task: {t.shape}")
         elif isinstance(target, (list, tuple)) and len(target) >= 2:
             yv, yd = target[0], target[1]
+            # Squeeze trailing singleton dims if present
             if torch.is_tensor(yv) and yv.ndim >= 3 and yv.size(-1) == 1:
                 yv = yv[..., 0]
             if torch.is_tensor(yd) and yd.ndim >= 3 and yd.size(-1) == 1:
@@ -707,14 +718,50 @@ class LearnableMultiTaskLoss(nn.Module):
         else:
             raise TypeError("LearnableMultiTaskLoss expects target tensor with two channels or list of two tensors")
 
+        # Compute individual losses (ensure scalars)
         L1 = self.loss_vol(p_vol, yv)
         L2 = self.loss_dir(p_dir, yd)
-        if L1.ndim > 0: L1 = L1.mean()
-        if L2.ndim > 0: L2 = L2.mean()
+        if L1.ndim > 0:
+            L1 = L1.mean()
+        if L2.ndim > 0:
+            L2 = L2.mean()
 
+        # Save for logging
+        self.last_L1 = L1.detach()
+        self.last_L2 = L2.detach()
+        self.last_s = self.s.detach()
+        self.last_w = torch.exp(-self.s.detach())
+
+        # Combine with learnable weights (Kendall & Gal style)
         weights = torch.exp(-self.s)  # [2]
         total = weights[0] * L1 + weights[1] * L2 + self.s.sum()
         return total
+
+    # ---- PF hooks so BaseModel.transform_output() works ----
+    def rescale_parameters(self, y_pred, **kwargs):
+        """
+        Rescale only the volatility head using its loss' logic; leave direction as-is.
+        Expected y_pred: [vol_params, dir_logit]
+        """
+        if isinstance(y_pred, (list, tuple)) and len(y_pred) >= 1:
+            vol = y_pred[0]
+            dir_ = y_pred[1] if len(y_pred) > 1 else None
+            if hasattr(self.loss_vol, "rescale_parameters"):
+                vol = self.loss_vol.rescale_parameters(vol, **kwargs)
+            return [vol, dir_]
+        return y_pred  # passthrough fallback
+
+    def to_prediction(self, y_pred, normalize: bool = False, **kwargs):
+        """
+        Convert parameters to predictions; delegate to vol loss, passthrough for dir.
+        """
+        if isinstance(y_pred, (list, tuple)) and len(y_pred) >= 1:
+            vol = y_pred[0]
+            dir_ = y_pred[1] if len(y_pred) > 1 else None
+            if hasattr(self.loss_vol, "to_prediction"):
+                vol = self.loss_vol.to_prediction(vol, normalize=normalize, **kwargs)
+            return [vol, dir_]
+        return y_pred
 
 # -----------------------------------------------------------------------
 # Mini-MLP dual head: one branch for volatility quantiles, one for direction logit
@@ -1776,7 +1823,7 @@ if ENABLE_FEATURE_IMPORTANCE:
         )
         # Reload best checkpoint before FI for consistent evaluation
         try:
-            best_ckpt_path = best_ckpt_cb.best_model_path
+            best_ckpt_path = best_ckpt_cb.best_model_path   
             if best_ckpt_path and os.path.exists(best_ckpt_path):
                 print(f"[FI] Loading best model checkpoint: {best_ckpt_path}")
                 tft = tft.__class__.load_from_checkpoint(best_ckpt_path)
