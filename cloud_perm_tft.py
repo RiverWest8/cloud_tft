@@ -75,17 +75,19 @@ except Exception:
 import shutil
 import argparse
 
-from pytorch_forecasting.models.base._base_model import BaseModel # type: ignore
-from pytorch_forecasting.models.temporal_fusion_transformer.tuning import TemporalFusionTransformer
+import pytorch_forecasting as pf
+import inspect
 
-# Remove deprecated hooks so Lightning v2 never calls them
-for cls in (BaseModel, TemporalFusionTransformer):
+# Remove deprecated hooks globally from all PF classes
+for name, cls in inspect.getmembers(pf.models, inspect.isclass):
     for hook in ("training_epoch_end", "validation_epoch_end"):
         if hasattr(cls, hook):
-            delattr(cls, hook)
+            try:
+                delattr(cls, hook)
+            except Exception:
+                pass
 
-print("[INFO] Removed training_epoch_end/validation_epoch_end from BaseModel and TFT for Lightning v2 compatibility.")
-
+print("[INFO] Removed training_epoch_end/validation_epoch_end from all PyTorch-Forecasting model classes.")
 # -----------------------------------------------------------------------
 # Ensure a robust "identity" transformation for GroupNormalizer
 # -----------------------------------------------------------------------
