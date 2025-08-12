@@ -1132,7 +1132,8 @@ try:
 
         pred = out.get("prediction", y_hat)
         pred = _coerce_prediction_tensor(pred)
-        loss = self.loss(out, y) if y is not None else torch.tensor(
+        pred_for_loss = out.get("prediction", y_hat)
+        loss = self.loss(pred_for_loss, y) if y is not None else torch.tensor(
             0.0, device=pred.device if torch.is_tensor(pred) else None
         )
         self.log("train_loss_step", loss, on_step=True, on_epoch=False, prog_bar=True, logger=True)
@@ -1160,7 +1161,8 @@ try:
 
         pred = out.get("prediction", y_hat)
         pred = _coerce_prediction_tensor(pred)
-        loss = self.loss(out, y) if y is not None else torch.tensor(
+        pred_for_loss = out.get("prediction", y_hat)
+        loss = self.loss(pred_for_loss, y) if y is not None else torch.tensor(
             0.0, device=pred.device if torch.is_tensor(pred) else None
         )
         self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
