@@ -1165,7 +1165,7 @@ try:
         loss = self.loss(pred_for_loss, y) if y is not None else torch.tensor(
             0.0, device=pred.device if torch.is_tensor(pred) else None
         )
-        self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log("val_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         return loss
 
     BaseModel.training_step = _patched_training_step
@@ -1216,6 +1216,40 @@ try:
     print("[INFO] Disabled PF plotting/logging for validation to avoid size-mismatch errors.")
 except Exception as _e:
     print(f"[WARN] Could not disable PF plotting: {_e}")
+
+# -----------------------------------------------------------------------
+# Guard PF validation hooks + disable TFT interpretation to avoid crashes
+# when validation outputs are empty (which they are with our custom steps)
+# -----------------------------------------------------------------------
+try:
+    from pytorch_forecasting.models.base._base_model import BaseModel as _PFBase # type: ignore
+    from pytorch_forecasting import TemporalFusionTransformer as _TFT
+
+    # 1) Safeguard BaseModel.on_validation_epoch_end: skip if no outputs
+    _orig_on_validation_epoch_end = getattr(_PFBase, "on_validation_epoch_end", None)
+
+    if _orig_on_validation_epoch_end is not None:
+        def _safe_on_validation_epoch_end(self):
+            outs = getattr(self, "validation_step_outputs", None)
+            if not outs:
+                # no validation_step dicts were returned -> do nothing
+                return
+            try:
+                return _orig_on_validation_epoch_end(self)
+            except Exception as e:
+                print(f"[WARN] Skipping PF on_validation_epoch_end due to error: {e}")
+                return
+
+        _PFBase.on_validation_epoch_end = _safe_on_validation_epoch_end
+
+    # 2) Disable TFT interpretation that indexes outputs[0]["interpretation"]
+    def _no_log_interpretation(self, *args, **kwargs):
+        # make it a no-op; prevents IndexError on empty outputs
+        return
+    _TFT.log_interpretation = _no_log_interpretation
+    print("[INFO] Disabled TFT interpretation logging / guarded on_validation_epoch_end.")
+except Exception as e:
+    print(f"[WARN] Could not patch PF validation hooks: {e}")
 
 # -----------------------------------------------------------------------
 # Compute / device configuration (optimised for NVIDIA L4 on GCP)
@@ -1737,6 +1771,7 @@ if __name__ == "__main__":
         reduce_on_plateau_patience=5,
         reduce_on_plateau_min_lr=1e-5,
     )
+    optimizer_params={"weight_decay": WEIGHT_DECAY}
 
     # --- Swap in LearnableMultiTaskLoss and DualHead (patched) ---
     try:
