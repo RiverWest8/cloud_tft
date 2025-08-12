@@ -1895,32 +1895,125 @@ if __name__ == "__main__":
                         print(f"[INFO] Bumping Trainer.max_epochs to {MAX_EPOCHS} to align logging intervals.")
         except Exception as e:
             print(f"[WARN] Could not bump max_epochs: {e}")
-
     # >>> ACTUALLY TRAIN THE MODEL <<<
-    try:
-        trainer.fit(tft, train_dataloader, val_dataloader)
-    except IndexError as e:
-        if "list index out of range" in str(e):
-            print("[WARN] trainer.fit raised IndexError('list index out of range'); retrying with FI disabled and no sanity check…")
-            # Best-effort: disable permutation importance so any FI callback/step cannot trigger the bug
-            try:
-                ENABLE_FEATURE_IMPORTANCE = False
-            except Exception:
-                pass
+    trainer.fit(tft, train_dataloader, val_dataloader)
 
-            # Rebuild a simpler Trainer for the retry
-            fallback_trainer = Trainer(
-                num_sanity_val_steps=0,
-                accelerator=ACCELERATOR,
-                devices=DEVICES,
-                max_epochs=MAX_EPOCHS,
-                precision=PRECISION,
-                enable_checkpointing=False,
-                logger=logger,
-                check_val_every_n_epoch=int(getattr(ARGS, "check_val_every_n_epoch", 1)),
-                log_every_n_steps=int(getattr(ARGS, "log_every_n_steps", 200)),
-            )
-            fallback_trainer.fit(tft, train_dataloader, val_dataloader)
-        else:
-            raise
- 
+    # -----------------------------------------------------------------------
+    # Permutation Feature Importance (runs after training)
+    # -----------------------------------------------------------------------
+    try:
+        if ENABLE_FEATURE_IMPORTANCE:
+            print("▶ Computing permutation feature importance …")
+
+            import numpy as _np
+            import pandas as _pd
+            import torch as _torch
+            from pytorch_forecasting import TimeSeriesDataSet as _TSD
+
+            def _move_batch_to_device(obj, device, param_dtype):
+                if _torch.is_tensor(obj):
+                    if obj.dtype.is_floating_point:
+                        return obj.to(device=device, dtype=param_dtype, non_blocking=True)
+                    return obj.to(device=device, non_blocking=True)
+                if isinstance(obj, dict):
+                    return {k: _move_batch_to_device(v, device, param_dtype) for k, v in obj.items()}
+                if isinstance(obj, (list, tuple)):
+                    return type(obj)(_move_batch_to_device(v, device, param_dtype) for v in obj)
+                return obj
+
+            @_torch.no_grad()
+            def _evaluate_val_loss(model, loader, max_batches=None):
+                model.eval()
+                device = next(model.parameters()).device
+                p_dtype = next(model.parameters()).dtype
+                total = 0.0
+                n = 0
+                for b_idx, batch in enumerate(loader):
+                    if (max_batches is not None) and (b_idx >= max_batches):
+                        break
+                    if not isinstance(batch, (list, tuple)) or len(batch) < 2:
+                        continue
+                    x, y = batch[0], batch[1]
+                    x = _move_batch_to_device(x, device, p_dtype)
+                    y = _move_batch_to_device(y, device, p_dtype)
+                    y_pred = model(x)
+                    loss = model.loss(y_pred, y)
+                    try:
+                        loss = loss.mean()
+                    except Exception:
+                        pass
+                    total += float(loss.detach().cpu().item())
+                    n += 1
+                return (total / max(n, 1))
+
+            # --- baseline on the existing validation dataloader ---
+            baseline_loss = _evaluate_val_loss(tft, val_dataloader, max_batches=FI_MAX_BATCHES)
+            print(f"[FI] Baseline val loss (first {FI_MAX_BATCHES} batches): {baseline_loss:.6f}")
+
+            # Candidate features to permute: calendar + unknown reals (skip PF internals)
+            fi_features = list((calendar_cols + ["Is_Weekend"]) + time_varying_unknown_reals)
+
+            def _permute_blocks_by_asset(df_in: _pd.DataFrame, feature: str, block: int, seed: int) -> _pd.Series:
+                rng = _np.random.default_rng(seed)
+
+                def _permute_one(s: _pd.Series) -> _pd.Series:
+                    n = len(s)
+                    if n <= 1:
+                        return s
+                    if block is None or block <= 1:
+                        return s.sample(frac=1.0, random_state=seed)
+                    # split into contiguous blocks and shuffle their order
+                    slices = [slice(i, min(i + block, n)) for i in range(0, n, block)]
+                    order = rng.permutation(len(slices))
+                    out = s.copy().to_numpy()
+                    pos = 0
+                    for b in order:
+                        sl = slices[b]
+                        ln = sl.stop - sl.start
+                        out[pos:pos + ln] = s.iloc[sl].to_numpy()
+                        pos += ln
+                    return _pd.Series(out, index=s.index)
+
+                return df_in.groupby("asset", group_keys=False)[feature].apply(_permute_one)
+
+            results = []
+            for feat in fi_features:
+                try:
+                    if feat not in val_df.columns:
+                        print(f"[FI][SKIP] {feat} not in validation frame; skipping.")
+                        continue
+                    dfp = val_df.copy(deep=True)
+                    dfp[feat] = _permute_blocks_by_asset(dfp, feat, PERM_BLOCK_SIZE, SEED)
+                    # Build a validation dataset from training_dataset to reuse encoders/normalizers
+                    ds_perm = _TSD.from_dataset(training_dataset, dfp, predict=False, stop_randomization=True)
+                    dl_perm = ds_perm.to_dataloader(
+                        train=False,
+                        batch_size=batch_size,
+                        num_workers=worker_cnt,
+                        persistent_workers=use_persist,
+                        prefetch_factor=prefetch,
+                        pin_memory=pin,
+                    )
+                    perm_loss = _evaluate_val_loss(tft, dl_perm, max_batches=FI_MAX_BATCHES)
+                    delta = perm_loss - baseline_loss
+                    results.append((feat, float(perm_loss), float(delta)))
+                    print(f"[FI] {feat:>24s} | loss={perm_loss:.6f} | Δ={delta:.6f}")
+                except Exception as e:
+                    print(f"[FI][WARN] {feat}: {e}")
+
+            if results:
+                res_df = _pd.DataFrame(results, columns=["feature", "perm_loss", "delta_loss"]).sort_values("delta_loss", ascending=False)
+                fi_path = LOCAL_RUN_DIR / f"tft_perm_importance_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv"
+                res_df.to_csv(fi_path, index=False)
+                print(f"✓ Saved permutation importance → {fi_path}")
+                try:
+                    upload_file_to_gcs(str(fi_path), f"{GCS_OUTPUT_PREFIX}/{fi_path.name}")
+                except Exception as e:
+                    print(f"[WARN] Could not upload FI CSV: {e}")
+            else:
+                print("[FI] No results to save (no features permuted or empty validation set).")
+
+    except Exception as e:
+        print(f"[WARN] FI computation failed: {e}")
+
+    
