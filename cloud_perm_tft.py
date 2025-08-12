@@ -1768,83 +1768,101 @@ if __name__ == "__main__":
         except Exception:
             return val
 
+
     class ComponentLossLogger(pl.Callback):
-      def __init__(self, path: str = str(LOCAL_RUN_DIR / f"tft_component_losses_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv")):
-          super().__init__()
-          self.path = path
-          self.rows = []
-      def _row(self, trainer, pl_module, phase: str):
-          try:
-              loss_mod = getattr(pl_module, "loss", None)
-              L1 = float(loss_mod.last_L1.cpu().item()) if hasattr(loss_mod, "last_L1") else float('nan')
-              L2 = float(loss_mod.last_L2.cpu().item()) if hasattr(loss_mod, "last_L2") else float('nan')
-              s = loss_mod.last_s.cpu().tolist() if hasattr(loss_mod, "last_s") else [None, None]
-              w = loss_mod.last_w.cpu().tolist() if hasattr(loss_mod, "last_w") else [None, None]
-              r = {
-                  "epoch": trainer.current_epoch,
-                  "phase": phase,
-                  "L1": L1,
-                  "L2": L2,
-                  "s1": s[0] if s else None,
-                  "s2": s[1] if s and len(s) > 1 else None,
-                  "w1": w[0] if w else None,
-                  "w2": w[1] if w and len(w) > 1 else None,
-              }
-              # quick TB logs if available
-              try:
-                  if L1 is not None:
-                      trainer.logger.experiment.add_scalar(f"components/{phase}_L1_vol", L1, trainer.global_step)
-                  if L2 is not None:
-                      trainer.logger.experiment.add_scalar(f"components/{phase}_L2_dir", L2, trainer.global_step)
-              except Exception:
-                  pass
-              return r
-          except Exception:
-              return None
-      def on_train_epoch_end(self, trainer, pl_module):
-          r = self._row(trainer, pl_module, "train")
-          if r:
-              self.rows.append(r)
-              try:
-                  ep = int(getattr(trainer, "current_epoch", -1)) + 1
-                  l1 = r.get("L1")
-                  l2 = r.get("L2")
-                  w1 = r.get("w1")
-                  w2 = r.get("w2")
-                  msg = f"[TRAIN EPOCH {ep}] L1_vol={l1:.6f} L2_dir={l2:.6f}"
-                  if w1 is not None and w2 is not None:
-                      msg += f" | w=({w1:.3f},{w2:.3f})"
-                  print(msg)
-              except Exception:
-                  pass
-      def on_validation_epoch_end(self, trainer, pl_module):
-          r = self._row(trainer, pl_module, "val")
-          if r:
-              self.rows.append(r)
-              try:
-                  ep = int(getattr(trainer, "current_epoch", -1)) + 1
-                  l1 = r.get("L1")
-                  l2 = r.get("L2")
-                  w1 = r.get("w1")
-                  w2 = r.get("w2")
-                  msg = f"[VAL   EPOCH {ep}] L1_vol={l1:.6f} L2_dir={l2:.6f}"
-                  if w1 is not None and w2 is not None:
-                      msg += f" | w=({w1:.3f},{w2:.3f})"
-                  print(msg)
-              except Exception:
-                  pass
-      def on_train_end(self, trainer, pl_module):
-          try:
-              import pandas as pd
-              if self.rows:
-                  pd.DataFrame(self.rows).to_csv(self.path, index=False)
-                  print(f"✓ Saved component losses → {self.path}")
-                  try:
-                      upload_file_to_gcs(self.path, f"{GCS_OUTPUT_PREFIX}/{os.path.basename(self.path)}")
-                  except Exception as e:
-                      print(f"[WARN] Could not upload component losses: {e}")
-          except Exception as e:
-              print(f"[WARN] Could not save component losses: {e}")
+        def __init__(self, path: str = str(LOCAL_RUN_DIR / f"tft_component_losses_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv")):
+            super().__init__()
+            self.path = path
+            self.rows = []
+
+        def _safe_get(self, seq, idx):
+            try:
+                if seq is None:
+                    return None
+                if idx < len(seq):
+                    return seq[idx]
+            except Exception:
+                return None
+            return None
+
+        def _row(self, trainer, pl_module, phase: str):
+            try:
+                loss_mod = getattr(pl_module, "loss", None)
+                L1 = float(loss_mod.last_L1.cpu().item()) if hasattr(loss_mod, "last_L1") else float('nan')
+                L2 = float(loss_mod.last_L2.cpu().item()) if hasattr(loss_mod, "last_L2") else float('nan')
+                s = getattr(loss_mod, "last_s", None)
+                if torch.is_tensor(s):
+                    s = s.cpu().tolist()
+                w = getattr(loss_mod, "last_w", None)
+                if torch.is_tensor(w):
+                    w = w.cpu().tolist()
+
+                r = {
+                    "epoch": trainer.current_epoch,
+                    "phase": phase,
+                    "L1": L1,
+                    "L2": L2,
+                    "s1": self._safe_get(s, 0),
+                    "s2": self._safe_get(s, 1),
+                    "w1": self._safe_get(w, 0),
+                    "w2": self._safe_get(w, 1),
+                }
+
+                # TensorBoard logging
+                try:
+                    if L1 is not None and not math.isnan(L1):
+                        trainer.logger.experiment.add_scalar(f"components/{phase}_L1_vol", L1, trainer.global_step)
+                    if L2 is not None and not math.isnan(L2):
+                        trainer.logger.experiment.add_scalar(f"components/{phase}_L2_dir", L2, trainer.global_step)
+                except Exception:
+                    pass
+                return r
+            except Exception:
+                return None
+
+        def on_train_epoch_end(self, trainer, pl_module):
+            r = self._row(trainer, pl_module, "train")
+            if r:
+                self.rows.append(r)
+                try:
+                    ep = int(getattr(trainer, "current_epoch", -1)) + 1
+                    l1 = r.get("L1", float("nan"))
+                    l2 = r.get("L2", float("nan"))
+                    w1 = r.get("w1", float("nan"))
+                    w2 = r.get("w2", float("nan"))
+                    msg = f"[TRAIN EPOCH {ep}] L1_vol={l1:.6f} L2_dir={l2:.6f} | w=({w1 if w1 is not None else float('nan'):.3f},{w2 if w2 is not None else float('nan'):.3f})"
+                    print(msg)
+                except Exception:
+                    pass
+
+        def on_validation_epoch_end(self, trainer, pl_module):
+            r = self._row(trainer, pl_module, "val")
+            if r:
+                self.rows.append(r)
+                try:
+                    ep = int(getattr(trainer, "current_epoch", -1)) + 1
+                    l1 = r.get("L1", float("nan"))
+                    l2 = r.get("L2", float("nan"))
+                    w1 = r.get("w1", float("nan"))
+                    w2 = r.get("w2", float("nan"))
+                    msg = f"[VAL   EPOCH {ep}] L1_vol={l1:.6f} L2_dir={l2:.6f} | w=({w1 if w1 is not None else float('nan'):.3f},{w2 if w2 is not None else float('nan'):.3f})"
+                    print(msg)
+                except Exception:
+                    pass
+
+        def on_train_end(self, trainer, pl_module):
+            try:
+                import pandas as pd
+                if self.rows:
+                    pd.DataFrame(self.rows).to_csv(self.path, index=False)
+                    print(f"✓ Saved component losses → {self.path}")
+                    try:
+                        upload_file_to_gcs(self.path, f"{GCS_OUTPUT_PREFIX}/{os.path.basename(self.path)}")
+                    except Exception as e:
+                        print(f"[WARN] Could not upload component losses: {e}")
+            except Exception as e:
+                print(f"[WARN] Could not save component losses: {e}")
+
 
     class LossHistory(pl.Callback):
       def __init__(self, path: str = str(LOCAL_RUN_DIR / f"tft_loss_history_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv")):
