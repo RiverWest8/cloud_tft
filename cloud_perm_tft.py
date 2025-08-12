@@ -1847,3 +1847,5 @@ if resume_ckpt:
             if fit_loop is not None and getattr(fit_loop, "max_epochs", None) is not None:
                 if fit_loop.max_epochs < need:
                     print(f"[INFO] Bumping Trainer.max_epochs to {MAX_EPOCHS} to align logging intervals.")
+    except Exception as e:
+        print(f"[WARN] Could not bump max_epochs: {e}")
