@@ -658,6 +658,103 @@ class PerAssetMetrics(pl.Callback):
         except Exception as e:
             print(f"[WARN] Could not save validation predictions: {e}")
             
+# ---------------------------------------------------------------------
+# Learnable Multi-Task Loss with Uncertainty-style Weights
+# ---------------------------------------------------------------------
+class LearnableMultiTaskLoss(nn.Module):
+    """
+    Two-loss combiner with learnable uncertainty-style weights.
+    total = exp(-s1) * L1 + exp(-s2) * L2 + (s1 + s2)
+    Initialize with desired starting weights w_i via s_i = -log(w_i).
+    Expects y_pred to be a list/tuple: [pred_vol, pred_dir].
+    """
+    def __init__(self, loss_vol: nn.Module, loss_dir: nn.Module, init_weights=(1.0, 0.5)):
+        super().__init__()
+        self.loss_vol = loss_vol
+        self.loss_dir = loss_dir
+        w1, w2 = float(init_weights[0]), float(init_weights[1])
+        # s_i = -log(w_i) so that exp(-s_i) = w_i at initialization
+        s1 = -np.log(max(w1, 1e-8))
+        s2 = -np.log(max(w2, 1e-8))
+        self.s = nn.Parameter(torch.tensor([s1, s2], dtype=torch.float32))
+
+    def forward(self, y_pred, target, **kwargs):
+        # Unpack predictions
+        if isinstance(y_pred, (list, tuple)) and len(y_pred) >= 2:
+            p_vol, p_dir = y_pred[0], y_pred[1]
+        else:
+            raise TypeError("LearnableMultiTaskLoss expects y_pred as [vol_pred, dir_pred]")
+
+        # Unpack targets -> expected shapes [..., pred_len] or [..., pred_len, 1]
+        # Accept either a single tensor with last dim >=2 (multi-target) or a list
+        if torch.is_tensor(target):
+            t = target
+            # Common PF shapes: [B, pred_len, n_targets] or [B, n_targets]
+            if t.ndim == 3 and t.size(-1) >= 2:
+                yv = t[..., 0]
+                yd = t[..., 1]
+            elif t.ndim == 2 and t.size(-1) >= 2:
+                yv = t[:, 0]
+                yd = t[:, 1]
+            else:
+                raise ValueError(f"Unexpected target shape for multi-task: {t.shape}")
+        elif isinstance(target, (list, tuple)) and len(target) >= 2:
+            yv, yd = target[0], target[1]
+            if torch.is_tensor(yv) and yv.ndim >= 3 and yv.size(-1) == 1:
+                yv = yv[..., 0]
+            if torch.is_tensor(yd) and yd.ndim >= 3 and yd.size(-1) == 1:
+                yd = yd[..., 0]
+        else:
+            raise TypeError("LearnableMultiTaskLoss expects target tensor with two channels or list of two tensors")
+
+        L1 = self.loss_vol(p_vol, yv)
+        L2 = self.loss_dir(p_dir, yd)
+        if L1.ndim > 0: L1 = L1.mean()
+        if L2.ndim > 0: L2 = L2.mean()
+
+        weights = torch.exp(-self.s)  # [2]
+        total = weights[0] * L1 + weights[1] * L2 + self.s.sum()
+        return total
+
+# -----------------------------------------------------------------------
+# Mini-MLP dual head: one branch for volatility quantiles, one for direction logit
+# -----------------------------------------------------------------------
+class DualHead(nn.Module):
+    def __init__(self, hidden_size: int, quantiles: int = 7):
+        super().__init__()
+        h = hidden_size // 2
+        self.vol = nn.Sequential(
+            nn.Linear(hidden_size, h),
+            nn.ReLU(),
+            nn.Dropout(0.10),
+            nn.Linear(h, quantiles),
+        )
+        self.dir = nn.Sequential(
+            nn.Linear(hidden_size, h),
+            nn.ReLU(),
+            nn.Dropout(0.10),
+            nn.Linear(h, 1),  # single logit
+        )
+
+    def forward(self, x):
+        vol_out = self.vol(x)
+        dir_out = self.dir(x)
+        return torch.cat([vol_out, dir_out], dim=-1)
+
+# keep BCE pos_weight on the correct device
+class StaticPosWeightBCE(nn.Module):
+    def __init__(self, pos_weight: float, smoothing: float = 0.0):
+        super().__init__()
+        self.pos_weight = float(pos_weight)
+        self.smoothing = float(smoothing)
+    def forward(self, y_pred, target):
+        target = target.float()
+        if self.smoothing > 0:
+            target = target * (1.0 - self.smoothing) + 0.5 * self.smoothing
+        pw = torch.tensor(self.pos_weight, device=y_pred.device, dtype=y_pred.dtype)
+        return F.binary_cross_entropy_with_logits(
+            y_pred.squeeze(-1), target.squeeze(-1), pos_weight=pw
+        )
 
 # -----------------------------------------------------------------------
 # Monkey-patch BaseModel.predict_step to support multi-target inference
@@ -1238,7 +1335,6 @@ if __name__ == "__main__":
     # Model
     # -----------------------------------------------------------------------
     seed_everything(SEED, workers=True)
-
     # Loss and output_size for multi-target: realised_vol (quantile regression), direction (classification)
     print("▶ Building model …")
     print(f"[LR] learning_rate={LR_OVERRIDE if LR_OVERRIDE is not None else 0.00275}")
@@ -1248,7 +1344,7 @@ if __name__ == "__main__":
         attention_head_size=2,
         dropout=0.0833704625250354,
         hidden_continuous_size=16,
-        learning_rate=(LR_OVERRIDE if LR_OVERRIDE is not None else 0.00275),
+        learning_rate=(LR_OVERRIDE if LR_OVERRIDE is not None else 0.0019),
         optimizer="AdamW",
         optimizer_params={"weight_decay": WEIGHT_DECAY},
         output_size=[7, 1],  # 7 quantiles + 1 logit
@@ -1263,8 +1359,59 @@ if __name__ == "__main__":
         log_interval=50,
         log_val_interval=10,
         reduce_on_plateau_patience=5,
-        reduce_on_plateau_min_lr = 1e-5,
+        reduce_on_plateau_min_lr=1e-5,
     )
+
+    # --- Swap in LearnableMultiTaskLoss and DualHead (patched) ---
+    try:
+        _LossClass = AsymmetricQuantileLoss  # use your existing AQL if present
+    except NameError:
+        from pytorch_forecasting.metrics import QuantileLoss
+        class AsymmetricQuantileLoss(QuantileLoss):
+            def __init__(self, quantiles, underestimation_init: float = 1.115, learnable_under: bool = True, reg_lambda: float = 1e-3, **kwargs):
+                super().__init__(quantiles=quantiles, **kwargs)
+                self.learnable_under = bool(learnable_under)
+                self.reg_lambda = float(reg_lambda)
+                a0 = max(float(underestimation_init), 1.0)
+                u0 = np.log(np.expm1(a0 - 1.0) + 1e-12)
+                param = torch.tensor(u0, dtype=torch.float32)
+                if self.learnable_under:
+                    self.u = nn.Parameter(param)
+                else:
+                    self.register_buffer("u", param)
+            def _alpha(self): 
+                return 1.0 + F.softplus(self.u)
+            def loss_per_prediction(self, y_pred, target):
+                diff = target.unsqueeze(-1) - y_pred
+                q = torch.tensor(self.quantiles, device=y_pred.device, dtype=y_pred.dtype).view(*([1] * (diff.ndim - 1)), -1)
+                alpha = self._alpha().to(y_pred.device, dtype=y_pred.dtype)
+                return torch.where(diff >= 0, alpha * q * diff, (1 - q) * (-diff))
+            def forward(self, y_pred, target, **kwargs):
+                base = super().forward(y_pred, target, **kwargs)
+                if self.reg_lambda > 0:
+                    base = base + self.reg_lambda * (self._alpha() - 1.0) ** 2
+                return base
+        _LossClass = AsymmetricQuantileLoss
+
+    # Loss: learnable underestimation starts at 1.115; direction pos_weight=1.1
+    tft.loss = LearnableMultiTaskLoss(
+        loss_vol=_LossClass(
+            quantiles=[0.05, 0.165, 0.25, 0.5, 0.75, 0.835, 0.95],
+            underestimation_init=1.115,
+            learnable_under=True,
+            reg_lambda=1e-3,
+        ),
+        loss_dir=StaticPosWeightBCE(pos_weight=1.1),
+        init_weights=(1.0, 0.5),
+    )
+
+    # Replace default linear heads with DualHead and bias-init direction from pos_weight=1.1
+    dual_head = DualHead(hidden_size=int(getattr(tft.hparams, "hidden_size", 64)))
+    p0 = 1.0 / (1.0 + 1.1)
+    bias0 = float(np.log(p0 / (1.0 - p0)))
+    with torch.no_grad():
+        dual_head.dir[-1].bias.data.fill_(bias0)
+    tft.output_layer = nn.ModuleList([dual_head.vol, dual_head.dir])
 
     # -----------------------------------------------------------------------
     # Training
@@ -1608,14 +1755,20 @@ if ENABLE_FEATURE_IMPORTANCE:
             limit_val_batches=int(FI_MAX_BATCHES),
             enable_progress_bar=False,
         )
-
         # Reload best checkpoint before FI for consistent evaluation
         try:
             best_ckpt_path = best_ckpt_cb.best_model_path
             if best_ckpt_path and os.path.exists(best_ckpt_path):
                 print(f"[FI] Loading best model checkpoint: {best_ckpt_path}")
                 tft = tft.__class__.load_from_checkpoint(best_ckpt_path)
-                # Trainer will move the model to the correct device during validate()
+
+                # Re-attach DualHead after loading checkpoint (keep loss etc. unchanged)
+                dual_head = DualHead(hidden_size=int(getattr(tft.hparams, "hidden_size", 64)))
+                p0 = 1.0 / (1.0 + 1.1)                      # pos_weight=1.1 prior
+                bias0 = float(np.log(p0 / (1.0 - p0)))
+                with torch.no_grad():
+                    dual_head.dir[-1].bias.data.fill_(bias0)
+                tft.output_layer = nn.ModuleList([dual_head.vol, dual_head.dir])
             else:
                 print("[FI][WARN] No best checkpoint found; using current model state.")
         except Exception as e:
