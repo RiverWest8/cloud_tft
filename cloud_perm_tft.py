@@ -1025,7 +1025,7 @@ def monkey_patch_to_network_output():
 monkey_patch_to_network_output()
 
 try:
-    from pytorch_forecasting.models.base._base_model import BaseModel
+    from pytorch_forecasting.models.base._base_model import BaseModel # type: ignore
     import torch
     
     def _coerce_prediction_tensor(pred):
@@ -1117,6 +1117,8 @@ try:
     BaseModel.training_step = _patched_training_step
     BaseModel.validation_step = _patched_validation_step
     print("[INFO] Patched PF training_step/validation_step to ensure tensor predictions and Tensor loss.")
+except Exception as e:
+    print(f"[WARN] Could not patch PF train/val steps: {e}")
 
 # -----------------------------------------------------------------------
 # Lightning v2 removed training_epoch_end / validation_epoch_end.
@@ -1138,37 +1140,6 @@ try:
         _rm(_TFT, _hook)
 except Exception as e:
     print(f"[WARN] Epoch-end hook removal failed: {e}")
-except Exception as e:
-    print(f"[WARN] Could not patch PF train/val steps: {e}")
-
-
-
-# -----------------------------------------------------------------------
-# Lightning v2 removed training_epoch_end / validation_epoch_end.
-# If PF's BaseModel or TFT define them, DELETE the attributes entirely so
-# Lightning's "has_overridden" check returns False.
-# -----------------------------------------------------------------------
-try:
-    from pytorch_forecasting.models.base._base_model import BaseModel as _PFBase
-    from pytorch_forecasting import TemporalFusionTransformer as _TFT
-
-    def _drop_attr(cls, name: str):
-        try:
-            if hasattr(cls, name):
-                delattr(cls, name)
-                print(f"[INFO] Removed {cls.__name__}.{name} for Lightning v2 compatibility.")
-        except Exception as e:
-            print(f"[WARN] Could not remove {cls.__name__}.{name}: {e}")
-
-    for hook in ("training_epoch_end", "validation_epoch_end"):
-        _drop_attr(_PFBase, hook)
-        _drop_attr(_TFT, hook)
-except Exception as e:
-    print(f"[WARN] Could not remove epoch_end hooks from PF/TFT: {e}")
-
-# -----------------------------------------------------------------------
-
-
 
 # -----------------------------------------------------------------------
 # Disable PF's plotting/logging hooks to avoid shape-related crashes
