@@ -1749,7 +1749,6 @@ if __name__ == "__main__":
     print("▶ Building model …")
     print(f"[LR] learning_rate={LR_OVERRIDE if LR_OVERRIDE is not None else 0.00187}")
     from pytorch_forecasting.metrics import MultiLoss
-    from my_losses import LabelSmoothedBCE  # keep your existing import path
 
     # Fixed weights
     FIXED_VOL_WEIGHT = 1.0
