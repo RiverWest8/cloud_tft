@@ -55,6 +55,7 @@ import torch.nn.functional as F
 # ------------------ Added imports for new FI block ------------------
 
 from pytorch_forecasting import (
+    BaseModel,
     TemporalFusionTransformer,
     TimeSeriesDataSet,
 )
@@ -1040,9 +1041,9 @@ def gcs_exists(path: str) -> bool:
     except Exception:
         return False
 
-TRAIN_URI = f"{GCS_DATA_PREFIX}/universal_train.parquet"
-VAL_URI   = f"{GCS_DATA_PREFIX}/universal_val.parquet"
-TEST_URI  = f"{GCS_DATA_PREFIX}/universal_test.parquet"
+TRAIN_URI = f"{GCS_DATA_PREFIX}/universal_train.parquet_10k"
+VAL_URI   = f"{GCS_DATA_PREFIX}/universal_val.parquet_10k"
+TEST_URI  = f"{GCS_DATA_PREFIX}/universal_test.parquet_10k"
 READ_PATHS = [str(TRAIN_URI), str(VAL_URI), str(TEST_URI)]
 '''
 # If a local data folder is explicitly provided, use it and skip GCS
@@ -1462,18 +1463,25 @@ if __name__ == "__main__":
         # everything else (strings, objects, scalars)
         return x
 
-    # Wrap plot_prediction (used by PF inside log_prediction)
-    if hasattr(tft, "plot_prediction"):
-        _orig_plot_prediction = tft.plot_prediction
-        def safe_plot_prediction(self, *args, **kwargs):
-            x = args[1] if len(args) > 1 else kwargs.get("x")
-            if isinstance(x, dict) and "encoder_lengths" in x:
-                if torch.is_tensor(x["encoder_lengths"]):
-                    x["encoder_lengths"] = x["encoder_lengths"].cpu()
-                # force scalar conversion for each length
-                if hasattr(x["encoder_lengths"], "__iter__"):
-                    x["encoder_lengths"] = [int(el) for el in x["encoder_lengths"]]
-            return _orig_plot_prediction(self, *args, **kwargs)
+    # Store the original method
+    _orig_plot_prediction = BaseModel.plot_prediction
+
+    def safe_plot_prediction(self, x, *args, **kwargs):
+        # Ensure encoder_lengths are plain ints
+        if "encoder_lengths" in x:
+            if torch.is_tensor(x["encoder_lengths"]):
+                x["encoder_lengths"] = x["encoder_lengths"].cpu().long().tolist()
+            else:
+                # Handle lists of tensors
+                x["encoder_lengths"] = [
+                    int(el.item()) if torch.is_tensor(el) else int(el)
+                    for el in x["encoder_lengths"]
+                ]
+        return _orig_plot_prediction(self, x, *args, **kwargs)
+
+    # Apply the patch
+    BaseModel.plot_prediction = safe_plot_prediction
+
 
     # Wrap log_prediction (PF calls this in validation to produce figures)
     if hasattr(tft, "log_prediction"):
