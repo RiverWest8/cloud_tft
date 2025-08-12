@@ -756,6 +756,15 @@ class StaticPosWeightBCE(nn.Module):
             y_pred.squeeze(-1), target.squeeze(-1), pos_weight=pw
         )
 
+class DualOutputModule(nn.Module):
+    """Wrap two heads so output_layer(x) returns [vol_out, dir_out] for PF."""
+    def __init__(self, vol_head: nn.Module, dir_head: nn.Module):
+        super().__init__()
+        self.vol = vol_head
+        self.dir = dir_head
+    def forward(self, x):
+        return [self.vol(x), self.dir(x)]
+
 # -----------------------------------------------------------------------
 # Monkey-patch BaseModel.predict_step to support multi-target inference
 # -----------------------------------------------------------------------
@@ -1421,7 +1430,7 @@ if __name__ == "__main__":
     bias0 = float(np.log(p0 / (1.0 - p0)))
     with torch.no_grad():
         dual_head.dir[-1].bias.data.fill_(bias0)
-    tft.output_layer = nn.ModuleList([dual_head.vol, dual_head.dir])
+    tft.output_layer = DualOutputModule(dual_head.vol, dual_head.dir)
 
     # -----------------------------------------------------------------------
     # Training
@@ -1778,7 +1787,7 @@ if ENABLE_FEATURE_IMPORTANCE:
                 bias0 = float(np.log(p0 / (1.0 - p0)))
                 with torch.no_grad():
                     dual_head.dir[-1].bias.data.fill_(bias0)
-                tft.output_layer = nn.ModuleList([dual_head.vol, dual_head.dir])
+                tft.output_layer = DualOutputModule(dual_head.vol, dual_head.dir)
             else:
                 print("[FI][WARN] No best checkpoint found; using current model state.")
         except Exception as e:
