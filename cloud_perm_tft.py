@@ -663,9 +663,12 @@ class LearnableMultiTaskLoss(nn.Module):
     Two-loss combiner with learnable uncertainty-style weights.
     total = exp(-s1) * L1 + exp(-s2) * L2 + (s1 + s2)
 
-    Expects y_pred = [pred_vol, pred_dir] where:
-    - pred_vol shape: [B, T, Q] (tensor) for quantiles
-    - pred_dir shape: [B, T] (tensor) for classification
+    Accepts predictions in **either** form:
+      • list/tuple: [pred_vol, pred_dir]
+      • stacked tensor: [..., 2, K] where index 0 is vol-quantiles (K), index 1 is
+        the direction logit replicated across the same K dimension.
+
+    Targets can be [..., 2] (vol, dir) or provided as a list/tuple of tensors.
     """
 
     def __init__(self, loss_vol: nn.Module, loss_dir: nn.Module, init_weights=(1.0, 0.5)):
@@ -673,9 +676,10 @@ class LearnableMultiTaskLoss(nn.Module):
         self.loss_vol = loss_vol
         self.loss_dir = loss_dir
         w1, w2 = float(init_weights[0]), float(init_weights[1])
-        self.s = nn.Parameter(torch.tensor([-np.log(max(w1, 1e-8)),
-                                            -np.log(max(w2, 1e-8))],
-                                           dtype=torch.float32))
+        self.s = nn.Parameter(torch.tensor([
+            -np.log(max(w1, 1e-8)),
+            -np.log(max(w2, 1e-8)),
+        ], dtype=torch.float32))
 
     @staticmethod
     def _ensure_tensor(x):
@@ -683,15 +687,10 @@ class LearnableMultiTaskLoss(nn.Module):
         if torch.is_tensor(x):
             return x
         if isinstance(x, (list, tuple)):
-            # Recursively flatten
-            flat = []
-            for item in x:
-                t = LearnableMultiTaskLoss._ensure_tensor(item)
-                flat.append(t)
+            flat = [LearnableMultiTaskLoss._ensure_tensor(t) for t in x]
             try:
-                return torch.stack(flat, dim=-1)  # stack into quantile dimension
+                return torch.stack(flat, dim=-1)  # stack into last (quantile) dim
             except RuntimeError:
-                # If already stacked correctly, just return the first element
                 return flat[0]
         raise TypeError(f"Expected Tensor/List/Tuple, got {type(x)}")
 
@@ -718,44 +717,56 @@ class LearnableMultiTaskLoss(nn.Module):
         raise TypeError("LearnableMultiTaskLoss expects target with at least one channel or a list/tuple")
 
     def forward(self, y_pred, target, **kwargs):
-        if not (isinstance(y_pred, (list, tuple)) and len(y_pred) >= 2):
-            raise TypeError("LearnableMultiTaskLoss expects y_pred as [vol_pred, dir_pred]")
+        # ---- parse predictions (list/tuple or stacked tensor) ----
+        if isinstance(y_pred, (list, tuple)):
+            p_vol = self._ensure_tensor(y_pred[0])
+            p_dir = self._ensure_tensor(y_pred[1]) if len(y_pred) > 1 else None
+        elif torch.is_tensor(y_pred):
+            t = y_pred
+            # squeeze pred_len dim if present (…, 1, 2, K) -> (…, 2, K)
+            if t.ndim >= 4 and t.size(-3) == 1:
+                t = t.squeeze(-3)
+            if t.ndim >= 3 and t.size(-2) >= 2:
+                p_vol = t.select(dim=-2, index=0)  # [..., K]
+                p_dir = t.select(dim=-2, index=1)  # [..., K] replicated
+            else:
+                p_vol = t
+                p_dir = None
+        else:
+            raise TypeError("LearnableMultiTaskLoss expects y_pred as list/tuple or stacked tensor")
 
-        p_vol = self._ensure_tensor(y_pred[0])
-        p_dir = self._ensure_tensor(y_pred[1])
-
-        # --- Unpack targets (allow missing direction) ---
+        # ---- targets ----
         yv, yd = self._unpack_targets(target)
 
-        # --- Ensure quantile dimension matches the configured loss quantiles ---
+        # ---- align quantile dim for vol head ----
         try:
             q = len(getattr(self.loss_vol, "quantiles", []))
         except Exception:
             q = None
         if q and torch.is_tensor(p_vol) and p_vol.ndim >= 2 and p_vol.size(-1) != q:
-            # If the model produced a single channel, repeat it to all quantiles.
             if p_vol.size(-1) == 1:
                 p_vol = p_vol.repeat_interleave(q, dim=-1)
             else:
-                # Fallback: collapse to one channel (mean) and repeat to expected quantiles.
-                p_single = p_vol.mean(dim=-1, keepdim=True)
-                p_vol = p_single.repeat_interleave(q, dim=-1)
+                p_vol = p_vol.mean(dim=-1, keepdim=True).repeat_interleave(q, dim=-1)
 
-        # Compute individual losses (allow missing direction target)
+        # ---- collapse direction to a single logit if it has a bogus K dim ----
+        if p_dir is not None and torch.is_tensor(p_dir) and p_dir.ndim >= 2 and p_dir.size(-1) > 1:
+            mid = p_dir.size(-1) // 2
+            p_dir = p_dir.index_select(-1, torch.tensor([mid], device=p_dir.device)).squeeze(-1)
+
+        # ---- compute component losses ----
         L1 = self.loss_vol(p_vol, yv)
         if hasattr(L1, "mean"):
             L1 = L1.mean()
 
-        L2 = None
-        if isinstance(yd, torch.Tensor) and yd.numel() > 0:
+        if isinstance(yd, torch.Tensor) and yd.numel() > 0 and p_dir is not None:
             L2 = self.loss_dir(p_dir, yd)
             if hasattr(L2, "mean"):
                 L2 = L2.mean()
         else:
-            # no direction labels present in this batch → zero contribution
             L2 = torch.zeros((), device=p_vol.device, dtype=p_vol.dtype)
 
-        # expose internals for callbacks (safe if not read)
+        # ---- cache internals for callbacks ----
         self.last_L1 = torch.as_tensor(L1).detach()
         self.last_L2 = torch.as_tensor(L2).detach() if isinstance(L2, torch.Tensor) else torch.tensor(float(L2))
         self.last_s  = self.s.detach()
@@ -766,6 +777,7 @@ class LearnableMultiTaskLoss(nn.Module):
 
     # ---- PF hooks ----
     def rescale_parameters(self, y_pred, **kwargs):
+        # support both forms during any PF-internal rescaling
         if isinstance(y_pred, (list, tuple)) and len(y_pred) >= 1:
             vol = self._ensure_tensor(y_pred[0])
             dir_ = self._ensure_tensor(y_pred[1]) if len(y_pred) > 1 else None
@@ -788,17 +800,18 @@ class LearnableMultiTaskLoss(nn.Module):
                 dir_ = self._ensure_tensor(t[1]) if len(t) > 1 else None
                 return vol, dir_
             if _torch.is_tensor(t):
-                if t.ndim >= 3:  # [..., n_targets, K]
-                    n_targets = t.size(-2)
+                # (…, 1, 2, K) -> (…, 2, K)
+                if t.ndim >= 4 and t.size(-3) == 1:
+                    t = t.squeeze(-3)
+                if t.ndim >= 3 and t.size(-2) >= 2:
                     vol = t.select(dim=-2, index=0)
-                    dir_ = t.select(dim=-2, index=1) if n_targets > 1 else None
+                    dir_ = t.select(dim=-2, index=1)
                     return vol, dir_
                 return t, None
             return t, None
 
         def _median_quantile(t):
             t = self._ensure_tensor(t)
-            # squeeze [B,1,Q] -> [B,Q]
             if t.ndim == 3 and t.size(1) == 1:
                 t = t.squeeze(1)
             if t.ndim >= 2 and t.size(-1) > 1:
@@ -807,7 +820,7 @@ class LearnableMultiTaskLoss(nn.Module):
 
         vol, dir_ = _split_heads(y_pred)
 
-        # Ensure quantile dimension matches configured quantiles before delegating
+        # Align quantiles with configured loss before delegating
         try:
             q = len(getattr(self.loss_vol, "quantiles", []))
         except Exception:
@@ -818,7 +831,6 @@ class LearnableMultiTaskLoss(nn.Module):
             else:
                 vol = vol.mean(dim=-1, keepdim=True).repeat_interleave(q, dim=-1)
 
-        # Try the underlying loss' converter first (new and old signatures)
         if hasattr(self.loss_vol, "to_prediction"):
             try:
                 vol_out = self.loss_vol.to_prediction(vol, normalize=normalize, **kwargs)
@@ -832,7 +844,6 @@ class LearnableMultiTaskLoss(nn.Module):
             except Exception:
                 pass
 
-        # Fallback: use median quantile explicitly
         return [_median_quantile(vol), dir_]
 
 # -----------------------------------------------------------------------
@@ -876,13 +887,17 @@ class StaticPosWeightBCE(nn.Module):
         )
 
 class DualOutputModule(nn.Module):
-    """Wrap two heads so output_layer(x) returns [vol_out, dir_out] for PF."""
+    """Return stacked tensor [..., 2, K] where:
+       index 0 = volatility quantiles (K=7), index 1 = direction logits (replicated across K)."""
     def __init__(self, vol_head: nn.Module, dir_head: nn.Module):
         super().__init__()
         self.vol = vol_head
         self.dir = dir_head
     def forward(self, x):
-        return [self.vol(x), self.dir(x)]
+        vol_out = self.vol(x)                 # [..., 7]
+        dir_out = self.dir(x)                 # [..., 1] (logit)
+        dir_rep = dir_out.repeat_interleave(vol_out.size(-1), dim=-1)  # [..., 7]
+        return torch.stack([vol_out, dir_rep], dim=-2)  # [..., 2, 7]
 
 # -----------------------------------------------------------------------
 # Monkey-patch BaseModel.predict_step to support multi-target inference
