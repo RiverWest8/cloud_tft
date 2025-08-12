@@ -1036,37 +1036,50 @@ def monkey_patch_to_network_output():
 # Activate the patch
 monkey_patch_to_network_output()
 
+
 try:
     from pytorch_forecasting.models.base._base_model import BaseModel # type: ignore
     import torch
-    
-    def _coerce_prediction_tensor(pred):
-        """Normalize PF predictions into a tensor shaped [B, n_targets, K]."""
-        # Unwrap Output wrappers/dicts
-        if hasattr(pred, "prediction"):
-            pred = pred.prediction
-        elif isinstance(pred, dict) and "prediction" in pred:
-            pred = pred["prediction"]
 
-        # Already tensor
+    def _coerce_prediction_tensor(pred):
+        """Normalize PF predictions into a tensor shaped [B, n_targets, K].
+        Accepts:
+          • Output wrappers (with .prediction)
+          • dicts containing 'prediction'
+          • tensors
+          • lists/tuples that may contain tensors, dicts with 'prediction', or Output wrappers
+        Always returns a **torch.Tensor** when at least one tensor-like is found; otherwise raises
+        a clear RuntimeError instead of letting a downstream "list index out of range" occur.
+        """
+        # Unwrap Output wrappers/dicts recursively to get a raw prediction object
+        def _unwrap(x):
+            if hasattr(x, "prediction"):
+                return x.prediction
+            if isinstance(x, dict) and "prediction" in x:
+                return x["prediction"]
+            return x
+
+        pred = _unwrap(pred)
+
+        # If we already have a tensor, just normalise its shape
         if torch.is_tensor(pred):
-            # Squeeze pred_len dim if present: [B,1,n_targets,K] or [B,n_targets,1,K]
             if pred.ndim == 4 and pred.size(2) == 1:
-                pred = pred.squeeze(2)
+                pred = pred.squeeze(2)  # [B, n_targets, K]
             return pred
 
-        # List/tuple of per-target tensors → harmonize and stack
+        # If we have a list/tuple, extract any tensor-like members (including nested wrappers)
         if isinstance(pred, (list, tuple)):
             processed = []
             for p in pred:
+                p = _unwrap(p)
                 if not torch.is_tensor(p):
                     continue
-                # [B,1,*,K] → [B,*,K]
+                # [B,1,*,K] -> [B,*,K]
                 if p.ndim == 4 and p.shape[2] == 1:
                     p = p.squeeze(2)
                 if p.ndim == 3 and p.shape[1] == 1:
-                    p = p.squeeze(1)
-                # If last dim is 1 (e.g. single logit), repeat to K=7
+                    p = p.squeeze(1)  # [B, K]
+                # If last dim is 1 (e.g., single logit), repeat to K=7
                 if p.ndim >= 2 and p.shape[-1] == 1:
                     p = p.repeat_interleave(7, dim=-1)
                 # If last dim is 2 (binary logits), reduce to prob and repeat to K=7
@@ -1076,8 +1089,21 @@ try:
                 processed.append(p)
             if processed:
                 return torch.stack(processed, dim=1)  # [B, n_targets, 7]
-        # Fallback: wrap as-is (may still be list/None)
-        return pred
+
+            # If we get here, we have a list/tuple but no usable tensors – fail loudly & clearly
+            raise RuntimeError(
+                "Model forward returned a list/tuple with no tensor predictions; "
+                "this would later cause 'list index out of range'. "
+                "Please ensure the model's output_layer returns tensors."
+            )
+
+        # Anything else – try one last unwrap, otherwise error
+        pred = _unwrap(pred)
+        if torch.is_tensor(pred):
+            return pred
+        raise RuntimeError(
+            f"Unsupported prediction type: {type(pred)}; cannot coerce into tensor."
+        )
 
     # Save originals in case needed for debugging
     _orig_training_step = BaseModel.training_step
@@ -1096,9 +1122,16 @@ try:
         else:
             x, y, _w = batch, None, None
 
-        # TRAINING: do NOT disable grads
+        # Use BaseModel.to_network_output to standardise outputs first
         y_hat = self(x)
-        pred = _coerce_prediction_tensor(y_hat)
+        try:
+            out = self.to_network_output(y_hat)
+        except Exception:
+            # Fallback to raw y_hat if PF's to_network_output is unavailable
+            out = {"prediction": y_hat}
+
+        pred = out.get("prediction", y_hat)
+        pred = _coerce_prediction_tensor(pred)
         loss = self.loss(pred, y) if y is not None else torch.tensor(
             0.0, device=pred.device if torch.is_tensor(pred) else None
         )
@@ -1117,10 +1150,15 @@ try:
         else:
             x, y, _w = batch, None, None
 
-        # VALIDATION: safe to disable grads
         with torch.no_grad():
             y_hat = self(x)
-        pred = _coerce_prediction_tensor(y_hat)
+        try:
+            out = self.to_network_output(y_hat)
+        except Exception:
+            out = {"prediction": y_hat}
+
+        pred = out.get("prediction", y_hat)
+        pred = _coerce_prediction_tensor(pred)
         loss = self.loss(pred, y) if y is not None else torch.tensor(
             0.0, device=pred.device if torch.is_tensor(pred) else None
         )
@@ -1128,7 +1166,7 @@ try:
 
     BaseModel.training_step = _patched_training_step
     BaseModel.validation_step = _patched_validation_step
-    print("[INFO] Patched PF training_step/validation_step to ensure tensor predictions and Tensor loss.")
+    print("[INFO] Patched PF training_step/validation_step to use to_network_output and ensure tensor predictions.")
 except Exception as e:
     print(f"[WARN] Could not patch PF train/val steps: {e}")
 
