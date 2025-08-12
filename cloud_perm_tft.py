@@ -1121,42 +1121,29 @@ except Exception as e:
     print(f"[WARN] Could not patch PF train/val steps: {e}")
 
 
-# -----------------------------------------------------------------------
-# PF epoch-end hooks expect a list of dicts; since we now return plain
-# Tensors from train/val steps, override epoch_end hooks to no-ops to
-# avoid "list index out of range" errors during sanity/validation.
-# -----------------------------------------------------------------------
-from pytorch_forecasting.models.base._base_model import BaseModel # type: ignore
-
-def _patched_training_epoch_end(self, outputs):
-    # Accept anything and do nothing
-    return
-
-def _patched_validation_epoch_end(self, outputs):
-    # Accept anything and do nothing
-    return
-
-BaseModel.training_epoch_end = _patched_training_epoch_end
-BaseModel.validation_epoch_end = _patched_validation_epoch_end
-
-print("[INFO] Neutralized PF training_epoch_end/validation_epoch_end to avoid list indexing issues.")
 
 # -----------------------------------------------------------------------
-# Lightning v2 no longer supports training_epoch_end/validation_epoch_end.
-# TemporalFusionTransformer implements these, so override them with no-ops
-# BEFORE model instantiation to avoid Lightning v2 runtime errors.
+# Lightning v2 removed training_epoch_end / validation_epoch_end.
+# If PF's BaseModel or TFT define them, DELETE the attributes entirely so
+# Lightning's "has_overridden" check returns False.
 # -----------------------------------------------------------------------
 try:
+    from pytorch_forecasting.models.base._base_model import BaseModel as _PFBase
     from pytorch_forecasting import TemporalFusionTransformer as _TFT
-    def _tft_training_epoch_end(self, outputs):
-        return
-    def _tft_validation_epoch_end(self, outputs):
-        return
-    _TFT.training_epoch_end = _tft_training_epoch_end
-    _TFT.validation_epoch_end = _tft_validation_epoch_end
-    print("[INFO] Neutralized TFT training_epoch_end/validation_epoch_end for Lightning v2 compatibility.")
+
+    def _drop_attr(cls, name: str):
+        try:
+            if hasattr(cls, name):
+                delattr(cls, name)
+                print(f"[INFO] Removed {cls.__name__}.{name} for Lightning v2 compatibility.")
+        except Exception as e:
+            print(f"[WARN] Could not remove {cls.__name__}.{name}: {e}")
+
+    for hook in ("training_epoch_end", "validation_epoch_end"):
+        _drop_attr(_PFBase, hook)
+        _drop_attr(_TFT, hook)
 except Exception as e:
-    print(f"[WARN] Could not neutralize TFT epoch_end hooks: {e}")
+    print(f"[WARN] Could not remove epoch_end hooks from PF/TFT: {e}")
 
 # -----------------------------------------------------------------------
 
