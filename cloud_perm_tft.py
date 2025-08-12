@@ -959,6 +959,63 @@ def monkey_patch_predict_step():
 monkey_patch_predict_step()
 
 # -----------------------------------------------------------------------
+# Force PF to return a tensor-shaped prediction instead of a list during train/val
+# so Lightning's internals (which call .detach()) don't blow up on lists.
+# -----------------------------------------------------------------------
+def monkey_patch_to_network_output():
+    try:
+        from pytorch_forecasting.models.base._base_model import BaseModel
+        import torch
+
+        def _to_network_output(self, out):
+            # PF usually returns either an Output-like object with .prediction,
+            # or a raw list/tuple of per-target tensors. We normalise to a dict
+            # holding a single tensor under key "prediction" with shape [B, n_targets, K].
+            pred = out
+            # Unwrap Output wrappers
+            if hasattr(out, "prediction"):
+                pred = out.prediction
+            elif isinstance(out, dict) and "prediction" in out:
+                pred = out["prediction"]
+
+            # If PF already gave us a tensor, just return it in the expected dict
+            if torch.is_tensor(pred):
+                return {"prediction": pred}
+
+            # If it's a list/tuple of tensors (one per target), harmonise shapes and stack
+            if isinstance(pred, (list, tuple)):
+                processed = []
+                for p in pred:
+                    if not torch.is_tensor(p):
+                        continue
+                    # squeeze singleton pred_len / target dims: [B,1,7] or [B,1,1,7] -> [B,7]
+                    if p.ndim == 4 and p.shape[2] == 1:
+                        p = p.squeeze(2)
+                    if p.ndim == 3 and p.shape[1] == 1:
+                        p = p.squeeze(1)
+                    # If last dim is 1 (e.g., direction single logit), repeat to match K=7
+                    if p.ndim >= 2 and p.shape[-1] == 1:
+                        p = p.repeat_interleave(7, dim=-1)
+                    # If last dim is 2 (binary logits), convert to prob of class 1 then repeat
+                    elif p.ndim >= 2 and p.shape[-1] == 2:
+                        pos = p.softmax(-1)[..., 1].unsqueeze(-1)
+                        p = pos.repeat_interleave(7, dim=-1)
+                    processed.append(p)
+                if processed:
+                    pred = torch.stack(processed, dim=1)  # [B, n_targets, 7]
+                    return {"prediction": pred}
+
+            # Fallback: return as-is in dict; better than returning a raw list
+            return {"prediction": pred}
+
+        BaseModel.to_network_output = _to_network_output
+    except Exception as e:
+        print(f"[WARN] Could not monkey-patch to_network_output: {e}")
+
+# Activate the patch
+monkey_patch_to_network_output()
+
+# -----------------------------------------------------------------------
 
 
 
