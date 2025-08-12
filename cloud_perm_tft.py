@@ -1790,21 +1790,45 @@ if ENABLE_FEATURE_IMPORTANCE:
 
         rng = np.random.default_rng(SEED)
 
-        def _permute_by_blocks(df_in: pd.DataFrame, col: str, group_col: str = GROUP_ID[0], block_size: int = PERM_BLOCK_SIZE) -> pd.DataFrame:
-            """Shuffle contiguous blocks of length `block_size` within each group for column `col`.
-            Keeps distribution roughly intact while breaking temporal alignment.
+        def _permute_by_blocks(
+            df_in: pd.DataFrame,
+            col: str,
+            group_col: str = GROUP_ID[0],
+            block_size: int = PERM_BLOCK_SIZE,
+        ) -> pd.DataFrame:
+            """
+            Shuffle contiguous blocks of length `block_size` within each group for column `col`.
+            Preserves order inside each block but permutes the block order to break temporal alignment.
             """
             df = df_in.copy()
             if col not in df.columns:
                 return df
+            if block_size is None or block_size <= 0:
+                return df
+
             for g, sub in df.groupby(group_col, sort=False):
                 idx = sub.index.to_numpy()
-                if idx.size == 0:
+                n = idx.size
+                if n == 0:
                     continue
-                # Build block index array: [0,0,...,1,1,...,2,2,...]
-                n_blocks = max(1, int(np.ceil(idx.size / float(block_size))))
-                block_ids = np.repeat(np.arange(n_blocks), block_size)[: idx.size]
-                # Permute block order
-                rng.shuffle(block_ids)
-                # Reorder indices by permuted block ids but keep within-block order
-                order = np.argsort(block_ids, k<truncated__content/>
+
+                # Build contiguous blocks
+                starts = np.arange(0, n, block_size)
+                blocks = [idx[s : s + block_size] for s in starts]
+                if len(blocks) <= 1:
+                    continue
+
+                # Permute block order using the RNG defined above
+                perm = rng.permutation(len(blocks))
+                new_order = np.concatenate([blocks[i] for i in perm])
+
+                # Reassign column values according to permuted block order
+                df.loc[idx, col] = df.loc[new_order, col].to_numpy()
+
+            return df
+
+        # …call _permute_by_blocks(...) here as needed …
+
+    except Exception as e:
+        print(f"Feature importance failed: {e}")
+        
