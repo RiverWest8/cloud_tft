@@ -46,11 +46,30 @@ from typing import List
 import json
 import numpy as np
 import pandas as pd
+import pandas as _pd
+pd = _pd  # Ensure pd always refers to pandas module
 import lightning as pl
 from lightning.pytorch import Trainer, seed_everything
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+def _permute_series_inplace(df: pd.DataFrame, col: str, block: int, group_col: str = "asset") -> None:
+    if col not in df.columns:
+        return
+    if group_col not in df.columns:
+        vals = df[col].values.copy()
+        np.random.shuffle(vals)
+        df[col] = vals
+        return
+    for _, idx in df.groupby(group_col, observed=True).groups.items():
+        idx = np.asarray(list(idx))
+        if block and block > 1:
+            shift = np.random.randint(1, max(2, len(idx)))
+            df.loc[idx, col] = df.loc[idx, col].values.take(np.arange(len(idx)) - shift, mode='wrap')
+        else:
+            vals = df.loc[idx, col].values.copy()
+            np.random.shuffle(vals)
+            df.loc[idx, col] = vals
 
 # ------------------ Added imports for new FI block ------------------
 
@@ -494,28 +513,6 @@ class PerAssetMetrics(pl.Callback):
         # Permutation Importance Helpers (decoded metric = MAE + RMSE)
         # -----------------------------------------------------------------------
 
-        def _permute_series_inplace(df: pd.DataFrame, col: str, block: int, group_col: str = "asset") -> None:
-            """
-            Permute a feature in-place. If block>1, do a group-wise cyclic roll
-            by a random offset (keeps local structure better). If block<=1, fully
-            shuffle within group.
-            """
-            if col not in df.columns:
-                return
-            if group_col not in df.columns:
-                vals = df[col].values.copy()
-                np.random.shuffle(vals)
-                df[col] = vals
-                return
-            for _, idx in df.groupby(group_col, observed=True).groups.items():
-                idx = np.asarray(list(idx))
-                if block and block > 1:
-                    shift = np.random.randint(1, max(2, len(idx)))
-                    df.loc[idx, col] = df.loc[idx, col].values.take(np.arange(len(idx)) - shift, mode='wrap')
-                else:
-                    vals = df.loc[idx, col].values.copy()
-                    np.random.shuffle(vals)
-                    df.loc[idx, col] = vals
 
 
         def _extract_norm_from_dataset(ds: TimeSeriesDataSet):
