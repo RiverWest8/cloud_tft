@@ -1865,70 +1865,96 @@ if __name__ == "__main__":
 
 
     class LossHistory(pl.Callback):
-      def __init__(self, path: str = str(LOCAL_RUN_DIR / f"tft_loss_history_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv")):
-          self.path = path
-          self.records = []
-      def on_train_epoch_end(self, trainer, pl_module):
-          loss = trainer.callback_metrics.get("train_loss_epoch")
-          if loss is not None:
-              self.records.append(
-                  {"epoch": int(getattr(trainer, "current_epoch", -1)), "train_loss": float(f"{float(loss):.8f}")}
-              )
-      def on_train_end(self, trainer, pl_module):
-          if self.records:
-              import pandas as pd
-              pd.DataFrame(self.records).to_csv(self.path, index=False)
-              print(f"✓ Saved loss history → {self.path}")
-              try:
-                  upload_file_to_gcs(self.path, f"{GCS_OUTPUT_PREFIX}/{os.path.basename(self.path)}")
-              except Exception as e:
-                  print(f"[WARN] Could not upload loss history: {e}")
+        def __init__(self, path: str = str(LOCAL_RUN_DIR / f"tft_loss_history_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv")):
+            self.path = path
+            self.records = []
+
+        def _safe_float(self, val):
+            try:
+                if val is None:
+                    return None
+                f = float(val)
+                if math.isnan(f):
+                    return None
+                return float(f"{f:.8f}")
+            except Exception:
+                return None
+
+        def on_train_epoch_end(self, trainer, pl_module):
+            try:
+                loss = trainer.callback_metrics.get("train_loss_epoch")
+                loss_val = self._safe_float(loss)
+                if loss_val is not None:
+                    self.records.append({
+                        "epoch": int(getattr(trainer, "current_epoch", -1)),
+                        "train_loss": loss_val
+                    })
+            except Exception:
+                pass
+
+        def on_train_end(self, trainer, pl_module):
+            if not self.records:
+                return
+            try:
+                import pandas as pd
+                pd.DataFrame(self.records).to_csv(self.path, index=False)
+                print(f"✓ Saved loss history → {self.path}")
+                try:
+                    upload_file_to_gcs(self.path, f"{GCS_OUTPUT_PREFIX}/{os.path.basename(self.path)}")
+                except Exception as e:
+                    print(f"[WARN] Could not upload loss history: {e}")
+            except Exception as e:
+                print(f"[WARN] Could not save loss history: {e}")
 
 
+    # ---------- Utility ----------
+    def _safe_float(val):
+        try:
+            if val is None:
+                return None
+            f = float(val)
+            if math.isnan(f):
+                return None
+            return float(f"{f:.8f}")
+        except Exception:
+            return None
+
+    # ---------- HighPrecisionTQDM ----------
     class HighPrecisionTQDM(TQDMProgressBar):
         """Progress bar that shows key metrics with higher precision."""
         def get_metrics(self, trainer, pl_module):
             metrics = super().get_metrics(trainer, pl_module)
-            # Pull raw values from callback_metrics when possible and format to 8 dp
             keys = (
                 "loss", "train_loss_step", "train_loss", "train_loss_epoch",
                 "val_loss", "val_loss_decoded", "val_mae_dec", "val_rmse_dec"
             )
             for k in keys:
-                try:
-                    if k in trainer.callback_metrics:
-                        v = float(trainer.callback_metrics[k])
-                        metrics[k] = f"{v:.8f}"
-                    elif k in metrics:
-                        # fallback to whatever Lightning provided
-                        v = float(metrics[k])
-                        metrics[k] = f"{v:.8f}"
-                except Exception:
-                    # ignore non-float or missing
-                    pass
+                val = trainer.callback_metrics.get(k, metrics.get(k, None))
+                sf = _safe_float(val)
+                if sf is not None:
+                    metrics[k] = f"{sf:.8f}"
             return metrics
 
+    # ---------- StepLossSaver ----------
     class StepLossSaver(pl.Callback):
         """Saves train_loss_step every logged batch with high precision."""
         def __init__(self, path: str = str(LOCAL_RUN_DIR / f"tft_step_losses_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv")):
             self.path = path
             self.rows = []
+
         def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-            try:
-                v = trainer.callback_metrics.get("train_loss_step")
-                if v is not None:
-                    self.rows.append({
-                        "global_step": int(getattr(trainer, "global_step", 0)),
-                        "epoch": int(getattr(trainer, "current_epoch", -1)),
-                        "train_loss_step": float(f"{float(v):.8f}")
-                    })
-            except Exception:
-                pass
+            v = _safe_float(trainer.callback_metrics.get("train_loss_step"))
+            if v is not None:
+                self.rows.append({
+                    "global_step": int(getattr(trainer, "global_step", 0)),
+                    "epoch": int(getattr(trainer, "current_epoch", -1)),
+                    "train_loss_step": v
+                })
+
         def on_train_end(self, trainer, pl_module):
             if not self.rows:
                 return
             try:
-                import pandas as pd
                 pd.DataFrame(self.rows).to_csv(self.path, index=False)
                 print(f"✓ Saved step loss history → {self.path}")
                 try:
@@ -1938,13 +1964,40 @@ if __name__ == "__main__":
             except Exception as e:
                 print(f"[WARN] Could not save step loss history: {e}")
 
+    # ---------- LossHistory ----------
+    class LossHistory(pl.Callback):
+        def __init__(self, path: str = str(LOCAL_RUN_DIR / f"tft_loss_history_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv")):
+            self.path = path
+            self.records = []
+
+        def on_train_epoch_end(self, trainer, pl_module):
+            loss_val = _safe_float(trainer.callback_metrics.get("train_loss_epoch"))
+            if loss_val is not None:
+                self.records.append({
+                    "epoch": int(getattr(trainer, "current_epoch", -1)),
+                    "train_loss": loss_val
+                })
+
+        def on_train_end(self, trainer, pl_module):
+            if not self.records:
+                return
+            try:
+                pd.DataFrame(self.records).to_csv(self.path, index=False)
+                print(f"✓ Saved loss history → {self.path}")
+                try:
+                    upload_file_to_gcs(self.path, f"{GCS_OUTPUT_PREFIX}/{os.path.basename(self.path)}")
+                except Exception as e:
+                    print(f"[WARN] Could not upload loss history: {e}")
+            except Exception as e:
+                print(f"[WARN] Could not save loss history: {e}")
+
+    # ---------- EpochPrinter ----------
     class EpochPrinter(pl.Callback):
-        """Print lightweight, periodic training status updates per epoch.
-        Shows epoch number, train/val loss (if available), and current LR.
-        """
+        """Print lightweight, periodic training status updates per epoch."""
         def __init__(self, total_epochs: int):
             super().__init__()
             self.total = int(total_epochs)
+
         def _format_lr(self, trainer):
             try:
                 opt = trainer.optimizers[0]
@@ -1952,63 +2005,34 @@ if __name__ == "__main__":
                 return None if lr is None else f"{float(lr):.2e}"
             except Exception:
                 return None
+
         def on_train_epoch_start(self, trainer, pl_module):
-            # +1 to present human-friendly epoch numbering
             print(f"▶ Epoch {trainer.current_epoch + 1}/{self.total} — training …")
+
         def on_train_epoch_end(self, trainer, pl_module):
             metrics = trainer.callback_metrics
-            train_loss = metrics.get("train_loss_epoch")
-            val_loss = metrics.get("val_loss")
-            val_mae_dec = metrics.get("val_mae_dec")
-            val_rmse_dec = metrics.get("val_rmse_dec")
-            val_loss_decoded = metrics.get("val_loss_decoded")
-            lr_str = self._format_lr(trainer)
             parts = [f"✓ Epoch {trainer.current_epoch + 1}/{self.total} done"]
-            if train_loss is not None:
-                try:
-                    parts.append(f"train_loss={float(train_loss):.8f}")
-                except Exception:
-                    pass
-            if val_loss is not None:
-                try:
-                    parts.append(f"val_loss={float(val_loss):.8f}")
-                except Exception:
-                    pass
-            if val_mae_dec is not None:
-                try:
-                    parts.append(f"val_mae_dec={float(val_mae_dec):.8f}")
-                except Exception:
-                    pass
-            if val_rmse_dec is not None:
-                try:
-                    parts.append(f"val_rmse_dec={float(val_rmse_dec):.8f}")
-                except Exception:
-                    pass
-            if val_loss_decoded is not None:
-                try:
-                    parts.append(f"val_loss_decoded={float(val_loss_decoded):.8f}")
-                except Exception:
-                    pass
+
+            for k in ["train_loss_epoch", "val_loss", "val_mae_dec", "val_rmse_dec", "val_loss_decoded"]:
+                v = _safe_float(metrics.get(k))
+                if v is not None:
+                    parts.append(f"{k}={v:.8f}")
+
+            lr_str = self._format_lr(trainer)
             if lr_str is not None:
                 parts.append(f"lr={lr_str}")
+
             print(" | ".join(parts))
+
         def on_validation_end(self, trainer, pl_module):
-            # Print the latest best checkpoint path if available
             try:
-                # `best_ckpt_cb` is defined in the same module where callbacks are assembled
-                from builtins import best_ckpt_cb  # noqa: F401 (hint to linters; safe at runtime)
-            except Exception:
-                pass
-            try:
-                ckpt_cb = None
-                for cb in trainer.callbacks:
-                    if isinstance(cb, pl.callbacks.ModelCheckpoint):
-                        ckpt_cb = cb
-                        break
+                ckpt_cb = next((cb for cb in trainer.callbacks if isinstance(cb, pl.callbacks.ModelCheckpoint)), None)
                 if ckpt_cb and getattr(ckpt_cb, "best_model_path", ""):
                     print(f"↳ Best so far: {ckpt_cb.best_model_path}")
             except Exception:
                 pass
+  
+
 
     best_ckpt_cb = ModelCheckpoint(
         monitor="val_loss_decoded",
