@@ -1032,7 +1032,7 @@ monkey_patch_to_network_output()
 try:
     from pytorch_forecasting.models.base._base_model import BaseModel
     import torch
-
+    
     def _coerce_prediction_tensor(pred):
         """Normalize PF predictions into a tensor shaped [B, n_targets, K]."""
         # Unwrap Output wrappers/dicts
@@ -1077,21 +1077,46 @@ try:
     _orig_validation_step = BaseModel.validation_step
 
     def _patched_training_step(self, batch, batch_idx):
-        x, y, _w = batch if isinstance(batch, (list, tuple)) and len(batch) >= 2 else (batch, None, None)
-        with torch.no_grad():
-            y_hat = self(x)
+        # Accept (x, y, w), (x, y), or just x
+        if isinstance(batch, (list, tuple)):
+            if len(batch) == 3:
+                x, y, _w = batch
+            elif len(batch) == 2:
+                x, y = batch
+                _w = None
+            else:
+                x, y, _w = batch[0], None, None
+        else:
+            x, y, _w = batch, None, None
+
+        # TRAINING: do NOT disable grads
+        y_hat = self(x)
         pred = _coerce_prediction_tensor(y_hat)
-        # Compute loss via model's current loss module (handles list/tensor)
-        loss = self.loss(pred, y) if y is not None else torch.tensor(0.0, device=pred.device if torch.is_tensor(pred) else None)
+        loss = self.loss(pred, y) if y is not None else torch.tensor(
+            0.0, device=pred.device if torch.is_tensor(pred) else None
+        )
         return loss
 
     def _patched_validation_step(self, batch, batch_idx):
-        x, y, _w = batch if isinstance(batch, (list, tuple)) and len(batch) >= 2 else (batch, None, None)
+        # Accept (x, y, w), (x, y), or just x
+        if isinstance(batch, (list, tuple)):
+            if len(batch) == 3:
+                x, y, _w = batch
+            elif len(batch) == 2:
+                x, y = batch
+                _w = None
+            else:
+                x, y, _w = batch[0], None, None
+        else:
+            x, y, _w = batch, None, None
+
+        # VALIDATION: safe to disable grads
         with torch.no_grad():
             y_hat = self(x)
         pred = _coerce_prediction_tensor(y_hat)
-        loss = self.loss(pred, y) if y is not None else torch.tensor(0.0, device=pred.device if torch.is_tensor(pred) else None)
-        # Lightning is happy with just a Tensor here
+        loss = self.loss(pred, y) if y is not None else torch.tensor(
+            0.0, device=pred.device if torch.is_tensor(pred) else None
+        )
         return loss
 
     BaseModel.training_step = _patched_training_step
