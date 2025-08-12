@@ -775,44 +775,65 @@ class LearnableMultiTaskLoss(nn.Module):
         return y_pred
 
     def to_prediction(self, y_pred, normalize: bool = False, **kwargs):
-        """Return point predictions for both heads.
-        Older PF QuantileLoss.to_prediction may not accept `normalize`.
-        We try-call with normalize, then without, and finally fall back
-        to taking the median quantile explicitly.
+        """Return point predictions for both heads, robust to PF version drift.
+        Handles list/tuple or stacked-tensor heads and aligns the quantile
+        dimension before delegating to the underlying loss (if available).
         """
+        import torch as _torch
+
+        def _split_heads(t):
+            # Accept [vol, dir] or stacked tensor [..., n_targets, K]
+            if isinstance(t, (list, tuple)):
+                vol = self._ensure_tensor(t[0])
+                dir_ = self._ensure_tensor(t[1]) if len(t) > 1 else None
+                return vol, dir_
+            if _torch.is_tensor(t):
+                if t.ndim >= 3:  # [..., n_targets, K]
+                    n_targets = t.size(-2)
+                    vol = t.select(dim=-2, index=0)
+                    dir_ = t.select(dim=-2, index=1) if n_targets > 1 else None
+                    return vol, dir_
+                return t, None
+            return t, None
+
         def _median_quantile(t):
             t = self._ensure_tensor(t)
             # squeeze [B,1,Q] -> [B,Q]
             if t.ndim == 3 and t.size(1) == 1:
                 t = t.squeeze(1)
-            # if last dim looks like quantiles, take middle index
             if t.ndim >= 2 and t.size(-1) > 1:
-                try:
-                    qn = len(getattr(self.loss_vol, "quantiles", []))
-                except Exception:
-                    qn = None
-                idx = (t.size(-1) // 2) if not qn else min(t.size(-1) - 1, qn // 2)
-                return t[..., idx]
-            # else already scalar per sample
+                return t[..., t.size(-1) // 2]
             return t.squeeze(-1)
 
-        if isinstance(y_pred, (list, tuple)) and len(y_pred) >= 1:
-            vol = self._ensure_tensor(y_pred[0])
-            dir_ = self._ensure_tensor(y_pred[1]) if len(y_pred) > 1 else None
-            # Try delegated conversion first
-            if hasattr(self.loss_vol, "to_prediction"):
-                try:
-                    vol = self.loss_vol.to_prediction(vol, normalize=normalize, **kwargs)
-                except TypeError:
-                    # Older signature without `normalize`
-                    try:
-                        vol = self.loss_vol.to_prediction(vol, **kwargs)
-                    except TypeError:
-                        vol = _median_quantile(vol)
+        vol, dir_ = _split_heads(y_pred)
+
+        # Ensure quantile dimension matches configured quantiles before delegating
+        try:
+            q = len(getattr(self.loss_vol, "quantiles", []))
+        except Exception:
+            q = None
+        if q and _torch.is_tensor(vol) and vol.ndim >= 2 and vol.size(-1) != q:
+            if vol.size(-1) == 1:
+                vol = vol.repeat_interleave(q, dim=-1)
             else:
-                vol = _median_quantile(vol)
-            return [vol, dir_]
-        return y_pred
+                vol = vol.mean(dim=-1, keepdim=True).repeat_interleave(q, dim=-1)
+
+        # Try the underlying loss' converter first (new and old signatures)
+        if hasattr(self.loss_vol, "to_prediction"):
+            try:
+                vol_out = self.loss_vol.to_prediction(vol, normalize=normalize, **kwargs)
+                return [vol_out, dir_]
+            except TypeError:
+                try:
+                    vol_out = self.loss_vol.to_prediction(vol, **kwargs)
+                    return [vol_out, dir_]
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        # Fallback: use median quantile explicitly
+        return [_median_quantile(vol), dir_]
 
 # -----------------------------------------------------------------------
 # Mini-MLP dual head: one branch for volatility quantiles, one for direction logit
@@ -1825,61 +1846,4 @@ if resume_ckpt:
             fit_loop = getattr(trainer, "fit_loop", None)
             if fit_loop is not None and getattr(fit_loop, "max_epochs", None) is not None:
                 if fit_loop.max_epochs < need:
-                    print(f"[INFO] Bumping Trainer.max_epochs {fit_loop.max_epochs} → {need} to match checkpoint epoch {_epoch}.")
-                    fit_loop.max_epochs = need
-    except Exception as e:
-        print(f"[WARN] Could not inspect checkpoint epoch: {e}. Proceeding without bump.")
-
-print("▶ Starting training …")
-trainer.fit(tft, train_dataloader, val_dataloader, ckpt_path=resume_ckpt)
-# -----------------------------------------------------------------------
-# Permutation Feature Importance (fast, limited val batches)
-
-if ENABLE_FEATURE_IMPORTANCE:
-    try:
-        print("▶ Running permutation feature importance …")
-
-        rng = np.random.default_rng(SEED)
-
-        def _permute_by_blocks(
-            df_in: pd.DataFrame,
-            col: str,
-            group_col: str = GROUP_ID[0],
-            block_size: int = PERM_BLOCK_SIZE,
-        ) -> pd.DataFrame:
-            """
-            Shuffle contiguous blocks of length `block_size` within each group for column `col`.
-            Preserves order inside each block but permutes the block order to break temporal alignment.
-            """
-            df = df_in.copy()
-            if col not in df.columns:
-                return df
-            if block_size is None or block_size <= 0:
-                return df
-
-            for g, sub in df.groupby(group_col, sort=False):
-                idx = sub.index.to_numpy()
-                n = idx.size
-                if n == 0:
-                    continue
-
-                # Build contiguous blocks
-                starts = np.arange(0, n, block_size)
-                blocks = [idx[s : s + block_size] for s in starts]
-                if len(blocks) <= 1:
-                    continue
-
-                # Permute block order using the RNG defined above
-                perm = rng.permutation(len(blocks))
-                new_order = np.concatenate([blocks[i] for i in perm])
-
-                # Reassign column values according to permuted block order
-                df.loc[idx, col] = df.loc[new_order, col].to_numpy()
-
-            return df
-
-        # …call _permute_by_blocks(...) here as needed …
-
-    except Exception as e:
-        print(f"Feature importance failed: {e}")
-        
+                    print(f"[INFO] Bumping Trainer.max_epoc<truncated__content/>
