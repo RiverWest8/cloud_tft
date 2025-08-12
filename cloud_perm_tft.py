@@ -664,8 +664,8 @@ class LearnableMultiTaskLoss(nn.Module):
     total = exp(-s1) * L1 + exp(-s2) * L2 + (s1 + s2)
 
     Expects y_pred = [pred_vol, pred_dir] where:
-    - pred_vol shape: [..., Q] (tensor) for Q quantiles
-    - pred_dir shape: [..., 1] (tensor) for single logit
+    - pred_vol shape: [B, T, Q] (tensor) for quantiles
+    - pred_dir shape: [B, T] (tensor) for classification
     """
 
     def __init__(self, loss_vol: nn.Module, loss_dir: nn.Module, init_weights=(1.0, 0.5)):
@@ -673,113 +673,79 @@ class LearnableMultiTaskLoss(nn.Module):
         self.loss_vol = loss_vol
         self.loss_dir = loss_dir
         w1, w2 = float(init_weights[0]), float(init_weights[1])
-        self.s = nn.Parameter(
-            torch.tensor([-np.log(max(w1, 1e-8)), -np.log(max(w2, 1e-8))], dtype=torch.float32)
-        )
+        self.s = nn.Parameter(torch.tensor([-np.log(max(w1, 1e-8)),
+                                            -np.log(max(w2, 1e-8))],
+                                           dtype=torch.float32))
 
-    # ---------- helpers ----------
     @staticmethod
     def _ensure_tensor(x):
         """Convert any nested list/tuple of tensors into a single torch.Tensor."""
         if torch.is_tensor(x):
             return x
         if isinstance(x, (list, tuple)):
-            flat = [LearnableMultiTaskLoss._ensure_tensor(t) for t in x]
+            # Recursively flatten
+            flat = []
+            for item in x:
+                t = LearnableMultiTaskLoss._ensure_tensor(item)
+                flat.append(t)
             try:
-                return torch.stack(flat, dim=-1)
-            except Exception:
+                return torch.stack(flat, dim=-1)  # stack into quantile dimension
+            except RuntimeError:
+                # If already stacked correctly, just return the first element
                 return flat[0]
         raise TypeError(f"Expected Tensor/List/Tuple, got {type(x)}")
 
-    @staticmethod
-    def _align_last_dim(x: torch.Tensor, want: int) -> torch.Tensor:
-        """Ensure x's last dimension equals `want` by sensible replication/slicing."""
-        if x.ndim == 0:
-            x = x.unsqueeze(0)
-        have = int(x.shape[-1]) if x.ndim >= 1 else 1
-        if have == want:
-            return x
-        if have == 1:
-            # replicate a single channel across quantiles/logit slots
-            return x.repeat_interleave(want, dim=-1)
-        if have > want:
-            # take the first `want` channels
-            return x[..., :want]
-        # have < want and have > 1: tile to fill, then trim
-        reps = int(np.ceil(want / max(have, 1)))
-        x_rep = x.repeat_interleave(reps, dim=-1)
-        return x_rep[..., :want]
-
-    @staticmethod
-    def _ensure_2d(x: torch.Tensor) -> torch.Tensor:
-        """Collapse any middle dims so metrics seeing [B, Q] or [B, 1] still work."""
-        if x.ndim >= 3:
-            # collapse all but batch and last
-            new_shape = (x.shape[0], -1, x.shape[-1])
-            x = x.reshape(new_shape)
-            # if prediction length ends up >1, average across it
-            if x.shape[1] > 1:
-                x = x.mean(dim=1)
-            else:
-                x = x.squeeze(1)
-        return x
-
-    def _prepare_heads(self, y_pred):
-        if not (isinstance(y_pred, (list, tuple)) and len(y_pred) >= 2):
-            raise TypeError("LearnableMultiTaskLoss expects y_pred as [vol_pred, dir_pred]")
-        p_vol = self._ensure_tensor(y_pred[0])
-        p_dir = self._ensure_tensor(y_pred[1])
-        # Align shapes to what the sub-losses expect
-        q_list = getattr(self.loss_vol, "quantiles", None)
-        qn = int(len(q_list)) if q_list is not None else (p_vol.shape[-1] if p_vol.ndim > 0 else 7)
-        p_vol = self._align_last_dim(p_vol, qn)
-        p_dir = self._align_last_dim(p_dir, 1)
-        # Collapse any time/extra dims for the metric's update loop
-        p_vol = self._ensure_2d(p_vol)  # [B, Q]
-        p_dir = self._ensure_2d(p_dir)  # [B, 1]
-        return p_vol, p_dir
-
     def _unpack_targets(self, target):
+        # Accept missing direction target; return (yv, yd_or_none)
         if torch.is_tensor(target):
-            if target.ndim == 3 and target.size(-1) >= 2:
-                return target[..., 0], target[..., 1]
-            if target.ndim == 2 and target.size(-1) >= 2:
-                return target[:, 0], target[:, 1]
+            if target.ndim == 3 and target.size(-1) >= 1:
+                yv = target[..., 0]
+                yd = target[..., 1] if target.size(-1) > 1 else None
+                return yv, yd
+            if target.ndim == 2 and target.size(-1) >= 1:
+                yv = target[:, 0]
+                yd = target[:, 1] if target.size(-1) > 1 else None
+                return yv, yd
             raise ValueError(f"Unexpected target shape: {target.shape}")
-        if isinstance(target, (list, tuple)) and len(target) >= 2:
-            yv, yd = target
+        if isinstance(target, (list, tuple)) and len(target) >= 1:
+            yv = target[0]
+            yd = target[1] if len(target) > 1 else None
             if torch.is_tensor(yv) and yv.ndim >= 3 and yv.size(-1) == 1:
                 yv = yv[..., 0]
-            if torch.is_tensor(yd) and yd.ndim >= 3 and yd.size(-1) == 1:
+            if isinstance(yd, torch.Tensor) and yd.ndim >= 3 and yd.size(-1) == 1:
                 yd = yd[..., 0]
             return yv, yd
-        raise TypeError("LearnableMultiTaskLoss expects target with two channels or list of two tensors")
+        raise TypeError("LearnableMultiTaskLoss expects target with at least one channel or a list/tuple")
 
     def forward(self, y_pred, target, **kwargs):
-        p_vol, p_dir = self._prepare_heads(y_pred)
+        if not (isinstance(y_pred, (list, tuple)) and len(y_pred) >= 2):
+            raise TypeError("LearnableMultiTaskLoss expects y_pred as [vol_pred, dir_pred]")
+
+        p_vol = self._ensure_tensor(y_pred[0])
+        p_dir = self._ensure_tensor(y_pred[1])
+
+        # --- Unpack targets (allow missing direction) ---
         yv, yd = self._unpack_targets(target)
-        # Make sure target dims match [B] vs [B,1]
-        if torch.is_tensor(yv) and yv.ndim > 1:
-            yv = yv.reshape(yv.shape[0], -1)
-            if yv.shape[1] > 1:
-                yv = yv.mean(dim=1)
-        if torch.is_tensor(yd) and yd.ndim > 1:
-            yd = yd.reshape(yd.shape[0], -1)
-            if yd.shape[1] > 1:
-                yd = yd[:, 0]
-        # Compute individual losses
+
+        # Compute individual losses (allow missing direction target)
         L1 = self.loss_vol(p_vol, yv)
-        L2 = self.loss_dir(p_dir, yd)
         if hasattr(L1, "mean"):
             L1 = L1.mean()
-        if hasattr(L2, "mean"):
-            L2 = L2.mean()
+
+        L2 = None
+        if isinstance(yd, torch.Tensor) and yd.numel() > 0:
+            L2 = self.loss_dir(p_dir, yd)
+            if hasattr(L2, "mean"):
+                L2 = L2.mean()
+        else:
+            # no direction labels present in this batch → zero contribution
+            L2 = torch.zeros((), device=p_vol.device, dtype=p_vol.dtype)
+
         weights = torch.exp(-self.s)
         return weights[0] * L1 + weights[1] * L2 + self.s.sum()
 
     # ---- PF hooks ----
     def rescale_parameters(self, y_pred, **kwargs):
-        # Only the vol head has parameters to rescale; dir is logits
         if isinstance(y_pred, (list, tuple)) and len(y_pred) >= 1:
             vol = self._ensure_tensor(y_pred[0])
             dir_ = self._ensure_tensor(y_pred[1]) if len(y_pred) > 1 else None
@@ -1841,133 +1807,4 @@ if ENABLE_FEATURE_IMPORTANCE:
                 # Permute block order
                 rng.shuffle(block_ids)
                 # Reorder indices by permuted block ids but keep within-block order
-                order = np.argsort(block_ids, kind="stable")
-                df.loc[idx, col] = sub[col].to_numpy()[order]
-            return df
-
-        # Build a lightweight validation-only Trainer with a cap on batches
-        fi_trainer = Trainer(
-            accelerator=ACCELERATOR,
-            devices=DEVICES,
-            precision=PRECISION,
-            logger=False,
-            enable_checkpointing=False,
-            limit_val_batches=int(FI_MAX_BATCHES),
-            enable_progress_bar=False,
-        )
-        # Reload best checkpoint before FI for consistent evaluation
-        try:
-            best_ckpt_path = best_ckpt_cb.best_model_path   
-            if best_ckpt_path and os.path.exists(best_ckpt_path):
-                print(f"[FI] Loading best model checkpoint: {best_ckpt_path}")
-                tft = tft.__class__.load_from_checkpoint(best_ckpt_path)
-
-                # Re-attach DualHead after loading checkpoint (keep loss etc. unchanged)
-                dual_head = DualHead(hidden_size=int(getattr(tft.hparams, "hidden_size", 64)))
-                p0 = 1.0 / (1.0 + 1.1)                      # pos_weight=1.1 prior
-                bias0 = float(np.log(p0 / (1.0 - p0)))
-                with torch.no_grad():
-                    dual_head.dir[-1].bias.data.fill_(bias0)
-                tft.output_layer = DualOutputModule(dual_head.vol, dual_head.dir)
-            else:
-                print("[FI][WARN] No best checkpoint found; using current model state.")
-        except Exception as e:
-            print(f"[FI][WARN] Failed to load best checkpoint: {e}")
-
-        # Baseline loss on the *original* validation set (limited batches)
-        base_metrics = fi_trainer.validate(tft, dataloaders=val_dataloader, verbose=False)
-        baseline = float(base_metrics[0].get("val_loss", np.nan)) if base_metrics else np.nan
-        print(f"[FI] Baseline val_loss (first {FI_MAX_BATCHES} batches): {baseline:.8f}")
-
-        # Candidate features: both unknown and known reals used by the model
-        fi_features = list(dict.fromkeys(time_varying_unknown_reals + time_varying_known_reals))
-
-        # Use single-threaded DataLoader for FI to avoid spawning many worker pools
-        fi_num_workers = 0
-        fi_persist = False
-        fi_pin = False
-        loader_kwargs = dict(
-            train=False,
-            batch_size=batch_size,
-            num_workers=fi_num_workers,
-            persistent_workers=fi_persist,
-            pin_memory=fi_pin,
-        )
-
-        # Checkpoint file to allow resuming FI if interrupted (stable name)
-        fi_ckpt_path = LOCAL_OUTPUT_DIR / "tft_perm_importance_checkpoint.csv"
-        done_features = set()
-        if fi_ckpt_path.exists():
-            try:
-                import pandas as _pd
-                _ck = _pd.read_csv(fi_ckpt_path)
-                if "feature" in _ck.columns:
-                    done_features = set(_ck["feature"].astype(str).tolist())
-                    print(f"[FI] Resume detected: {len(done_features)} features already computed, will skip them.")
-            except Exception as _e:
-                print(f"[FI][WARN] Could not read FI checkpoint: {_e}")
-
-        fi_rows = []
-        for feat in fi_features:
-            if feat in done_features:
-                # print(f"[FI] {feat}: skipped (already in checkpoint)")
-                continue
-            try:
-                perm_df = _permute_by_blocks(val_df, feat)
-                perm_ds = build_dataset(perm_df, predict=False)
-                perm_loader = perm_ds.to_dataloader(**loader_kwargs)
-                m = fi_trainer.validate(tft, dataloaders=perm_loader, verbose=False)
-                perm_loss = float(m[0].get("val_loss", np.nan)) if m else np.nan
-                delta = perm_loss - baseline if (np.isfinite(perm_loss) and np.isfinite(baseline)) else np.nan
-                print(f"  • {feat:>30s} Δloss = {delta:+.6f}")
-                fi_rows.append({"feature": feat, "baseline_val_loss": baseline, "perm_val_loss": perm_loss, "delta": delta})
-                # Append the row to the checkpoint file
-                try:
-                    import pandas as _pd
-                    _row_df = _pd.DataFrame([fi_rows[-1]])
-                    _row_df.to_csv(fi_ckpt_path, mode="a", header=not fi_ckpt_path.exists(), index=False)
-                except Exception as _e:
-                    print(f"[FI][WARN] Could not append FI checkpoint: {_e}")
-                try:
-                    del perm_loader
-                    del perm_ds
-                except Exception:
-                    pass
-                import gc as _gc
-                _gc.collect()
-            except Exception as e:
-                print(f"[FI][WARN] Failed on feature '{feat}': {e}")
-
-        import gc as _gc
-        _gc.collect()
-
-        # Save to CSV locally and upload to GCS (merge checkpoint + current rows)
-        try:
-            import pandas as _pd
-            _all_rows = fi_rows.copy()
-            if fi_ckpt_path.exists():
-                try:
-                    _prev = _pd.read_csv(fi_ckpt_path)
-                    _all_rows.extend(_prev.to_dict("records"))
-                except Exception as _e:
-                    print(f"[FI][WARN] Could not merge FI checkpoint: {_e}")
-            # Drop duplicates by feature, keep last (current run wins)
-            _df = _pd.DataFrame(_all_rows)
-            if not _df.empty:
-                _df = _df.drop_duplicates(subset=["feature"], keep="last")
-                fi_path = LOCAL_OUTPUT_DIR / f"tft_perm_importance_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv"
-                _df.sort_values("delta", ascending=False).to_csv(fi_path, index=False)
-                print(f"✓ Saved permutation importance → {fi_path}")
-                try:
-                    upload_file_to_gcs(str(fi_path), f"{GCS_OUTPUT_PREFIX}/{fi_path.name}")
-                except Exception as ue:
-                    print(f"[WARN] Could not upload FI CSV: {ue}")
-            else:
-                print("[FI][WARN] No FI rows collected; nothing to save.")
-        except Exception as se:
-            print(f"[FI][WARN] Could not save FI CSV: {se}")
-
-    except Exception as e:
-        print(f"[FI][WARN] Permutation importance failed: {e}")
-else:
-    print("[FI] Skipped (ENABLE_FEATURE_IMPORTANCE is False).")
+                order = np.argsort(block_ids, k<truncated__content/>
