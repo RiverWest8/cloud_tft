@@ -1431,7 +1431,6 @@ if __name__ == "__main__":
         log_val_interval=10,
         reduce_on_plateau_patience=5,
         reduce_on_plateau_min_lr=1e-5,
-        log_interpretations=False,
     )
     optimizer_params={"weight_decay": WEIGHT_DECAY}
     if isinstance(getattr(tft, "output_layer", None), DualOutputModule):
