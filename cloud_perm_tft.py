@@ -1901,6 +1901,7 @@ if __name__ == "__main__":
     # -----------------------------------------------------------------------
     # Permutation Feature Importance (runs after training)
     # -----------------------------------------------------------------------
+    
     try:
         if ENABLE_FEATURE_IMPORTANCE:
             print("▶ Computing permutation feature importance …")
@@ -1910,6 +1911,37 @@ if __name__ == "__main__":
             import torch as _torch
             from pytorch_forecasting import TimeSeriesDataSet as _TSD
 
+            # --- Robustly obtain the raw validation dataframe ---
+            def _get_val_dataframe():
+                # 1) Prefer the original val_df if it still exists
+                v = globals().get("val_df", None)
+                if isinstance(v, _pd.DataFrame):
+                    return v
+                # 2) Try dataset.data (PF stores the backing frame here on most versions)
+                try:
+                    d = getattr(validation_dataset, "data", None)
+                    if isinstance(d, _pd.DataFrame):
+                        return d
+                except Exception:
+                    pass
+                # 3) Try to_pandas() (available on some versions)
+                try:
+                    d = validation_dataset.to_pandas()
+                    if isinstance(d, _pd.DataFrame):
+                        return d
+                except Exception:
+                    pass
+                raise TypeError("Could not obtain validation DataFrame for FI; val_df/validation_dataset.data missing")
+
+            _val_df_src = _get_val_dataframe().copy()
+            # Basic column sanity and dtype harmonisation
+            required_cols = {"asset", "time_idx"}
+            if not required_cols.issubset(_val_df_src.columns):
+                raise KeyError(f"Validation frame missing required columns {required_cols} — has: {sorted(_val_df_src.columns)}")
+            _val_df_src["asset"] = _val_df_src["asset"].astype(str)
+            _val_df_src["time_idx"] = _pd.to_numeric(_val_df_src["time_idx"], errors="coerce").astype("Int64").astype("int64")
+
+            # Helper: move nested batch to device/dtype
             def _move_batch_to_device(obj, device, param_dtype):
                 if _torch.is_tensor(obj):
                     if obj.dtype.is_floating_point:
@@ -1946,23 +1978,26 @@ if __name__ == "__main__":
                     n += 1
                 return (total / max(n, 1))
 
-            # --- baseline on the existing validation dataloader ---
+            # --- Baseline using the existing validation dataloader ---
             baseline_loss = _evaluate_val_loss(tft, val_dataloader, max_batches=FI_MAX_BATCHES)
             print(f"[FI] Baseline val loss (first {FI_MAX_BATCHES} batches): {baseline_loss:.6f}")
 
-            # Candidate features to permute: calendar + unknown reals (skip PF internals)
-            fi_features = list((calendar_cols + ["Is_Weekend"]) + time_varying_unknown_reals)
+            # Candidate features: calendar + unknown reals that are actually present in the frame
+            _candidate_feats = list((calendar_cols + ["Is_Weekend"]) + time_varying_unknown_reals)
+            fi_features = [f for f in _candidate_feats if f in _val_df_src.columns]
+            if not fi_features:
+                raise ValueError("No candidate FI features found in validation frame — nothing to permute.")
 
+            # Group-wise, contiguous-block permutation (per asset)
             def _permute_blocks_by_asset(df_in: _pd.DataFrame, feature: str, block: int, seed: int) -> _pd.Series:
                 rng = _np.random.default_rng(seed)
-
                 def _permute_one(s: _pd.Series) -> _pd.Series:
                     n = len(s)
                     if n <= 1:
                         return s
                     if block is None or block <= 1:
                         return s.sample(frac=1.0, random_state=seed)
-                    # split into contiguous blocks and shuffle their order
+                    # Build contiguous blocks and shuffle their order
                     slices = [slice(i, min(i + block, n)) for i in range(0, n, block)]
                     order = rng.permutation(len(slices))
                     out = s.copy().to_numpy()
@@ -1973,18 +2008,17 @@ if __name__ == "__main__":
                         out[pos:pos + ln] = s.iloc[sl].to_numpy()
                         pos += ln
                     return _pd.Series(out, index=s.index)
-
                 return df_in.groupby("asset", group_keys=False)[feature].apply(_permute_one)
 
             results = []
             for feat in fi_features:
                 try:
-                    if feat not in val_df.columns:
-                        print(f"[FI][SKIP] {feat} not in validation frame; skipping.")
-                        continue
-                    dfp = val_df.copy(deep=True)
+                    print(f"[FI] Permuting feature: {feat}")
+                    dfp = _val_df_src.copy(deep=True)
+                    # The returned Series keeps the original index — assignment by index is safe
                     dfp[feat] = _permute_blocks_by_asset(dfp, feat, PERM_BLOCK_SIZE, SEED)
-                    # Build a validation dataset from training_dataset to reuse encoders/normalizers
+
+                    # Rebuild a validation dataset from the training template to reuse encoders
                     ds_perm = _TSD.from_dataset(training_dataset, dfp, predict=False, stop_randomization=True)
                     dl_perm = ds_perm.to_dataloader(
                         train=False,
@@ -1994,6 +2028,7 @@ if __name__ == "__main__":
                         prefetch_factor=prefetch,
                         pin_memory=pin,
                     )
+
                     perm_loss = _evaluate_val_loss(tft, dl_perm, max_batches=FI_MAX_BATCHES)
                     delta = perm_loss - baseline_loss
                     results.append((feat, float(perm_loss), float(delta)))
