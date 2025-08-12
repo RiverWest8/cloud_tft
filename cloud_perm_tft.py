@@ -664,8 +664,8 @@ class LearnableMultiTaskLoss(nn.Module):
     total = exp(-s1) * L1 + exp(-s2) * L2 + (s1 + s2)
 
     Expects y_pred = [pred_vol, pred_dir] where:
-    - pred_vol shape: [B, T, Q] (tensor) for quantiles
-    - pred_dir shape: [B, T] (tensor) for classification
+    - pred_vol shape: [..., Q] (tensor) for Q quantiles
+    - pred_dir shape: [..., 1] (tensor) for single logit
     """
 
     def __init__(self, loss_vol: nn.Module, loss_dir: nn.Module, init_weights=(1.0, 0.5)):
@@ -673,66 +673,113 @@ class LearnableMultiTaskLoss(nn.Module):
         self.loss_vol = loss_vol
         self.loss_dir = loss_dir
         w1, w2 = float(init_weights[0]), float(init_weights[1])
-        self.s = nn.Parameter(torch.tensor([-np.log(max(w1, 1e-8)),
-                                            -np.log(max(w2, 1e-8))],
-                                           dtype=torch.float32))
+        self.s = nn.Parameter(
+            torch.tensor([-np.log(max(w1, 1e-8)), -np.log(max(w2, 1e-8))], dtype=torch.float32)
+        )
 
+    # ---------- helpers ----------
     @staticmethod
     def _ensure_tensor(x):
         """Convert any nested list/tuple of tensors into a single torch.Tensor."""
         if torch.is_tensor(x):
             return x
         if isinstance(x, (list, tuple)):
-            # Recursively flatten
-            flat = []
-            for item in x:
-                t = LearnableMultiTaskLoss._ensure_tensor(item)
-                flat.append(t)
+            flat = [LearnableMultiTaskLoss._ensure_tensor(t) for t in x]
             try:
-                return torch.stack(flat, dim=-1)  # stack into quantile dimension
-            except RuntimeError:
-                # If already stacked correctly, just return the first element
+                return torch.stack(flat, dim=-1)
+            except Exception:
                 return flat[0]
         raise TypeError(f"Expected Tensor/List/Tuple, got {type(x)}")
 
-    def forward(self, y_pred, target, **kwargs):
+    @staticmethod
+    def _align_last_dim(x: torch.Tensor, want: int) -> torch.Tensor:
+        """Ensure x's last dimension equals `want` by sensible replication/slicing."""
+        if x.ndim == 0:
+            x = x.unsqueeze(0)
+        have = int(x.shape[-1]) if x.ndim >= 1 else 1
+        if have == want:
+            return x
+        if have == 1:
+            # replicate a single channel across quantiles/logit slots
+            return x.repeat_interleave(want, dim=-1)
+        if have > want:
+            # take the first `want` channels
+            return x[..., :want]
+        # have < want and have > 1: tile to fill, then trim
+        reps = int(np.ceil(want / max(have, 1)))
+        x_rep = x.repeat_interleave(reps, dim=-1)
+        return x_rep[..., :want]
+
+    @staticmethod
+    def _ensure_2d(x: torch.Tensor) -> torch.Tensor:
+        """Collapse any middle dims so metrics seeing [B, Q] or [B, 1] still work."""
+        if x.ndim >= 3:
+            # collapse all but batch and last
+            new_shape = (x.shape[0], -1, x.shape[-1])
+            x = x.reshape(new_shape)
+            # if prediction length ends up >1, average across it
+            if x.shape[1] > 1:
+                x = x.mean(dim=1)
+            else:
+                x = x.squeeze(1)
+        return x
+
+    def _prepare_heads(self, y_pred):
         if not (isinstance(y_pred, (list, tuple)) and len(y_pred) >= 2):
             raise TypeError("LearnableMultiTaskLoss expects y_pred as [vol_pred, dir_pred]")
-
         p_vol = self._ensure_tensor(y_pred[0])
         p_dir = self._ensure_tensor(y_pred[1])
+        # Align shapes to what the sub-losses expect
+        q_list = getattr(self.loss_vol, "quantiles", None)
+        qn = int(len(q_list)) if q_list is not None else (p_vol.shape[-1] if p_vol.ndim > 0 else 7)
+        p_vol = self._align_last_dim(p_vol, qn)
+        p_dir = self._align_last_dim(p_dir, 1)
+        # Collapse any time/extra dims for the metric's update loop
+        p_vol = self._ensure_2d(p_vol)  # [B, Q]
+        p_dir = self._ensure_2d(p_dir)  # [B, 1]
+        return p_vol, p_dir
 
-        # --- Unpack targets ---
+    def _unpack_targets(self, target):
         if torch.is_tensor(target):
             if target.ndim == 3 and target.size(-1) >= 2:
-                yv, yd = target[..., 0], target[..., 1]
-            elif target.ndim == 2 and target.size(-1) >= 2:
-                yv, yd = target[:, 0], target[:, 1]
-            else:
-                raise ValueError(f"Unexpected target shape: {target.shape}")
-        elif isinstance(target, (list, tuple)) and len(target) >= 2:
+                return target[..., 0], target[..., 1]
+            if target.ndim == 2 and target.size(-1) >= 2:
+                return target[:, 0], target[:, 1]
+            raise ValueError(f"Unexpected target shape: {target.shape}")
+        if isinstance(target, (list, tuple)) and len(target) >= 2:
             yv, yd = target
             if torch.is_tensor(yv) and yv.ndim >= 3 and yv.size(-1) == 1:
                 yv = yv[..., 0]
             if torch.is_tensor(yd) and yd.ndim >= 3 and yd.size(-1) == 1:
                 yd = yd[..., 0]
-        else:
-            raise TypeError("LearnableMultiTaskLoss expects target with two channels or list of two tensors")
+            return yv, yd
+        raise TypeError("LearnableMultiTaskLoss expects target with two channels or list of two tensors")
 
-        # --- Compute both losses ---
+    def forward(self, y_pred, target, **kwargs):
+        p_vol, p_dir = self._prepare_heads(y_pred)
+        yv, yd = self._unpack_targets(target)
+        # Make sure target dims match [B] vs [B,1]
+        if torch.is_tensor(yv) and yv.ndim > 1:
+            yv = yv.reshape(yv.shape[0], -1)
+            if yv.shape[1] > 1:
+                yv = yv.mean(dim=1)
+        if torch.is_tensor(yd) and yd.ndim > 1:
+            yd = yd.reshape(yd.shape[0], -1)
+            if yd.shape[1] > 1:
+                yd = yd[:, 0]
+        # Compute individual losses
         L1 = self.loss_vol(p_vol, yv)
         L2 = self.loss_dir(p_dir, yd)
         if hasattr(L1, "mean"):
             L1 = L1.mean()
         if hasattr(L2, "mean"):
             L2 = L2.mean()
-
         weights = torch.exp(-self.s)
-        total = weights[0] * L1 + weights[1] * L2 + self.s.sum()
-        return total
+        return weights[0] * L1 + weights[1] * L2 + self.s.sum()
 
     # ---- PF hooks ----
     def rescale_parameters(self, y_pred, **kwargs):
+        # Only the vol head has parameters to rescale; dir is logits
         if isinstance(y_pred, (list, tuple)) and len(y_pred) >= 1:
             vol = self._ensure_tensor(y_pred[0])
             dir_ = self._ensure_tensor(y_pred[1]) if len(y_pred) > 1 else None
