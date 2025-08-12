@@ -164,7 +164,7 @@ from pytorch_forecasting.metrics import QuantileLoss, MultiLoss
 
 
 class LabelSmoothedBCE(nn.Module):
-    def __init__(self, smoothing: float = 0.1, pos_weight: float = 1.4):
+    def __init__(self, smoothing: float = 0.1, pos_weight: float = 1.1):
         super().__init__()
         self.smoothing = smoothing
         self.register_buffer("pos_weight", torch.tensor(pos_weight))
@@ -425,9 +425,10 @@ class PerAssetMetrics(pl.Callback):
             mae = (pvi - yvi).abs().mean().item()
             mse = ((pvi - yvi) ** 2).mean().item()
             rmse = mse ** 0.5
-            sigma2_p = torch.clamp(pvi.abs(), min=eps) ** 2
-            sigma2   = torch.clamp(yvi.abs(), min=eps) ** 2
-            ratio = sigma2_p / sigma2
+            sigma2_p = torch.clamp(pvi.abs(), min=eps) ** 2  # forecast variance
+            sigma2_p = torch.clamp(sigma2_p, min=eps)
+            sigma2   = torch.clamp(yvi.abs(), min=eps) ** 2  # realized variance
+            ratio = sigma2 / sigma2_p  # true/forecast
             qlike = (ratio - torch.log(ratio) - 1.0).mean().item()
             acc = None
             if yd_cpu is not None and pd_cpu is not None and m.sum() > 0:
@@ -445,9 +446,10 @@ class PerAssetMetrics(pl.Callback):
         overall_mae = (pv_dec_all - yv_dec_all).abs().mean().item()
         overall_mse = ((pv_dec_all - yv_dec_all) ** 2).mean().item()
         overall_rmse = overall_mse ** 0.5
-        sigma2_p_all = torch.clamp(pv_dec_all.abs(), min=eps) ** 2
-        sigma2_all   = torch.clamp(yv_dec_all.abs(), min=eps) ** 2
-        ratio_all    = sigma2_p_all / sigma2_all
+        sigma2_p_all = torch.clamp(pv_dec_all.abs(), min=eps) ** 2  # forecast variance
+        sigma2_p_all = torch.clamp(sigma2_p_all, min=eps)
+        sigma2_all   = torch.clamp(yv_dec_all.abs(), min=eps) ** 2  # realized variance
+        ratio_all    = sigma2_all / sigma2_p_all  # true/forecast
         overall_qlike = (ratio_all - torch.log(ratio_all) - 1.0).mean().item()
 
         # —— expose decoded metrics, but DO NOT override PF's native val_loss ——
@@ -468,9 +470,10 @@ class PerAssetMetrics(pl.Callback):
                     yt_s = yt * 0.9 + 0.05
                     dir_bce = F.binary_cross_entropy(p, yt_s)
                 dir_bce = float(dir_bce.item())
-            # Composite validation loss
-            comp_val = float(overall_mae) + 0.4 * (float(dir_bce) if dir_bce is not None else 0.0)
+            # Composite validation metric (decoded): MAE + RMSE (direction excluded)
+            comp_val = float(overall_mae) + float(overall_rmse)
             trainer.callback_metrics["val_mae_dec"] = _torch.tensor(float(overall_mae))
+            trainer.callback_metrics["val_rmse_dec"] = _torch.tensor(float(overall_rmse))
             trainer.callback_metrics["val_dir_bce"] = _torch.tensor(float(dir_bce)) if dir_bce is not None else _torch.tensor(float('nan'))
             trainer.callback_metrics["val_loss_decoded"] = _torch.tensor(comp_val)
         except Exception:
@@ -1255,7 +1258,7 @@ if __name__ == "__main__":
                 underestimation_factor=1.115,
             ),
             LabelSmoothedBCE(smoothing=0.1),
-        ], weights=[1.0, 0.4]),
+        ], weights=[1.0, 0.1]),
         logging_metrics=[],
         log_interval=50,
         log_val_interval=10,
@@ -1380,7 +1383,7 @@ if __name__ == "__main__":
             # Pull raw values from callback_metrics when possible and format to 8 dp
             keys = (
                 "loss", "train_loss_step", "train_loss", "train_loss_epoch",
-                "val_loss", "val_loss_decoded", "val_mae_dec"
+                "val_loss", "val_loss_decoded", "val_mae_dec", "val_rmse_dec"
             )
             for k in keys:
                 try:
@@ -1448,6 +1451,8 @@ if __name__ == "__main__":
             train_loss = metrics.get("train_loss_epoch")
             val_loss = metrics.get("val_loss")
             val_mae_dec = metrics.get("val_mae_dec")
+            val_rmse_dec = metrics.get("val_rmse_dec")
+            val_loss_decoded = metrics.get("val_loss_decoded")
             lr_str = self._format_lr(trainer)
             parts = [f"✓ Epoch {trainer.current_epoch + 1}/{self.total} done"]
             if train_loss is not None:
@@ -1463,6 +1468,16 @@ if __name__ == "__main__":
             if val_mae_dec is not None:
                 try:
                     parts.append(f"val_mae_dec={float(val_mae_dec):.8f}")
+                except Exception:
+                    pass
+            if val_rmse_dec is not None:
+                try:
+                    parts.append(f"val_rmse_dec={float(val_rmse_dec):.8f}")
+                except Exception:
+                    pass
+            if val_loss_decoded is not None:
+                try:
+                    parts.append(f"val_loss_decoded={float(val_loss_decoded):.8f}")
                 except Exception:
                     pass
             if lr_str is not None:
@@ -1487,7 +1502,7 @@ if __name__ == "__main__":
                 pass
 
     best_ckpt_cb = ModelCheckpoint(
-        monitor="val_loss",
+        monitor="val_loss_decoded",
         mode="min",
         save_top_k=1,
         save_last=True,  # writes last.ckpt
@@ -1502,7 +1517,7 @@ if __name__ == "__main__":
         ckpt_uploader_cb,
         EpochPrinter(MAX_EPOCHS),
         LearningRateMonitor(logging_interval="epoch"),
-        EarlyStopping(monitor="val_loss", patience=EARLY_STOP_PATIENCE, mode="min"),
+        EarlyStopping(monitor="val_loss_decoded", patience=EARLY_STOP_PATIENCE, mode="min"),
         ComponentLossLogger(),
         LossHistory(),
         StepLossSaver(),
