@@ -1748,7 +1748,7 @@ if __name__ == "__main__":
     # Loss and output_size for multi-target: realised_vol (quantile regression), direction (classification)
     print("▶ Building model …")
     print(f"[LR] learning_rate={LR_OVERRIDE if LR_OVERRIDE is not None else 0.00187}")
-    from pytorch_forecasting.metrics import MultiLoss, AsymmetricQuantileLoss
+    from pytorch_forecasting.metrics import MultiLoss
     from my_losses import LabelSmoothedBCE  # keep your existing import path
 
     # Fixed weights
