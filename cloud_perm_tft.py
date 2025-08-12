@@ -967,46 +967,52 @@ def monkey_patch_to_network_output():
         from pytorch_forecasting.models.base._base_model import BaseModel
         import torch
 
-        def _to_network_output(self, out):
-            # PF usually returns either an Output-like object with .prediction,
-            # or a raw list/tuple of per-target tensors. We normalise to a dict
-            # holding a single tensor under key "prediction" with shape [B, n_targets, K].
-            pred = out
-            # Unwrap Output wrappers
-            if hasattr(out, "prediction"):
-                pred = out.prediction
-            elif isinstance(out, dict) and "prediction" in out:
-                pred = out["prediction"]
+        def _to_network_output(self, prediction=None, **kwargs):
+            """
+            Normalise PF outputs to a dict with a tensor under 'prediction'.
+            Accepts both the modern signature (prediction=...) and older forms.
+            """
+            pred = prediction
 
-            # If PF already gave us a tensor, just return it in the expected dict
+            # Unwrap PF Output wrappers or dicts if someone passed those through
+            if hasattr(pred, "prediction"):
+                pred = pred.prediction
+            elif isinstance(pred, dict) and "prediction" in pred:
+                pred = pred["prediction"]
+
+            # If already a tensor, return it as-is
             if torch.is_tensor(pred):
-                return {"prediction": pred}
-
-            # If it's a list/tuple of tensors (one per target), harmonise shapes and stack
-            if isinstance(pred, (list, tuple)):
+                out = {"prediction": pred}
+            # If PF gave a list/tuple (one per target), harmonise and stack
+            elif isinstance(pred, (list, tuple)):
                 processed = []
                 for p in pred:
                     if not torch.is_tensor(p):
                         continue
-                    # squeeze singleton pred_len / target dims: [B,1,7] or [B,1,1,7] -> [B,7]
+                    # squeeze singleton pred_len/target dims
                     if p.ndim == 4 and p.shape[2] == 1:
-                        p = p.squeeze(2)
+                        p = p.squeeze(2)     # [B,1,7]
                     if p.ndim == 3 and p.shape[1] == 1:
-                        p = p.squeeze(1)
-                    # If last dim is 1 (e.g., direction single logit), repeat to match K=7
+                        p = p.squeeze(1)     # [B,7]
+                    # replicate single logit or reduce 2‑logit to prob and replicate to K=7
                     if p.ndim >= 2 and p.shape[-1] == 1:
                         p = p.repeat_interleave(7, dim=-1)
-                    # If last dim is 2 (binary logits), convert to prob of class 1 then repeat
                     elif p.ndim >= 2 and p.shape[-1] == 2:
                         pos = p.softmax(-1)[..., 1].unsqueeze(-1)
                         p = pos.repeat_interleave(7, dim=-1)
                     processed.append(p)
                 if processed:
                     pred = torch.stack(processed, dim=1)  # [B, n_targets, 7]
-                    return {"prediction": pred}
+                out = {"prediction": pred}
+            else:
+                # Fallback — return whatever we got, under the expected key
+                out = {"prediction": pred}
 
-            # Fallback: return as-is in dict; better than returning a raw list
-            return {"prediction": pred}
+            # pass through other known keys if PF expects them
+            for k in ("target", "encoder_lengths", "decoder_lengths", "loss"):
+                if k in kwargs:
+                    out[k] = kwargs[k]
+            return out
 
         BaseModel.to_network_output = _to_network_output
     except Exception as e:
