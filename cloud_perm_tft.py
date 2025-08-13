@@ -1750,8 +1750,10 @@ if __name__ == "__main__":
 
     bar_cb = TQDMProgressBar()
 
-    # Example of your custom metrics callback
-    metrics_cb = PerAssetMetrics(id_to_name=rev_asset, vol_normalizer=None)
+    metrics_cb = PerAssetMetrics(
+        id_to_name=rev_asset,
+        vol_normalizer=_extract_norm_from_dataset(training_dataset)
+    )
 
     # If you have a custom checkpoint mirroring callback
     mirror_cb = MirrorCheckpoints()
