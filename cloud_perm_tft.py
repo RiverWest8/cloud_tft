@@ -1364,16 +1364,8 @@ def _evaluate_decoded_metrics(
         pin_memory=pin_memory,
     )
 
-    # Get model device (first parameter device)
-    try:
-        model_device = next(model.parameters()).device
-    except Exception:
-        model_device = torch.device("cpu")
-
     model.eval()
     y_all, p_all, yd_all, pd_all, g_all = [], [], [], [], []
-    skipped_reasons = {"no_groups":0, "no_targets":0, "bad_pred_format":0}
-
     with torch.no_grad():
         for b_idx, batch in enumerate(dl):
             if max_batches is not None and b_idx >= int(max_batches):
@@ -1384,26 +1376,20 @@ def _evaluate_decoded_metrics(
             else:
                 x, y = batch, None
 
-            if not isinstance(x, dict):
-                skipped_reasons["bad_pred_format"] += 1
-                continue
+            y_hat = model(x)
+            pred = getattr(y_hat, "prediction", y_hat)
 
-            # ---- groups (robust) ----
-            g = x.get("groups") or x.get("group_ids")
-            if isinstance(g, (list, tuple)) and len(g) > 0:
+            # groups for decoding
+            g = x.get("groups")
+            if isinstance(g, (list, tuple)):
                 g = g[0]
             if torch.is_tensor(g) and g.ndim > 1 and g.size(-1) == 1:
                 g = g.squeeze(-1)
-            if not torch.is_tensor(g):
-                skipped_reasons["no_groups"] += 1
-                continue
 
-            # ---- targets (robust) ----
+            # decoder target
+            dec_t = x.get("decoder_target")
             y_vol = None
             y_dir = None
-
-            # Preferred: decoder_target
-            dec_t = x.get("decoder_target") or x.get("target")
             if torch.is_tensor(dec_t):
                 t = dec_t
                 if t.ndim == 3 and t.size(-1) == 1:
@@ -1411,39 +1397,15 @@ def _evaluate_decoded_metrics(
                 if t.ndim == 2 and t.size(1) >= 1:
                     y_vol = t[:, 0]
                     y_dir = t[:, 1] if t.size(1) > 1 else None
-
-            # Fallback: dataloader second item
-            if (y_vol is None or (y_dir is None and y is not None)) and torch.is_tensor(y):
+            if y_vol is None and torch.is_tensor(y):
                 t = y
                 if t.ndim == 3 and t.size(1) == 1:
                     t = t[:, 0, :]
                 if t.ndim == 2 and t.size(1) >= 1:
-                    if y_vol is None:
-                        y_vol = t[:, 0]
-                    if y_dir is None and t.size(1) > 1:
-                        y_dir = t[:, 1]
+                    y_vol = t[:, 0]
+                    y_dir = t[:, 1] if t.size(1) > 1 else y_dir
 
-            if not torch.is_tensor(y_vol):
-                skipped_reasons["no_targets"] += 1
-                continue
-
-            # ---- forward pass (move to model device) ----
-            # Move only tensors inside x that are torch.Tensors
-            x_dev = {}
-            for k, v in x.items():
-                if torch.is_tensor(v):
-                    x_dev[k] = v.to(model_device, non_blocking=True)
-                elif isinstance(v, (list, tuple)):
-                    x_dev[k] = [vv.to(model_device, non_blocking=True) if torch.is_tensor(vv) else vv for vv in v]
-                else:
-                    x_dev[k] = v
-
-            y_hat = model(x_dev)
-            pred = getattr(y_hat, "prediction", y_hat)
-            if isinstance(pred, dict) and "prediction" in pred:
-                pred = pred["prediction"]
-
-            # ---- extract heads ----
+            # take median quantile for vol and extract direction logit/prob
             def _median_q(t):
                 if torch.is_tensor(t) and t.ndim == 3 and t.size(1) == 1:
                     t = t.squeeze(1)
@@ -1465,14 +1427,14 @@ def _evaluate_decoded_metrics(
                     p_vol = _median_q(t)
                     p_dir = None
                 else:
-                    skipped_reasons["bad_pred_format"] += 1
-                    continue
+                    p_vol = t
+                    p_dir = None
             else:
-                skipped_reasons["bad_pred_format"] += 1
+                # Skip this batch if predictions are not in an expected format
                 continue
 
-            if not (torch.is_tensor(p_vol) and torch.is_tensor(g)):
-                skipped_reasons["bad_pred_format"] += 1
+            if not (torch.is_tensor(y_vol) and torch.is_tensor(p_vol) and torch.is_tensor(g)):
+                # Skip this batch if we couldn't extract targets/preds/groups
                 continue
 
             # collapse dir head to single logit if needed
@@ -1482,10 +1444,10 @@ def _evaluate_decoded_metrics(
 
             # decode back to physical scale (vol only)
             try:
-                y_dec = vol_norm.decode(y_vol.to(model_device).unsqueeze(-1), group_ids=g.to(model_device).unsqueeze(-1)).squeeze(-1)
-                p_dec = vol_norm.decode(p_vol.to(model_device).unsqueeze(-1), group_ids=g.to(model_device).unsqueeze(-1)).squeeze(-1)
+                y_dec = vol_norm.decode(y_vol.unsqueeze(-1), group_ids=g.unsqueeze(-1)).squeeze(-1)
+                p_dec = vol_norm.decode(p_vol.unsqueeze(-1), group_ids=g.unsqueeze(-1)).squeeze(-1)
             except Exception:
-                y_dec, p_dec = y_vol.to(model_device), p_vol.to(model_device)
+                y_dec, p_dec = y_vol, p_vol
 
             y_all.append(y_dec.detach().cpu())
             p_all.append(p_dec.detach().cpu())
@@ -1497,7 +1459,6 @@ def _evaluate_decoded_metrics(
 
     if not y_all:
         print("[FI] No valid batches produced targets/predictions; dataset may be empty or shapes unexpected.")
-        print(f"[FI] Skips — groups:{skipped_reasons['no_groups']}, targets:{skipped_reasons['no_targets']}, pred:{skipped_reasons['bad_pred_format']}")
         return float("nan"), float("nan"), float("nan"), float("nan"), 0
 
     y = torch.cat(y_all)
@@ -1546,10 +1507,6 @@ def run_permutation_importance(
     Saves CSV with: feature, baseline_val_loss, permuted_val_loss, delta, mae, rmse, dir_bce, n.
     """
     ds_base = build_ds_fn(base_df, predict=False)
-    try:
-        print(f"[FI] Dataset size (samples): {len(ds_base)} | batch_size={batch_size}")
-    except Exception:
-        pass
     b_mae, b_rmse, b_dir, b_val, n = _evaluate_decoded_metrics(
         model, ds_base, batch_size, max_batches, num_workers, prefetch, pin_memory
     )
