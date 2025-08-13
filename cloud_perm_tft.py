@@ -230,7 +230,7 @@ if not hasattr(GroupNormalizer, "decode"):
 from pytorch_forecasting.metrics import QuantileLoss, MultiLoss
 
 class LabelSmoothedBCE(nn.Module):
-    def __init__(self, smoothing: float = 0.1, pos_weight: float = 1.5):
+    def __init__(self, smoothing: float = 0.1, pos_weight: float = 4):
         super().__init__()
         self.smoothing = smoothing
         self.register_buffer("pos_weight", torch.tensor(pos_weight))
@@ -250,7 +250,7 @@ class AsymmetricQuantileLoss(QuantileLoss):
     Setting ``underestimation_factor`` > 1 makes the model pay a larger
     penalty for forecasts that are too low.
     """
-    def __init__(self, quantiles, underestimation_factor: float = 10, **kwargs):
+    def __init__(self, quantiles, underestimation_factor: float = 1.115, **kwargs):
         super().__init__(quantiles=quantiles, **kwargs)
         self.underestimation_factor = float(underestimation_factor)
 
@@ -1701,7 +1701,7 @@ if __name__ == "__main__":
         loss=MultiLoss([
             AsymmetricQuantileLoss(
                 quantiles=[0.05, 0.165, 0.25, 0.5, 0.75, 0.835, 0.95],
-                underestimation_factor= 1.115 #1.115,  # keep asymmetric penalty
+                underestimation_factor= 1.515 #1.115,  # keep asymmetric penalty
             ),
             LabelSmoothedBCE(smoothing=0.1),
         ], weights=[FIXED_VOL_WEIGHT, FIXED_DIR_WEIGHT]),
