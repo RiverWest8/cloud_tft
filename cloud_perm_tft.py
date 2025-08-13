@@ -1740,7 +1740,7 @@ if __name__ == "__main__":
         training_dataset,
         hidden_size=64,
         attention_head_size=2,
-        dropout=0.05 #0.0833704625250354,
+        dropout=0.05, #0.0833704625250354,
         hidden_continuous_size=16,
         learning_rate=(LR_OVERRIDE if LR_OVERRIDE is not None else 0.0019),
         optimizer="AdamW",
