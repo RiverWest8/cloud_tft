@@ -224,7 +224,9 @@ def _extract_y_vol_from_batch(x, y):
 def _extract_groups_from_batch(x):
     g_raw = None
     if isinstance(x, dict):
-        g_raw = x.get("groups", None) or x.get("group_ids", None)
+        g_raw = x.get("groups", None)
+        if g_raw is None:
+            g_raw = x.get("group_ids", None)
     g = None
     if torch.is_tensor(g_raw):
         g = g_raw
