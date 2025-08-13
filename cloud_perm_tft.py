@@ -15,11 +15,24 @@ from pytorch_forecasting.metrics import QuantileLoss
 # Detect if running in Google Cloud environment
 IN_CLOUD = os.getenv("CLOUD_ENV", "false").lower() == "true"
 
-# Configure paths from environment variables or use defaults
-HOME = Path.home()
-TRAIN_P = Path(os.getenv("TRAIN_PATH", str(HOME / "Desktop" / "Data" / "CleanedData" / "universal_train.parquet")))
-VAL_P   = Path(os.getenv("VAL_PATH", str(HOME / "Desktop" / "Data" / "CleanedData" / "universal_val.parquet")))
-TEST_P  = Path(os.getenv("TEST_PATH", str(HOME / "Desktop" / "Data" / "CleanedData" / "universal_test.parquet")))
+# Google Cloud Storage config
+GCS_BUCKET = os.environ.get("GCS_BUCKET", "river-ml-bucket")
+GCS_DATA_PREFIX = f"gs://{GCS_BUCKET}/Data/CleanedData"
+GCS_OUTPUT_PREFIX = f"gs://{GCS_BUCKET}/Dissertation/TFT"
+TRAIN_URI = f"{GCS_DATA_PREFIX}/universal_train.parquet"
+VAL_URI   = f"{GCS_DATA_PREFIX}/universal_val.parquet"
+TEST_URI  = f"{GCS_DATA_PREFIX}/universal_test.parquet"
+READ_PATHS = [str(TRAIN_URI), str(VAL_URI), str(TEST_URI)]
+
+if IN_CLOUD:
+    TRAIN_P = Path(TRAIN_URI)
+    VAL_P = Path(VAL_URI)
+    TEST_P = Path(TEST_URI)
+else:
+    HOME = Path.home()
+    TRAIN_P = Path(os.getenv("TRAIN_PATH", str(HOME / "Desktop" / "Data" / "CleanedData" / "universal_train.parquet")))
+    VAL_P   = Path(os.getenv("VAL_PATH", str(HOME / "Desktop" / "Data" / "CleanedData" / "universal_val.parquet")))
+    TEST_P  = Path(os.getenv("TEST_PATH", str(HOME / "Desktop" / "Data" / "CleanedData" / "universal_test.parquet")))
 
 # -----------------------
 # 0) Register asinh
