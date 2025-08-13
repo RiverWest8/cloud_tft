@@ -518,226 +518,16 @@ class PerAssetMetrics(pl.Callback):
             "rmse": overall_rmse,
             "mse": overall_mse,
             "qlike": overall_qlike,
+            "val_loss": float(overall_mae + overall_rmse) + (
+                0.05 * float(trainer.callback_metrics.get("val_dir_bce", torch.tensor(float('nan'))).item())
+                if torch.is_tensor(trainer.callback_metrics.get("val_dir_bce")) and torch.isfinite(trainer.callback_metrics["val_dir_bce"]) else 0.0
+            ),
+            "dir_bce": float(trainer.callback_metrics.get("val_dir_bce", torch.tensor(float('nan'))).item())
+                if torch.is_tensor(trainer.callback_metrics.get("val_dir_bce")) else None,
             "yd": yd_cpu,
             "pd": pd_cpu,
         }
-
-
-        # -----------------------------------------------------------------------
-        # Permutation Importance helpers at module scope (decoded metric = MAE + RMSE + 0.05 * DirBCE)
-        # -----------------------------------------------------------------------
-
-        def _extract_norm_from_dataset(ds: TimeSeriesDataSet):
-            """Return the GroupNormalizer used for realised_vol in our MultiNormalizer."""
-            try:
-                norm = ds.get_parameters()["target_normalizer"]
-                if hasattr(norm, "normalizers") and len(norm.normalizers) >= 1:
-                    return norm.normalizers[0]
-            except Exception:
-                pass
-            return None
-
-        def _evaluate_decoded_metrics(
-            model,
-            ds: TimeSeriesDataSet,
-            batch_size: int,
-            max_batches: int,
-            num_workers: int,
-            prefetch: int,
-            pin_memory: bool,
-        ):
-            """Run model on up to `max_batches` batches and compute decoded MAE, RMSE, DirBCE and combined val_loss.
-            Returns: (mae, rmse, dir_bce, val_loss, n)
-            """
-            vol_norm = _extract_norm_from_dataset(ds)
-
-            dl = ds.to_dataloader(
-                train=False,
-                batch_size=batch_size,
-                num_workers=num_workers,
-                persistent_workers=(num_workers > 0),
-                prefetch_factor=prefetch,
-                pin_memory=pin_memory,
-            )
-
-            model.eval()
-            y_all, p_all, yd_all, pd_all, g_all = [], [], [], [], []
-            with torch.no_grad():
-                for b_idx, batch in enumerate(dl):
-                    if max_batches is not None and b_idx >= int(max_batches):
-                        break
-
-                    if isinstance(batch, (list, tuple)) and len(batch) >= 2:
-                        x, y = batch[0], batch[1]
-                    else:
-                        x, y = batch, None
-
-                    y_hat = model(x)
-                    pred = getattr(y_hat, "prediction", y_hat)
-
-                    # groups for decoding
-                    g = x.get("groups")
-                    if isinstance(g, (list, tuple)):
-                        g = g[0]
-                    if torch.is_tensor(g) and g.ndim > 1 and g.size(-1) == 1:
-                        g = g.squeeze(-1)
-
-                    # decoder target
-                    dec_t = x.get("decoder_target")
-                    y_vol = None
-                    y_dir = None
-                    if torch.is_tensor(dec_t):
-                        t = dec_t
-                        if t.ndim == 3 and t.size(-1) == 1:
-                            t = t[..., 0]
-                        if t.ndim == 2 and t.size(1) >= 1:
-                            y_vol = t[:, 0]
-                            y_dir = t[:, 1] if t.size(1) > 1 else None
-                    if y_vol is None and torch.is_tensor(y):
-                        t = y
-                        if t.ndim == 3 and t.size(1) == 1:
-                            t = t[:, 0, :]
-                        if t.ndim == 2 and t.size(1) >= 1:
-                            y_vol = t[:, 0]
-                            y_dir = t[:, 1] if t.size(1) > 1 else y_dir
-
-                    # take median quantile for vol and extract direction logit/prob
-                    def _median_q(t):
-                        if torch.is_tensor(t) and t.ndim == 3 and t.size(1) == 1:
-                            t = t.squeeze(1)
-                        if torch.is_tensor(t) and t.ndim == 2 and t.size(-1) >= 1:
-                            return t[:, t.size(-1) // 2]
-                        return t
-
-                    if isinstance(pred, (list, tuple)):
-                        p_vol = _median_q(pred[0])
-                        p_dir = pred[1] if len(pred) > 1 else None
-                    elif torch.is_tensor(pred):
-                        t = pred
-                        if t.ndim == 4 and t.size(1) == 1:
-                            t = t.squeeze(1)
-                        if t.ndim == 3 and t.size(1) >= 2:
-                            p_vol = _median_q(t[:, 0, :])
-                            p_dir = t[:, 1, :]
-                        elif t.ndim >= 2:
-                            p_vol = _median_q(t)
-                            p_dir = None
-                        else:
-                            p_vol = t
-                            p_dir = None
-                    else:
-                        return float("nan"), float("nan"), float("nan"), float("nan"), 0
-
-                    if not (torch.is_tensor(y_vol) and torch.is_tensor(p_vol) and torch.is_tensor(g)):
-                        return float("nan"), float("nan"), float("nan"), float("nan"), 0
-
-                    # collapse dir head to single logit if needed
-                    if p_dir is not None and torch.is_tensor(p_dir) and p_dir.ndim >= 2 and p_dir.size(-1) > 1:
-                        mid = p_dir.size(-1) // 2
-                        p_dir = p_dir.index_select(-1, torch.tensor([mid], device=p_dir.device)).squeeze(-1)
-
-                    # decode back to physical scale (vol only)
-                    try:
-                        y_dec = vol_norm.decode(y_vol.unsqueeze(-1), group_ids=g.unsqueeze(-1)).squeeze(-1)
-                        p_dec = vol_norm.decode(p_vol.unsqueeze(-1), group_ids=g.unsqueeze(-1)).squeeze(-1)
-                    except Exception:
-                        y_dec, p_dec = y_vol, p_vol
-
-                    y_all.append(y_dec.detach().cpu())
-                    p_all.append(p_dec.detach().cpu())
-                    g_all.append(g.detach().cpu())
-
-                    if torch.is_tensor(y_dir) and p_dir is not None:
-                        yd_all.append(y_dir.detach().cpu())
-                        pd_all.append(p_dir.detach().cpu())
-
-            if not y_all:
-                return float("nan"), float("nan"), float("nan"), float("nan"), 0
-
-            y = torch.cat(y_all)
-            p = torch.cat(p_all)
-            mae = (p - y).abs().mean().item()
-            rmse = torch.sqrt(((p - y) ** 2).mean()).item()
-
-            # Direction BCE (logits-aware) with label smoothing 0.1
-            dir_bce = float("nan")
-            if yd_all and pd_all:
-                yd = torch.cat(yd_all).float()
-                pd = torch.cat(pd_all)
-                try:
-                    if torch.isfinite(pd).any() and (pd.min() < 0 or pd.max() > 1):
-                        yt_s = yd * 0.9 + 0.05
-                        dir_bce_t = F.binary_cross_entropy_with_logits(pd, yt_s)
-                    else:
-                        pr = torch.clamp(pd, 1e-7, 1 - 1e-7)
-                        yt_s = yd * 0.9 + 0.05
-                        dir_bce_t = F.binary_cross_entropy(pr, yt_s)
-                    dir_bce = float(dir_bce_t.item())
-                except Exception:
-                    pass
-
-            val_loss = (float(mae) + float(rmse)) + (0.05 * dir_bce if np.isfinite(dir_bce) else 0.0)
-            return float(mae), float(rmse), float(dir_bce), float(val_loss), int(y.numel())
-
-        def run_permutation_importance(
-            model,
-            base_df: pd.DataFrame,
-            build_ds_fn,
-            features: List[str],
-            block_size: int,
-            batch_size: int,
-            max_batches: int,
-            num_workers: int,
-            prefetch: int,
-            pin_memory: bool,
-            out_csv_path: str,
-            uploader,
-        ) -> None:
-            """
-            Compute FI by permuting each feature and measuring Δ(val_loss) where
-            val_loss = MAE + RMSE + 0.05 * DirBCE (decoded scale).
-            Saves CSV with: feature, baseline_val_loss, permuted_val_loss, delta, mae, rmse, dir_bce, n.
-            """
-            ds_base = build_ds_fn(base_df, predict=False)
-            b_mae, b_rmse, b_dir, b_val, n = _evaluate_decoded_metrics(
-                model, ds_base, batch_size, max_batches, num_workers, prefetch, pin_memory
-            )
-            print(f"[FI] Baseline val_loss = {b_val:.6f} (MAE={b_mae:.6f}, RMSE={b_rmse:.6f}, DirBCE={b_dir:.6f}) | N={n}")
-
-            rows = []
-            for feat in features:
-                if feat not in base_df.columns:
-                    print(f"[FI] Skipping missing feature: {feat}")
-                    continue
-                df_p = base_df.copy()
-                _permute_series_inplace(df_p, feat, block=block_size, group_col=GROUP_ID[0] if GROUP_ID else "asset")
-                ds_p = build_ds_fn(df_p, predict=False)
-                p_mae, p_rmse, p_dir, p_val, n_p = _evaluate_decoded_metrics(
-                    model, ds_p, batch_size, max_batches, num_workers, prefetch, pin_memory
-                )
-                delta = (p_val - b_val) if (np.isfinite(p_val) and np.isfinite(b_val)) else float("nan")
-                print(f"[FI] {feat:>20} | val_p={p_val:.6f} | Δ={delta:.6f} | (MAE={p_mae:.6f}, RMSE={p_rmse:.6f}, DirBCE={p_dir:.6f})")
-                rows.append({
-                    "feature": feat,
-                    "baseline_val_loss": b_val,
-                    "permuted_val_loss": p_val,
-                    "delta": delta,
-                    "mae": p_mae,
-                    "rmse": p_rmse,
-                    "dir_bce": p_dir,
-                    "n": n_p,
-                })
-
-            try:
-                _df = pd.DataFrame(rows).sort_values("delta", ascending=False)
-                _df.to_csv(out_csv_path, index=False)
-                print(f"✓ Saved FI → {out_csv_path}")
-                try:
-                    uploader(out_csv_path, f"{GCS_OUTPUT_PREFIX}/" + os.path.basename(out_csv_path))
-                except Exception as e:
-                    print(f"[WARN] Could not upload FI CSV: {e}")
-            except Exception as e:
-                print(f"[WARN] Failed to save FI: {e}")
+        
 
         # ---- concise per-epoch validation metrics printout (overall only) ----
         try:
@@ -849,10 +639,10 @@ class PerAssetMetrics(pl.Callback):
             import json
             out = {
                 "decoded": True,
-                "overall": {k: v for k, v in overall.items() if k in ("mae","rmse","mse","qlike")},
+                "overall": {k: v for k, v in overall.items() if k in ("mae","rmse","mse","qlike","val_loss","dir_bce")},
                 "direction_overall": dir_overall,
                 "per_asset": [
-                    {"asset": r[0], "mae": r[1], "rmse": r[2], "mse": r[3], "qlike": r[4], "acc": r[5], "n": r[6]}
+                    {"asset": r[0], "mae": r[1], "rmse": r[2], "mse": r[3], "qlike": r[4], "acc": r[5], "n": r[6], "val_l" : r[7]}
                     for r in rows
                 ],
             }
@@ -1536,7 +1326,223 @@ def add_calendar_features(df: pd.DataFrame) -> pd.DataFrame:
     df["Is_Weekend"] = (dow >= 5).astype("int8")
     return df
 
+# -----------------------------------------------------------------------
+# Permutation Importance helpers at module scope (decoded metric = MAE + RMSE + 0.05 * DirBCE)
+# -----------------------------------------------------------------------
 
+def _extract_norm_from_dataset(ds: TimeSeriesDataSet):
+    """Return the GroupNormalizer used for realised_vol in our MultiNormalizer."""
+    try:
+        norm = ds.get_parameters()["target_normalizer"]
+        if hasattr(norm, "normalizers") and len(norm.normalizers) >= 1:
+            return norm.normalizers[0]
+    except Exception:
+        pass
+    return None
+
+
+def _evaluate_decoded_metrics(
+    model,
+    ds: TimeSeriesDataSet,
+    batch_size: int,
+    max_batches: int,
+    num_workers: int,
+    prefetch: int,
+    pin_memory: bool,
+):
+    """Compute decoded MAE, RMSE, DirBCE and combined val_loss on up to max_batches.
+    Returns: (mae, rmse, dir_bce, val_loss, n)
+    """
+    vol_norm = _extract_norm_from_dataset(ds)
+
+    dl = ds.to_dataloader(
+        train=False,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        persistent_workers=(num_workers > 0),
+        prefetch_factor=prefetch,
+        pin_memory=pin_memory,
+    )
+
+    model.eval()
+    y_all, p_all, yd_all, pd_all, g_all = [], [], [], [], []
+    with torch.no_grad():
+        for b_idx, batch in enumerate(dl):
+            if max_batches is not None and b_idx >= int(max_batches):
+                break
+
+            if isinstance(batch, (list, tuple)) and len(batch) >= 2:
+                x, y = batch[0], batch[1]
+            else:
+                x, y = batch, None
+
+            y_hat = model(x)
+            pred = getattr(y_hat, "prediction", y_hat)
+
+            # groups for decoding
+            g = x.get("groups")
+            if isinstance(g, (list, tuple)):
+                g = g[0]
+            if torch.is_tensor(g) and g.ndim > 1 and g.size(-1) == 1:
+                g = g.squeeze(-1)
+
+            # decoder target
+            dec_t = x.get("decoder_target")
+            y_vol = None
+            y_dir = None
+            if torch.is_tensor(dec_t):
+                t = dec_t
+                if t.ndim == 3 and t.size(-1) == 1:
+                    t = t[..., 0]
+                if t.ndim == 2 and t.size(1) >= 1:
+                    y_vol = t[:, 0]
+                    y_dir = t[:, 1] if t.size(1) > 1 else None
+            if y_vol is None and torch.is_tensor(y):
+                t = y
+                if t.ndim == 3 and t.size(1) == 1:
+                    t = t[:, 0, :]
+                if t.ndim == 2 and t.size(1) >= 1:
+                    y_vol = t[:, 0]
+                    y_dir = t[:, 1] if t.size(1) > 1 else y_dir
+
+            # take median quantile for vol and extract direction logit/prob
+            def _median_q(t):
+                if torch.is_tensor(t) and t.ndim == 3 and t.size(1) == 1:
+                    t = t.squeeze(1)
+                if torch.is_tensor(t) and t.ndim == 2 and t.size(-1) >= 1:
+                    return t[:, t.size(-1) // 2]
+                return t
+
+            if isinstance(pred, (list, tuple)):
+                p_vol = _median_q(pred[0])
+                p_dir = pred[1] if len(pred) > 1 else None
+            elif torch.is_tensor(pred):
+                t = pred
+                if t.ndim == 4 and t.size(1) == 1:
+                    t = t.squeeze(1)
+                if t.ndim == 3 and t.size(1) >= 2:
+                    p_vol = _median_q(t[:, 0, :])
+                    p_dir = t[:, 1, :]
+                elif t.ndim >= 2:
+                    p_vol = _median_q(t)
+                    p_dir = None
+                else:
+                    p_vol = t
+                    p_dir = None
+            else:
+                return float("nan"), float("nan"), float("nan"), float("nan"), 0
+
+            if not (torch.is_tensor(y_vol) and torch.is_tensor(p_vol) and torch.is_tensor(g)):
+                return float("nan"), float("nan"), float("nan"), float("nan"), 0
+
+            # collapse dir head to single logit if needed
+            if p_dir is not None and torch.is_tensor(p_dir) and p_dir.ndim >= 2 and p_dir.size(-1) > 1:
+                mid = p_dir.size(-1) // 2
+                p_dir = p_dir.index_select(-1, torch.tensor([mid], device=p_dir.device)).squeeze(-1)
+
+            # decode back to physical scale (vol only)
+            try:
+                y_dec = vol_norm.decode(y_vol.unsqueeze(-1), group_ids=g.unsqueeze(-1)).squeeze(-1)
+                p_dec = vol_norm.decode(p_vol.unsqueeze(-1), group_ids=g.unsqueeze(-1)).squeeze(-1)
+            except Exception:
+                y_dec, p_dec = y_vol, p_vol
+
+            y_all.append(y_dec.detach().cpu())
+            p_all.append(p_dec.detach().cpu())
+            g_all.append(g.detach().cpu())
+
+            if torch.is_tensor(y_dir) and p_dir is not None:
+                yd_all.append(y_dir.detach().cpu())
+                pd_all.append(p_dir.detach().cpu())
+
+    if not y_all:
+        return float("nan"), float("nan"), float("nan"), float("nan"), 0
+
+    y = torch.cat(y_all)
+    p = torch.cat(p_all)
+    mae = (p - y).abs().mean().item()
+    rmse = torch.sqrt(((p - y) ** 2).mean()).item()
+
+    # Direction BCE (logits-aware) with label smoothing 0.1
+    dir_bce = float("nan")
+    if yd_all and pd_all:
+        yd = torch.cat(yd_all).float()
+        pd = torch.cat(pd_all)
+        try:
+            if torch.isfinite(pd).any() and (pd.min() < 0 or pd.max() > 1):
+                yt_s = yd * 0.9 + 0.05
+                dir_bce_t = F.binary_cross_entropy_with_logits(pd, yt_s)
+            else:
+                pr = torch.clamp(pd, 1e-7, 1 - 1e-7)
+                yt_s = yd * 0.9 + 0.05
+                dir_bce_t = F.binary_cross_entropy(pr, yt_s)
+            dir_bce = float(dir_bce_t.item())
+        except Exception:
+            pass
+
+    val_loss = (float(mae) + float(rmse)) + (0.05 * dir_bce if np.isfinite(dir_bce) else 0.0)
+    return float(mae), float(rmse), float(dir_bce), float(val_loss), int(y.numel())
+
+
+def run_permutation_importance(
+    model,
+    base_df: pd.DataFrame,
+    build_ds_fn,
+    features: List[str],
+    block_size: int,
+    batch_size: int,
+    max_batches: int,
+    num_workers: int,
+    prefetch: int,
+    pin_memory: bool,
+    out_csv_path: str,
+    uploader,
+) -> None:
+    """
+    Compute FI by permuting each feature and measuring Δ(val_loss) where
+    val_loss = MAE + RMSE + 0.05 * DirBCE (decoded scale).
+    Saves CSV with: feature, baseline_val_loss, permuted_val_loss, delta, mae, rmse, dir_bce, n.
+    """
+    ds_base = build_ds_fn(base_df, predict=False)
+    b_mae, b_rmse, b_dir, b_val, n = _evaluate_decoded_metrics(
+        model, ds_base, batch_size, max_batches, num_workers, prefetch, pin_memory
+    )
+    print(f"[FI] Baseline val_loss = {b_val:.6f} (MAE={b_mae:.6f}, RMSE={b_rmse:.6f}, DirBCE={b_dir:.6f}) | N={n}")
+
+    rows = []
+    for feat in features:
+        if feat not in base_df.columns:
+            print(f"[FI] Skipping missing feature: {feat}")
+            continue
+        df_p = base_df.copy()
+        _permute_series_inplace(df_p, feat, block=block_size, group_col=GROUP_ID[0] if GROUP_ID else "asset")
+        ds_p = build_ds_fn(df_p, predict=False)
+        p_mae, p_rmse, p_dir, p_val, n_p = _evaluate_decoded_metrics(
+            model, ds_p, batch_size, max_batches, num_workers, prefetch, pin_memory
+        )
+        delta = (p_val - b_val) if (np.isfinite(p_val) and np.isfinite(b_val)) else float("nan")
+        print(f"[FI] {feat:>20} | val_p={p_val:.6f} | Δ={delta:.6f} | (MAE={p_mae:.6f}, RMSE={p_rmse:.6f}, DirBCE={p_dir:.6f})")
+        rows.append({
+            "feature": feat,
+            "baseline_val_loss": b_val,
+            "permuted_val_loss": p_val,
+            "delta": delta,
+            "mae": p_mae,
+            "rmse": p_rmse,
+            "dir_bce": p_dir,
+            "n": n_p,
+        })
+
+    try:
+        _df = pd.DataFrame(rows).sort_values("delta", ascending=False)
+        _df.to_csv(out_csv_path, index=False)
+        print(f"✓ Saved FI → {out_csv_path}")
+        try:
+            uploader(out_csv_path, f"{GCS_OUTPUT_PREFIX}/" + os.path.basename(out_csv_path))
+        except Exception as e:
+            print(f"[WARN] Could not upload FI CSV: {e}")
+    except Exception as e:
+        print(f"[WARN] Failed to save FI: {e}")
 # -----------------------------------------------------------------------
 # Data preparation
 # -----------------------------------------------------------------------
