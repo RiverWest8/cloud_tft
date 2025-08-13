@@ -112,35 +112,23 @@ Q50_IDX = VOL_QUANTILES.index(0.50)  # -> 3
 # breaks later when `.setdefault()` is called on it.  The logic below
 # handles both cases safely.
 #
-identity_transform = {"forward": lambda x: x, "inverse": lambda x: x}
 
-# If the key is missing OR is not in the expected dict format, patch it.
-if (
-    "identity" not in GroupNormalizer.TRANSFORMATIONS
-    or not isinstance(GroupNormalizer.TRANSFORMATIONS["identity"], dict)
-):
-    GroupNormalizer.TRANSFORMATIONS["identity"] = identity_transform
+from pytorch_forecasting.data.encoders import GroupNormalizer
+import numpy as np, torch
 
-# Some PF versions expose a separate `INVERSE_TRANSFORMATIONS` registry.
-# Add the mapping only if the attribute exists.
-
-if hasattr(GroupNormalizer, "INVERSE_TRANSFORMATIONS"):
-    GroupNormalizer.INVERSE_TRANSFORMATIONS.setdefault("identity", lambda x: x)
-
-# ---------------- Register custom asinh transformation ----------------
-if (
-    "asinh" not in GroupNormalizer.TRANSFORMATIONS
-    or not isinstance(GroupNormalizer.TRANSFORMATIONS["asinh"], dict)
-):
+if ("asinh" not in GroupNormalizer.TRANSFORMATIONS
+    or not isinstance(GroupNormalizer.TRANSFORMATIONS["asinh"], dict)):
     GroupNormalizer.TRANSFORMATIONS["asinh"] = {
         "forward": lambda x: torch.asinh(x) if torch.is_tensor(x) else np.arcsinh(x),
-        "inverse": lambda x: torch.sinh(x) if torch.is_tensor(x) else np.sinh(x),
+        "inverse": lambda x: torch.sinh(x)  if torch.is_tensor(x) else np.sinh(x),
     }
 if hasattr(GroupNormalizer, "INVERSE_TRANSFORMATIONS"):
     GroupNormalizer.INVERSE_TRANSFORMATIONS.setdefault(
         "asinh",
         lambda x: torch.sinh(x) if torch.is_tensor(x) else np.sinh(x),
     )
+
+
 
 # -----------------------------------------------------------------------
 # Robust manual inverse for GroupNormalizer (fallback when decode fails)
@@ -1587,8 +1575,8 @@ if __name__ == "__main__":
     test_dataset = TimeSeriesDataSet.from_dataset(
         training_dataset, test_df, predict=False, stop_randomization=True
     )
-
-
+    vol_normalizer = _extract_norm_from_dataset(training_dataset)  # must be from TRAIN
+    # make it available to both the model and the metrics callback
     # (optional) quick alignment check
     try:
         train_vocab = training_dataset.get_parameters()["categorical_encoders"]["asset"].classes_
@@ -1694,6 +1682,115 @@ if __name__ == "__main__":
         reduce_on_plateau_patience=5,
         reduce_on_plateau_min_lr=1e-5,
     )
+    vol_normalizer = _extract_norm_from_dataset(training_dataset)
+    tft.vol_norm = vol_normalizer          # if your LightningModule is 'tft'
+    metrics_cb = PerAssetMetrics(
+        id_to_name=rev_asset,
+        vol_normalizer=vol_normalizer,
+        max_print=10
+    )
+    # --- train on DECODED scale (overrides PF default training_step) ---
+    from types import MethodType
+    import torch
+
+    def _custom_training_step_decoded(self, batch, batch_idx):
+        # unpack PF batch
+        if isinstance(batch, (list, tuple)) and len(batch) >= 2:
+            x, y = batch[0], batch[1]
+        else:
+            x, y = batch, None
+            raise RuntimeError("Unexpected batch structure for training_step")
+
+        # forward pass
+        out = self(x)
+        pred = getattr(out, "prediction", out)
+        if isinstance(pred, dict) and "prediction" in pred:
+            pred = pred["prediction"]
+
+        # ---- extract vol head as a point forecast (median/mean of quantiles) ----
+        def _point_from_quantiles(vol_q):
+            # if last dim is the 7 quantiles, use mean-of-quantiles (simple & stable)
+            if torch.is_tensor(vol_q) and vol_q.ndim == 2:
+                return vol_q.mean(dim=-1)
+            return vol_q
+
+        # handle common PF shapes
+        if isinstance(pred, (list, tuple)):
+            # [vol_quantiles, dir_logits?]
+            vol_q = pred[0]
+            if torch.is_tensor(vol_q) and vol_q.ndim == 3 and vol_q.size(1) == 1:
+                vol_q = vol_q[:, 0, :]
+            p_vol = _point_from_quantiles(vol_q)
+        elif torch.is_tensor(pred):
+            t = pred
+            if t.ndim >= 4 and t.size(1) == 1:
+                t = t.squeeze(1)          # [B, 2, K] or [B, D]
+            if t.ndim == 3 and t.size(1) == 1:
+                t = t[:, 0, :]            # [B, D]
+            if t.ndim == 2:
+                D = t.size(-1)
+                if D >= 2:
+                    vol_q = t[:, : D-1]   # first K columns are vol quantiles
+                    p_vol = _point_from_quantiles(vol_q)
+                else:
+                    raise RuntimeError("Unexpected pred shape for vol head")
+            else:
+                raise RuntimeError("Unexpected prediction shape")
+        else:
+            raise RuntimeError("Unsupported prediction type")
+
+        # ---- pull vol target from y (PF often gives [B, pred_len=1, n_targets]) ----
+        if torch.is_tensor(y):
+            yt = y
+            if yt.ndim == 3 and yt.size(1) == 1:
+                yt = yt[:, 0, :]  # -> [B, n_targets]
+            if yt.ndim == 2 and yt.size(1) >= 1:
+                y_vol = yt[:, 0]
+            else:
+                raise RuntimeError("Unexpected target shape")
+        elif isinstance(y, (list, tuple)) and len(y) >= 1:
+            y_vol = y[0]
+            if torch.is_tensor(y_vol) and y_vol.ndim == 3 and y_vol.size(1) == 1:
+                y_vol = y_vol[:, 0, 0]
+            elif torch.is_tensor(y_vol) and y_vol.ndim == 2 and y_vol.size(-1) == 1:
+                y_vol = y_vol[:, 0]
+        else:
+            raise RuntimeError("Missing targets in batch")
+
+        # ---- group ids for per-asset decode (must match TRAIN normalizer) ----
+        g = x.get("groups", None)
+        if g is None:
+            g = x.get("group_ids", None)
+        if isinstance(g, (list, tuple)):
+            g = g[0] if len(g) > 0 else None
+        if g is None or not torch.is_tensor(g):
+            raise RuntimeError("Missing 'groups' in batch for decoded loss")
+        if g.ndim > 1 and g.size(-1) == 1:
+            g = g.squeeze(-1)
+
+        # ---- decode both y and p using TRAIN normalizer attached as self.vol_norm ----
+        y_dec = safe_decode_vol(
+            y_vol.to(self.device).unsqueeze(-1), self.vol_norm, g.to(self.device).unsqueeze(-1)
+        ).squeeze(-1)
+        p_dec = safe_decode_vol(
+            p_vol.to(self.device).unsqueeze(-1), self.vol_norm, g.to(self.device).unsqueeze(-1)
+        ).squeeze(-1)
+        p_dec = torch.clamp(p_dec, min=1e-8)
+
+        # ---- simple decoded objective (matches overfit_test spirit) ----
+        mse  = torch.mean((p_dec - y_dec) ** 2)
+        mae  = torch.mean(torch.abs(p_dec - y_dec))
+        loss = mse + mae
+
+        # lightweight logging
+        self.log("train_mae_dec", mae.detach(), prog_bar=True, on_step=False, on_epoch=True)
+        self.log("train_mse_dec", mse.detach(), prog_bar=False, on_step=False, on_epoch=True)
+        self.log("train_loss_dec", loss.detach(), prog_bar=True, on_step=True, on_epoch=True)
+        return loss
+
+    # bind it
+    tft.training_step = MethodType(_custom_training_step_decoded, tft)    
+
 
         # ----------------------------
     # Create callbacks BEFORE Trainer
