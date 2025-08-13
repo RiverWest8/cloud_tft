@@ -1739,23 +1739,47 @@ if __name__ == "__main__":
         else:
             raise RuntimeError("Unsupported prediction type")
 
-        # ---- pull vol target from y (PF often gives [B, pred_len=1, n_targets]) ----
-        if torch.is_tensor(y):
-            yt = y
-            if yt.ndim == 3 and yt.size(1) == 1:
-                yt = yt[:, 0, :]  # -> [B, n_targets]
-            if yt.ndim == 2 and yt.size(1) >= 1:
-                y_vol = yt[:, 0]
-            else:
-                raise RuntimeError("Unexpected target shape")
-        elif isinstance(y, (list, tuple)) and len(y) >= 1:
-            y_vol = y[0]
-            if torch.is_tensor(y_vol) and y_vol.ndim == 3 and y_vol.size(1) == 1:
-                y_vol = y_vol[:, 0, 0]
-            elif torch.is_tensor(y_vol) and y_vol.ndim == 2 and y_vol.size(-1) == 1:
-                y_vol = y_vol[:, 0]
-        else:
-            raise RuntimeError("Missing targets in batch")
+        # ---- pull vol target robustly (prefer decoder_target from x; fallback to y) ----
+        def _coerce_to_vol_tensor(obj):
+            # returns 1D tensor [B] or None
+            import torch
+            t = None
+            if torch.is_tensor(obj):
+                t = obj
+            elif isinstance(obj, (list, tuple)):
+                # pick the first tensor we can find
+                for it in obj:
+                    if torch.is_tensor(it):
+                        t = it
+                        break
+            if t is None:
+                return None
+            # squeeze to [B, n_targets]
+            if t.ndim == 3 and t.size(1) == 1:
+                t = t[:, 0, :]
+            if t.ndim == 3 and t.size(-1) == 1:
+                t = t[..., 0]
+            if t.ndim == 2 and t.size(1) >= 1:
+                return t[:, 0]  # first target = realised_vol
+            if t.ndim == 1:
+                return t
+            return None
+
+        def _extract_y_vol(x_dict, y_obj):
+            # 1) try decoder_target / target inside x (PF often stores labels here)
+            for key in ("decoder_target", "target"):
+                obj = x_dict.get(key, None) if isinstance(x_dict, dict) else None
+                if obj is not None:
+                    yv = _coerce_to_vol_tensor(obj)
+                    if yv is not None:
+                        return yv
+            # 2) fallback to the batched y argument (can be tensor or (targets, weights))
+            yv = _coerce_to_vol_tensor(y_obj)
+            if yv is not None:
+                return yv
+            raise RuntimeError("Could not find tensor realised_vol target in batch")
+
+        y_vol = _extract_y_vol(x, y)
 
         # ---- robust group ids for per-asset decode (must match TRAIN normalizer) ----
         g_raw = x.get("groups", None)
