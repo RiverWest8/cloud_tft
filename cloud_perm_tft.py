@@ -388,6 +388,15 @@ def main():
     parser.add_argument("--local_out_dir", type=str, default="/tmp/tft_runs")
     args = parser.parse_args()
 
+    # Force overfitting test mode: very small subset, large model capacity, many epochs
+    # (Set these before loading datasets)
+    global TRAIN_N, VAL_N, TEST_N, MAX_EPOCHS, LR
+    TRAIN_N = 512
+    VAL_N = 512
+    TEST_N = 512
+    MAX_EPOCHS = 100
+    LR = 1e-2
+
     # If gcs_data_prefix is given, override data paths to use GCS URIs
     if args.gcs_data_prefix:
         gcs_prefix = args.gcs_data_prefix.rstrip("/")
@@ -417,8 +426,7 @@ def main():
     print(f"[INFO] mean realised_vol (val subset)={val_df['realised_vol'].mean():.6g}")
     print(f"[INFO] mean realised_vol (test subset)={test_df['realised_vol'].mean():.6g}")
 
-    # Override constants with CLI args
-    MAX_EPOCHS = args.max_epochs
+    # Override constants with CLI args (except those forced above)
     BATCH_SIZE = args.batch_size
     ENC_LEN = args.max_encoder_length
 
@@ -482,10 +490,10 @@ def main():
     tft = TemporalFusionTransformer.from_dataset(
         training_dataset,
         learning_rate=LR,
-        hidden_size=64,
-        attention_head_size=4,
-        dropout=0.1,
-        hidden_continuous_size=32,
+        hidden_size=128,
+        attention_head_size=8,
+        dropout=0.0,
+        hidden_continuous_size=64,
         output_size=7,             # 7 quantiles
         loss=QuantileLoss(),       # head produces quantiles; we override training loss below
         log_interval=10,
