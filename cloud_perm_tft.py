@@ -19,8 +19,9 @@ from pytorch_forecasting.metrics import QuantileLoss
 # Google Cloud Storage config
 # Google Cloud Storage config with env + CLI override support
 GCS_BUCKET = os.environ.get("GCS_BUCKET", "river-ml-bucket")
-GCS_DATA_PREFIX = f"gs://{GCS_BUCKET}/Data/CleanedData"
+GCS_DATA_PREFIX = f"gs://{GCS_BUCKET}/Data/Feature_Ablation"
 GCS_OUTPUT_PREFIX = f"gs://{GCS_BUCKET}/Dissertation/TFT"
+
 
 TRAIN_P = f"{GCS_DATA_PREFIX}/universal_train.parquet"
 VAL_P   = f"{GCS_DATA_PREFIX}/universal_val.parquet"
