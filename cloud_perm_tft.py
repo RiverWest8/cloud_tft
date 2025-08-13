@@ -464,29 +464,6 @@ class PerAssetMetrics(pl.Callback):
         yd_cpu = yd.detach().cpu() if yd is not None else None
         pd_cpu = pdir.detach().cpu() if pdir is not None else None
 
-        # --- Calibrate predictions before metrics ---
-        # --- Robust calibration BEFORE metrics (pull median(y/p) → 1) ---
-        with torch.no_grad():
-            mask = torch.isfinite(yv_dec_all) & torch.isfinite(pv_dec_all) & (pv_dec_all.abs() > 1e-12)
-            if mask.any():
-                # Global multiplicative scale via median ratio
-                ratio = yv_dec_all[mask] / (pv_dec_all[mask] + 1e-12)
-                a_global = float(torch.nanmedian(ratio).item())
-                a_global = max(0.25, min(4.0, a_global))
-                pv_dec_all = pv_dec_all * a_global
-
-                # Optional per-asset refinement (keeps assets on their own scales)
-                try:
-                    for gid in torch.unique(g_cpu):
-                        m = (g_cpu == gid) & mask
-                        if m.any():
-                            r_g = yv_dec_all[m] / (pv_dec_all[m] + 1e-12)
-                            a_g = float(torch.nanmedian(r_g).item())
-                            a_g = max(0.25, min(4.0, a_g))
-                            pv_dec_all[m] = pv_dec_all[m] * a_g
-                except Exception:
-                    pass
-
         # Debug check
         print(f"[VAL DEBUG] mean(y)={yv_dec_all.mean():.6g} mean(p)={pv_dec_all.mean():.6g}")
         print(f"[VAL DEBUG] median(y/p)≈{(yv_dec_all / (pv_dec_all+1e-12)).median():.3f}")
@@ -1092,7 +1069,7 @@ RUN_SUFFIX = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 MODEL_SAVE_PATH = (LOCAL_CKPT_DIR / f"tft_realised_vol_e{MAX_EPOCHS}_{RUN_SUFFIX}.ckpt")
 
 SEED = 50
-WEIGHT_DECAY = 1e-4 #0.00578350719515325     # weight decay for AdamW
+WEIGHT_DECAY = 1e-6 #0.00578350719515325     # weight decay for AdamW
 GRADIENT_CLIP_VAL = 1 #0.78    # gradient clipping value for Trainer
 # Feature-importance controls
 ENABLE_FEATURE_IMPORTANCE = True   # gate FI so you can toggle it
@@ -1740,9 +1717,9 @@ if __name__ == "__main__":
         training_dataset,
         hidden_size=64,
         attention_head_size=2,
-        dropout=0.05, #0.0833704625250354,
+        dropout=0.00, #0.0833704625250354,
         hidden_continuous_size=16,
-        learning_rate=(LR_OVERRIDE if LR_OVERRIDE is not None else 0.03), #0.0019
+        learning_rate=(LR_OVERRIDE if LR_OVERRIDE is not None else 0.01), #0.0019
         optimizer="AdamW",
         optimizer_params={"weight_decay": WEIGHT_DECAY},
         output_size=[7, 1],  # 7 quantiles + 1 logit
