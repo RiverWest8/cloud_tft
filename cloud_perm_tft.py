@@ -1342,6 +1342,7 @@ def _extract_norm_from_dataset(ds: TimeSeriesDataSet):
     return None
 
 
+
 def _evaluate_decoded_metrics(
     model,
     ds: TimeSeriesDataSet,
@@ -1351,7 +1352,8 @@ def _evaluate_decoded_metrics(
     prefetch: int,
     pin_memory: bool,
 ):
-    """Compute decoded MAE, RMSE, DirBCE and combined val_loss on up to max_batches.
+    """
+    Compute decoded MAE, RMSE, DirBCE and combined val_loss on up to max_batches.
     Returns: (mae, rmse, dir_bce, val_loss, n)
     """
     vol_norm = _extract_norm_from_dataset(ds)
@@ -1373,7 +1375,7 @@ def _evaluate_decoded_metrics(
 
     model.eval()
     y_all, p_all, yd_all, pd_all, g_all = [], [], [], [], []
-    skipped_reasons = {"no_groups":0, "no_targets":0, "bad_pred_format":0}
+    skipped_reasons = {"no_groups": 0, "no_targets": 0, "bad_pred_format": 0}
 
     with torch.no_grad():
         for b_idx, batch in enumerate(dl):
@@ -1389,22 +1391,27 @@ def _evaluate_decoded_metrics(
                 skipped_reasons["bad_pred_format"] += 1
                 continue
 
-            # ---- groups (robust) ----
-            g = x.get("groups") or x.get("group_ids")
-            if isinstance(g, (list, tuple)) and len(g) > 0:
-                g = g[0]
+            # ---- groups (robust; avoid `or` with tensors) ----
+            g = x.get("groups", None)
+            if g is None:
+                g = x.get("group_ids", None)
+            if isinstance(g, (list, tuple)):
+                g = g[0] if len(g) > 0 else None
             if torch.is_tensor(g) and g.ndim > 1 and g.size(-1) == 1:
                 g = g.squeeze(-1)
             if not torch.is_tensor(g):
                 skipped_reasons["no_groups"] += 1
                 continue
 
-            # ---- targets (robust) ----
+            # ---- targets (robust; avoid `or` with tensors) ----
             y_vol = None
             y_dir = None
 
-            # Preferred: decoder_target
-            dec_t = x.get("decoder_target") or x.get("target")
+            # Preferred: decoder_target, else target
+            dec_t = x.get("decoder_target", None)
+            if dec_t is None:
+                dec_t = x.get("target", None)
+
             if torch.is_tensor(dec_t):
                 t = dec_t
                 if t.ndim == 3 and t.size(-1) == 1:
@@ -1429,7 +1436,6 @@ def _evaluate_decoded_metrics(
                 continue
 
             # ---- forward pass (move to model device) ----
-            # Move only tensors inside x that are torch.Tensors
             x_dev = {}
             for k, v in x.items():
                 if torch.is_tensor(v):
@@ -1525,6 +1531,7 @@ def _evaluate_decoded_metrics(
 
     val_loss = (float(mae) + float(rmse)) + (0.05 * dir_bce if np.isfinite(dir_bce) else 0.0)
     return float(mae), float(rmse), float(dir_bce), float(val_loss), int(y.numel())
+
 
 
 def run_permutation_importance(
