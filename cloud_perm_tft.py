@@ -259,9 +259,10 @@ def _training_step_decoded(self, batch, batch_idx):
     mae = torch.mean(torch.abs(p_dec - y_dec))
     loss = mse + mae
 
-    self.log("train_mae_dec", mae.detach(), prog_bar=True, on_step=False, on_epoch=True)
-    self.log("train_rmse_dec", torch.sqrt(mse.detach()), prog_bar=False, on_step=False, on_epoch=True)
-    self.log("train_loss_dec", loss.detach(), prog_bar=True, on_step=True, on_epoch=True)
+    bs = y_dec.size(0)
+    self.log("train_mae_dec", mae.detach(), prog_bar=True, on_step=False, on_epoch=True, batch_size=bs)
+    self.log("train_rmse_dec", torch.sqrt(mse.detach()), prog_bar=False, on_step=False, on_epoch=True, batch_size=bs)
+    self.log("train_loss_dec", loss.detach(), prog_bar=True, on_step=True, on_epoch=True, batch_size=bs)
     return loss
 
 def _validation_step_decoded(self, batch, batch_idx):
@@ -280,8 +281,10 @@ def _validation_step_decoded(self, batch, batch_idx):
     mse = torch.mean((p_dec - y_dec) ** 2)
     mae = torch.mean(torch.abs(p_dec - y_dec))
 
-    self.log("val_mae_dec", mae.detach(), prog_bar=True, on_step=False, on_epoch=True)
-    self.log("val_rmse_dec", torch.sqrt(mse.detach()), prog_bar=True, on_step=False, on_epoch=True)
+    bs = y_dec.size(0)
+    self.log("val_mae_dec", mae.detach(), prog_bar=True, on_step=False, on_epoch=True, batch_size=bs)
+    self.log("val_rmse_dec", torch.sqrt(mse.detach()), prog_bar=True, on_step=False, on_epoch=True, batch_size=bs)
+    self.log("val_loss", (mse + mae).detach(), prog_bar=False, on_step=False, on_epoch=True, batch_size=bs)
     return {"val_loss": (mse + mae).detach()}
 
 ## tft.training_step and validation_step will be set after tft is created in main()
@@ -388,6 +391,9 @@ def main():
     parser.add_argument("--local_out_dir", type=str, default="/tmp/tft_runs")
     args = parser.parse_args()
 
+    # Avoid multiprocessing DataLoader crashes in notebooks/containers
+    args.num_workers = 0
+
     # Force overfitting test mode: very small subset, large model capacity, many epochs
     # (Set these before loading datasets)
     TRAIN_N = 512
@@ -468,20 +474,14 @@ def main():
         training_dataset, test_df, predict=False, stop_randomization=True
     )
 
-    # Dataloaders with user-specified workers and prefetch
+    # Dataloaders with user-specified workers and prefetch, handle prefetch_factor and persistent_workers only if num_workers > 0
     global train_loader, val_loader
-    train_loader = training_dataset.to_dataloader(
-        train=True,
-        batch_size=BATCH_SIZE,
-        num_workers=args.num_workers,
-        prefetch_factor=args.prefetch_factor
-    )
-    val_loader = validation_dataset.to_dataloader(
-        train=False,
-        batch_size=BATCH_SIZE,
-        num_workers=args.num_workers,
-        prefetch_factor=args.prefetch_factor
-    )
+    dl_common = dict(batch_size=BATCH_SIZE, num_workers=args.num_workers)
+    if args.num_workers and args.num_workers > 0:
+        dl_common.update(dict(persistent_workers=True, prefetch_factor=args.prefetch_factor, pin_memory=torch.cuda.is_available()))
+
+    train_loader = training_dataset.to_dataloader(train=True, **dl_common)
+    val_loader = validation_dataset.to_dataloader(train=False, **dl_common)
 
     # Now extract the normalizer and build the TFT model
     vol_norm = _extract_norm_from_dataset(training_dataset)
@@ -536,11 +536,17 @@ def main():
     else:
         precision_mode = 32
     accelerator = "gpu" if torch.cuda.is_available() else "cpu"
+    try:
+        num_train_batches = len(train_loader)
+    except TypeError:
+        num_train_batches = 1
+    effective_log_every = min(args.log_every_n_steps, max(1, num_train_batches))
+
     trainer = Trainer(
         max_epochs=MAX_EPOCHS,
         accelerator=accelerator,
         devices=1,
-        log_every_n_steps=args.log_every_n_steps,
+        log_every_n_steps=effective_log_every,
         check_val_every_n_epoch=args.check_val_every_n_epoch,
         default_root_dir=str(local_run_dir),
         callbacks=[checkpoint_callback],
@@ -549,7 +555,10 @@ def main():
     )
     print("[INFO] CLI args:", vars(args))
     print("▶ Training TFT on decoded scale (MAE+MSE)…")
-    trainer.fit(tft, train_loader, val_loader)
+    try:
+        trainer.fit(tft, train_loader, val_loader)
+    except KeyboardInterrupt:
+        print("[WARN] Training interrupted by user. Proceeding to save artifacts from current model state.")
 
     target_prefix = args.gcs_output_prefix if args.gcs_output_prefix else str(local_run_dir / "artifacts")
     save_predictions_and_metrics(tft, val_loader, target_prefix)
