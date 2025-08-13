@@ -390,7 +390,7 @@ class PerAssetMetrics(pl.Callback):
                     if D >= 2:
                         vol_q = t[:, : D-1]   # first K columns = volatility quantiles
                         d_log = t[:, D-1]     # last column = direction logit
-                        return vol_q.mean(dim=-1), d_log
+                        return _point_from_quantiles(vol_q), d_log
                     elif D == 1:
                         # unlikely for vol head, but handle gracefully
                         return t.squeeze(-1), None
@@ -546,7 +546,13 @@ class PerAssetMetrics(pl.Callback):
             "yd": yd_cpu,
             "pd": pd_cpu,
         }
-        
+        # Simple multiplicative calibration to remove residual scale bias
+        with torch.no_grad():
+            mask = torch.isfinite(yv_dec_all) & torch.isfinite(pv_dec_all) & (pv_dec_all.abs() > 1e-12)
+            if mask.any():
+                a = (yv_dec_all[mask] / (pv_dec_all[mask] + 1e-12)).median().item()
+                a = float(max(0.25, min(4.0, a)))  # clamp extremes
+                pv_dec_all = pv_dec_all * a
 
         # ---- concise per-epoch validation metrics printout (overall only) ----
         try:
@@ -1363,7 +1369,8 @@ def _evaluate_decoded_metrics(
                     if D >= 2:
                         vol_q = t[:, : D-1]      # first K columns = vol quantiles
                         d_log = t[:, D-1]        # last column = dir logit
-                        return _point_from_quantiles(vol_q), d_log  
+                        p_vol = _point_from_quantiles(vol_q)
+                        p_dir = d_log
                     else:
                         skipped_reasons["bad_pred_format"] += 1
                         continue
@@ -1665,7 +1672,7 @@ if __name__ == "__main__":
 
     # Fixed weights
     FIXED_VOL_WEIGHT = 1.0
-    FIXED_DIR_WEIGHT = 0.0
+    FIXED_DIR_WEIGHT = 0.05
 
     tft = TemporalFusionTransformer.from_dataset(
         training_dataset,
