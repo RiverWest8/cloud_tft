@@ -1686,7 +1686,7 @@ if __name__ == "__main__":
 
     # Fixed weights
     FIXED_VOL_WEIGHT = 1.0
-    FIXED_DIR_WEIGHT = 0.1
+    FIXED_DIR_WEIGHT = 0.23
 
     tft = TemporalFusionTransformer.from_dataset(
         training_dataset,
@@ -1703,7 +1703,7 @@ if __name__ == "__main__":
                 quantiles=[0.05, 0.165, 0.25, 0.5, 0.75, 0.835, 0.95],
                 underestimation_factor= 1.515 #1.115,  # keep asymmetric penalty
             ),
-            LabelSmoothedBCE(smoothing=0.1),
+            LabelSmoothedBCE(smoothing=0.05),
         ], weights=[FIXED_VOL_WEIGHT, FIXED_DIR_WEIGHT]),
         logging_metrics=[],
         log_interval=50,
