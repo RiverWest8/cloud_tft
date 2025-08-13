@@ -446,6 +446,12 @@ class PerAssetMetrics(pl.Callback):
             pv_dec_t = torch.clamp(pv_dec_t, min=2e-7)
         except Exception:
             pv_dec_t = pv
+        
+        print(
+        "DEBUG: mean(yv_dec)=", yv_dec_t.mean().item(),
+        "mean(pv_dec)=", pv_dec_t.mean().item(),
+        "ratio=", (yv_dec_t.mean() / pv_dec_t.mean()).item()
+        )
 
         # move to CPU for numpy-style metrics
         g_cpu = g.detach().cpu()
@@ -1471,6 +1477,7 @@ def _evaluate_decoded_metrics(
 
 def run_permutation_importance(
     model,
+    template_ds : TimeSeriesDataSet
     base_df: pd.DataFrame,
     build_ds_fn,
     features: List[str],
@@ -1806,7 +1813,7 @@ if __name__ == "__main__":
         feats = [f for f in feats if f not in ("sin_tod", "cos_tod", "sin_dow", "cos_dow", "Is_Weekend")]
         run_permutation_importance(
             model=tft,
-            template_ds=training_dataset,            # << use train template
+            template_ds = training_dataset,            # << use train template
             base_df=val_df,
             features=feats,
             block_size=int(PERM_BLOCK_SIZE) if PERM_BLOCK_SIZE else 1,
