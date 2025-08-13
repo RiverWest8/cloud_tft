@@ -184,7 +184,7 @@ if not hasattr(GroupNormalizer, "decode"):
 from pytorch_forecasting.metrics import QuantileLoss, MultiLoss
 
 class LabelSmoothedBCE(nn.Module):
-    def __init__(self, smoothing: float = 0.1, pos_weight: float = 1.1):
+    def __init__(self, smoothing: float = 0.1, pos_weight: float = 1.15):
         super().__init__()
         self.smoothing = smoothing
         self.register_buffer("pos_weight", torch.tensor(pos_weight))
@@ -815,7 +815,7 @@ class DualHead(nn.Module):
 
 # keep BCE pos_weight on the correct device
 class StaticPosWeightBCE(nn.Module):
-    def __init__(self, pos_weight: float, smoothing: float = 0.0):
+    def __init__(self, pos_weight: float, smoothing: float = 1.15):
         super().__init__()
         self.pos_weight = float(pos_weight)
         self.smoothing = float(smoothing)
@@ -1060,7 +1060,7 @@ def mirror_local_ckpts_to_gcs():
             remote = f"{CKPT_GCS_PREFIX}/{p.name}"
             with fsspec.open(remote, "wb") as f_out, open(p, "rb") as f_in:
                 shutil.copyfileobj(f_in, f_out)
-            print(f"✓ Mirrored checkpoint {p} → {remote}")
+            #print(f"✓ Mirrored checkpoint {p} → {remote}")
     except Exception as e:
         print(f"[WARN] Failed to mirror checkpoints: {e}")
 
@@ -1435,7 +1435,7 @@ def _evaluate_decoded_metrics(
             try:
                 y_dec = vol_norm.decode(y_vol.to(model_device).unsqueeze(-1), group_ids=g.to(model_device).unsqueeze(-1)).squeeze(-1)
                 p_dec = vol_norm.decode(p_vol.to(model_device).unsqueeze(-1), group_ids=g.to(model_device).unsqueeze(-1)).squeeze(-1)
-                p_dec = torch.clamp(p_dec, min=1e-6)  # ensure positive floor       
+                p_dec = torch.clamp(p_dec, min=1e-8)  # ensure positive floor       
             except Exception:
                 y_dec, p_dec = y_vol.to(model_device), p_vol.to(model_device)
 
@@ -1628,7 +1628,7 @@ if __name__ == "__main__":
                 GroupNormalizer(
                     groups=GROUP_ID,
                     center=False,
-                    scale_by_group= True,
+                    scale_by_group= False,
                     transformation="asinh",
                 ),
                 TorchNormalizer(method="identity", center=False),   # direction
@@ -1749,7 +1749,7 @@ if __name__ == "__main__":
         loss=MultiLoss([
             AsymmetricQuantileLoss(
                 quantiles=[0.05, 0.165, 0.25, 0.5, 0.75, 0.835, 0.95],
-                underestimation_factor= 1 #1.115,  # keep asymmetric penalty
+                underestimation_factor= 1.115 #1.115,  # keep asymmetric penalty
             ),
             LabelSmoothedBCE(smoothing=0.1),
         ], weights=[FIXED_VOL_WEIGHT, FIXED_DIR_WEIGHT]),
