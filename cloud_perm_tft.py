@@ -1620,6 +1620,7 @@ def run_permutation_importance(
     Saves CSV with: feature, baseline_val_loss, permuted_val_loss, delta, mae, rmse, dir_bce, n.
     """
     ds_base = build_ds_fn(base_df, predict=False)
+    max_batches = 24
     try:
         print(f"[FI] Dataset size (samples): {len(ds_base)} | batch_size={batch_size}")
     except Exception:
