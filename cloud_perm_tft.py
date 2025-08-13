@@ -1815,25 +1815,13 @@ if __name__ == "__main__":
         check_val_every_n_epoch=int(ARGS.check_val_every_n_epoch),
         log_every_n_steps=int(ARGS.log_every_n_steps),
     )
-
-
-    # put this right before trainer.fit(...)
     from types import MethodType
-    def _safe_plot(self, *args, **kwargs):
-        import torch
-        def cast(x):
-            if torch.is_tensor(x): return x.detach().float().cpu()
-            if isinstance(x, (list, tuple)): return type(x)(cast(v) for v in x)
-            if isinstance(x, dict): return {k: cast(v) for k, v in x.items()}
-            return x
-        args = tuple(cast(a) for a in args)
-        kwargs = {k: cast(v) for k, v in kwargs.items()}
-        try:
-            return super(type(self), self).plot_prediction(*args, **kwargs)
-        except Exception:
-            return None
+    def _no_plot(self, *args, **kwargs):
+        return None
 
-    tft.plot_prediction = MethodType(_safe_plot, tft)
+    # Make plot_prediction a no-op so validation won't try to render Matplotlib figures.
+    tft.plot_prediction = MethodType(_no_plot, tft)
+    
     # Train the model
     trainer.fit(tft, train_dataloader, val_dataloader)
 
