@@ -1116,9 +1116,9 @@ def gcs_exists(path: str) -> bool:
     except Exception:
         return False
 
-TRAIN_URI = f"{GCS_DATA_PREFIX}/universal_train.parquet_10k"
-VAL_URI   = f"{GCS_DATA_PREFIX}/universal_val.parquet_10k"
-TEST_URI  = f"{GCS_DATA_PREFIX}/universal_test.parquet_10k"
+TRAIN_URI = f"{GCS_DATA_PREFIX}/universal_train.parquet"
+VAL_URI   = f"{GCS_DATA_PREFIX}/universal_val.parquet"
+TEST_URI  = f"{GCS_DATA_PREFIX}/universal_test.parquet"
 READ_PATHS = [str(TRAIN_URI), str(VAL_URI), str(TEST_URI)]
 '''
 # If a local data folder is explicitly provided, use it and skip GCS
