@@ -1481,25 +1481,56 @@ def _evaluate_decoded_metrics(
                 pred = pred["prediction"]
 
             # ---- extract heads ----
-            def _median_q(t):
-                if torch.is_tensor(t) and t.ndim == 3 and t.size(1) == 1:
-                    t = t.squeeze(1)
-                if torch.is_tensor(t) and t.ndim == 2 and t.size(-1) >= 1:
-                    return t[:, t.size(-1) // 2]
+            # ---- extract heads (robust; mirrors callback) ----
+            def _to_median_q(t):
+                if t is None:
+                    return None
+                if torch.is_tensor(t):
+                    # squeeze pred_len dim if present
+                    if t.ndim >= 4 and t.size(1) == 1:
+                        t = t.squeeze(1)
+                    if t.ndim == 3 and t.size(1) == 1:
+                        t = t.squeeze(1)  # [B, K] or [B, 1]
+                    if t.ndim == 2 and t.size(-1) >= 1:
+                        return t[:, t.size(-1) // 2]  # median quantile
+                    if t.ndim == 1:
+                        return t
                 return t
 
+            def _to_dir_logit(t):
+                if t is None:
+                    return None
+                if torch.is_tensor(t):
+                    # squeeze pred_len dim if present
+                    if t.ndim >= 4 and t.size(1) == 1:
+                        t = t.squeeze(1)
+                    if t.ndim == 3 and t.size(1) == 1:
+                        t = t.squeeze(1)  # [B, K] or [B, 1]
+                    if t.ndim == 2:
+                        # if replicated across K, take middle slot; else squeeze singleton
+                        if t.size(-1) > 1:
+                            return t[:, t.size(-1) // 2]
+                        return t.squeeze(-1)
+                    if t.ndim == 1:
+                        return t
+                return t
+
+            p_vol, p_dir = None, None
             if isinstance(pred, (list, tuple)):
-                p_vol = _median_q(pred[0])
-                p_dir = pred[1] if len(pred) > 1 else None
+                p_vol = _to_median_q(pred[0])
+                p_dir = _to_dir_logit(pred[1] if len(pred) > 1 else None)
             elif torch.is_tensor(pred):
                 t = pred
-                if t.ndim == 4 and t.size(1) == 1:
+                # squeeze pred_len dim if present: [B, 1, 2, K] -> [B, 2, K]
+                if t.ndim >= 4 and t.size(1) == 1:
                     t = t.squeeze(1)
                 if t.ndim == 3 and t.size(1) >= 2:
-                    p_vol = _median_q(t[:, 0, :])
-                    p_dir = t[:, 1, :]
+                    vol = t[:, 0, :]  # [B, K]
+                    d   = t[:, 1, :]  # [B, K] (replicated logits) or [B, 1]
+                    p_vol = _to_median_q(vol)
+                    p_dir = _to_dir_logit(d)
                 elif t.ndim >= 2:
-                    p_vol = _median_q(t)
+                    p_vol = _to_median_q(t)
                     p_dir = None
                 else:
                     skipped_reasons["bad_pred_format"] += 1
@@ -1508,7 +1539,7 @@ def _evaluate_decoded_metrics(
                 skipped_reasons["bad_pred_format"] += 1
                 continue
 
-            if not (torch.is_tensor(p_vol) and torch.is_tensor(g)):
+            if not torch.is_tensor(p_vol) or not torch.is_tensor(g):
                 skipped_reasons["bad_pred_format"] += 1
                 continue
 
@@ -1528,9 +1559,14 @@ def _evaluate_decoded_metrics(
             p_all.append(p_dec.detach().cpu())
             g_all.append(g.detach().cpu())
 
-            if torch.is_tensor(y_dir) and p_dir is not None:
-                yd_all.append(y_dir.detach().cpu())
-                pd_all.append(p_dir.detach().cpu())
+            # collect direction only if both available
+            if torch.is_tensor(y_dir) and torch.is_tensor(p_dir):
+                yd_flat = y_dir.reshape(-1)
+                pd_flat = p_dir.reshape(-1)
+                L2 = min(yd_flat.numel(), pd_flat.numel())
+                if L2 > 0:
+                    yd_all.append(yd_flat[:L2].detach().cpu())
+                    pd_all.append(pd_flat[:L2].detach().cpu())
 
     if not y_all:
         print("[FI] No valid batches produced targets/predictions; dataset may be empty or shapes unexpected.")
