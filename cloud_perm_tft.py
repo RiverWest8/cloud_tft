@@ -114,17 +114,8 @@ test_df = None
 # -----------------------
 # 3) Build PF datasets
 # -----------------------
-# calendar/known features (minimal)
 calendar_cols = []
 time_varying_known_reals = calendar_cols + ["time_idx"]  # + any of your calendar cols
-# numeric candidates
-all_numeric = train_df.select_dtypes(include=[np.number]).columns.tolist()
-
-# ensure realised_vol is NOT used as a feature (target only)
-time_varying_unknown_reals = [
-    c for c in all_numeric
-    if c not in (calendar_cols + ["time_idx", "realised_vol"])
-]
 
 # (optional) remove realised_vol from the feature frame if you really want zero chance of leak
 # NOTE: PF will still get the target from the 'target' argument, so we keep the column.
@@ -439,6 +430,14 @@ def main():
     BATCH_SIZE = args.batch_size
     ENC_LEN = args.max_encoder_length
 
+    # numeric candidates after loading data
+    all_numeric = train_df.select_dtypes(include=[np.number]).columns.tolist()
+    # ensure realised_vol is NOT used as a feature (target only)
+    time_varying_unknown_reals = [
+        c for c in all_numeric
+        if c not in (calendar_cols + ["time_idx", "realised_vol"])
+    ]
+
     # Rebuild datasets with loaded data
     global training_dataset, validation_dataset, test_dataset
     training_dataset = TimeSeriesDataSet(
@@ -452,10 +451,7 @@ def main():
         max_prediction_length=PRED_LEN,
         static_categoricals=GROUP_ID,
         time_varying_known_reals=calendar_cols + ["time_idx"],
-        time_varying_unknown_reals=[
-            c for c in train_df.select_dtypes(include=[np.number]).columns.tolist()
-            if c not in (calendar_cols + ["time_idx", "realised_vol"])
-        ],
+        time_varying_unknown_reals=time_varying_unknown_reals,
         add_relative_time_idx=True,
         add_target_scales=True,
         add_encoder_length=True,
