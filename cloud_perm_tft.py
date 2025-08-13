@@ -472,7 +472,7 @@ class PerAssetMetrics(pl.Callback):
         ratio_all    = sigma2_all / sigma2_p_all  # true/forecast
         overall_qlike = (ratio_all - torch.log(ratio_all) - 1.0).mean().item()
 
-        # —— expose decoded metrics, but DO NOT override PF's native val_loss ——
+        # —— expose decoded metrics and define a combined val_loss = MAE + RMSE + 0.05 * DirBCE ——
         try:
             import torch as _torch
             # Direction BCE (logits-aware) over all collected val samples
@@ -484,18 +484,31 @@ class PerAssetMetrics(pl.Callback):
                 if _torch.isfinite(pt).any() and (pt.min() < 0 or pt.max() > 1):
                     # label smoothing 0.1 (same as training)
                     yt_s = yt * 0.9 + 0.05
-                    dir_bce = F.binary_cross_entropy_with_logits(pt, yt_s)
+                    dir_bce_t = F.binary_cross_entropy_with_logits(pt, yt_s)
                 else:
                     p = _torch.clamp(pt, 1e-7, 1 - 1e-7)
                     yt_s = yt * 0.9 + 0.05
-                    dir_bce = F.binary_cross_entropy(p, yt_s)
-                dir_bce = float(dir_bce.item())
-            # Composite validation metric (decoded): MAE + RMSE (direction excluded)
+                    dir_bce_t = F.binary_cross_entropy(p, yt_s)
+                dir_bce = float(dir_bce_t.item())
+
+            # Base composite (decoded): MAE + RMSE
             comp_val = float(overall_mae) + float(overall_rmse)
+            # Add small weight on direction (BCE) if available
+            if dir_bce is not None and np.isfinite(dir_bce):
+                comp_val_full = comp_val + 0.05 * float(dir_bce)
+            else:
+                comp_val_full = comp_val
+
+            # Log individual components and the combined loss that we want to track
             trainer.callback_metrics["val_mae_dec"] = _torch.tensor(float(overall_mae))
             trainer.callback_metrics["val_rmse_dec"] = _torch.tensor(float(overall_rmse))
-            trainer.callback_metrics["val_dir_bce"] = _torch.tensor(float(dir_bce)) if dir_bce is not None else _torch.tensor(float('nan'))
-            trainer.callback_metrics["val_loss_decoded"] = _torch.tensor(comp_val)
+            trainer.callback_metrics["val_dir_bce"] = (
+                _torch.tensor(float(dir_bce)) if dir_bce is not None else _torch.tensor(float('nan'))
+            )
+            # The key below is what Lightning callbacks (EarlyStopping/Checkpoint) commonly monitor by default
+            trainer.callback_metrics["val_loss"] = _torch.tensor(comp_val_full)
+            # Keep a named alias for clarity in logs
+            trainer.callback_metrics["val_loss_decoded"] = _torch.tensor(comp_val_full)
         except Exception:
             pass
 
@@ -509,11 +522,10 @@ class PerAssetMetrics(pl.Callback):
             "pd": pd_cpu,
         }
 
-        # -----------------------------------------------------------------------
-        # Permutation Importance Helpers (decoded metric = MAE + RMSE)
-        # -----------------------------------------------------------------------
 
-
+        # -----------------------------------------------------------------------
+        # Permutation Importance helpers at module scope (decoded metric = MAE + RMSE)
+        # -----------------------------------------------------------------------
 
         def _extract_norm_from_dataset(ds: TimeSeriesDataSet):
             """Return the GroupNormalizer used for realised_vol in our MultiNormalizer."""
@@ -607,10 +619,10 @@ class PerAssetMetrics(pl.Callback):
                         else:
                             p_vol = t
                     else:
-                        continue
+                        return float("nan"), float("nan"), 0
 
                     if not (torch.is_tensor(y_vol) and torch.is_tensor(p_vol) and torch.is_tensor(g)):
-                        continue
+                        return float("nan"), float("nan"), 0
 
                     # decode back to physical scale
                     try:
@@ -689,6 +701,9 @@ class PerAssetMetrics(pl.Callback):
             except Exception as e:
                 print(f"[WARN] Failed to save FI: {e}")
 
+
+
+
         # ---- concise per-epoch validation metrics printout (overall only) ----
         try:
             epoch_num = int(getattr(trainer, "current_epoch", -1)) + 1
@@ -718,6 +733,20 @@ class PerAssetMetrics(pl.Callback):
                 + (f"| ACC={acc:.3f} " if acc is not None else "")
                 + f"| N={N}"
             )
+            # Append combined loss to msg
+            try:
+                # reuse the same composition for display
+                _dir_display = None
+                if yd_cpu is not None and pd_cpu is not None and yd_cpu.numel() > 0 and pd_cpu.numel() > 0:
+                    pt_disp = pd_cpu
+                    if torch.isfinite(pt_disp).any() and (pt_disp.min() < 0 or pt_disp.max() > 1):
+                        _dir_display = float(F.binary_cross_entropy_with_logits(pt_disp, (yd_cpu.float()*0.9+0.05)).item())
+                    else:
+                        _dir_display = float(F.binary_cross_entropy(torch.clamp(pt_disp,1e-7,1-1e-7), (yd_cpu.float()*0.9+0.05)).item())
+                _val_loss_disp = (overall_mae + overall_rmse) + (0.05 * _dir_display if _dir_display is not None else 0.0)
+                msg += f"| VAL_LOSS={_val_loss_disp:.6f}"
+            except Exception:
+                pass
             print(msg)
 
             # Expose to callback metrics for progress bar if desired
@@ -1777,6 +1806,7 @@ if __name__ == "__main__":
     # -----------------------------------------------------------------------
     # Training
     # -----------------------------------------------------------------------
+
 
     # ----------------- Permutation importance loss scaling helper -----------------
     def _scale_loss(val):
