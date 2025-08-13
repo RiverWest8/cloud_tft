@@ -496,6 +496,8 @@ def main():
     from types import MethodType
     tft.training_step  = MethodType(_training_step_decoded, tft)
     tft.validation_step = MethodType(_validation_step_decoded, tft)
+    # Disable built-in interpretation logging to prevent empty outputs error
+    tft.log_interpretation = lambda *args, **kwargs: None
 
     # Build local run directory based on local_out_dir and gcs_output_prefix
     if args.gcs_output_prefix:
