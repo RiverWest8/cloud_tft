@@ -149,25 +149,12 @@ def safe_decode_vol(values: torch.Tensor, vol_norm, group_ids: torch.Tensor) -> 
         # last resort: identity (shouldn't happen if normalizer is from training_dataset)
         return values.squeeze(-1)
 
-vol_norm = _extract_norm_from_dataset(training_dataset)
+## vol_norm will be set after datasets are created in main()
 
 # -----------------------
 # 5) Build TFT model
 # -----------------------
-tft = TemporalFusionTransformer.from_dataset(
-    training_dataset,
-    learning_rate=LR,
-    hidden_size=64,
-    attention_head_size=4,
-    dropout=0.1,
-    hidden_continuous_size=32,
-    output_size=7,             # 7 quantiles
-    loss=QuantileLoss(),       # head produces quantiles; we override training loss below
-    log_interval=10,
-    reduce_on_plateau_patience=4,
-)
-# attach normalizer so our custom steps can decode
-tft.vol_norm = vol_norm
+## tft will be created after datasets exist in main()
 
 # -----------------------
 # 6) Train on DECODED scale (override training/validation steps)
@@ -295,8 +282,7 @@ def _validation_step_decoded(self, batch, batch_idx):
     self.log("val_rmse_dec", torch.sqrt(mse.detach()), prog_bar=True, on_step=False, on_epoch=True)
     return {"val_loss": (mse + mae).detach()}
 
-tft.training_step  = MethodType(_training_step_decoded, tft)
-tft.validation_step = MethodType(_validation_step_decoded, tft)
+## tft.training_step and validation_step will be set after tft is created in main()
 
 # -----------------------
 # 7) Train
@@ -448,6 +434,29 @@ def main():
         num_workers=args.num_workers,
         prefetch_factor=args.prefetch_factor
     )
+
+    # Now extract the normalizer and build the TFT model
+    vol_norm = _extract_norm_from_dataset(training_dataset)
+    global tft
+    tft = TemporalFusionTransformer.from_dataset(
+        training_dataset,
+        learning_rate=LR,
+        hidden_size=64,
+        attention_head_size=4,
+        dropout=0.1,
+        hidden_continuous_size=32,
+        output_size=7,             # 7 quantiles
+        loss=QuantileLoss(),       # head produces quantiles; we override training loss below
+        log_interval=10,
+        reduce_on_plateau_patience=4,
+    )
+    # attach normalizer so our custom steps can decode
+    tft.vol_norm = vol_norm
+
+    # Attach custom training/validation steps
+    from types import MethodType
+    tft.training_step  = MethodType(_training_step_decoded, tft)
+    tft.validation_step = MethodType(_validation_step_decoded, tft)
 
     accelerator = "gpu" if torch.cuda.is_available() else "cpu"
     trainer = Trainer(
