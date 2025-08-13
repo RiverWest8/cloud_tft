@@ -1815,13 +1815,28 @@ if __name__ == "__main__":
         check_val_every_n_epoch=int(ARGS.check_val_every_n_epoch),
         log_every_n_steps=int(ARGS.log_every_n_steps),
     )
-    from types import MethodType
-    def _no_plot(self, *args, **kwargs):
-        return None
 
-    # Make plot_prediction a no-op so validation won't try to render Matplotlib figures.
-    tft.plot_prediction = MethodType(_no_plot, tft)
-    
+
+    from types import MethodType
+
+    # Completely skip PF's internal figure creation & TensorBoard logging during validation.
+    def _no_log_prediction(self, *args, **kwargs):
+        # Intentionally do nothing so BaseModel.create_log won't attempt to log a Matplotlib figure.
+        return
+
+    tft.log_prediction = MethodType(_no_log_prediction, tft)
+
+    # (Optional, extra safety) If any PF path calls plot_prediction directly, hand back a blank figure
+    # so nothing touches your tensors or bf16 -> NumPy conversion.
+    def _blank_plot(self, *args, **kwargs):
+        import matplotlib
+        matplotlib.use("Agg", force=True)  # headless-safe backend
+        import matplotlib.pyplot as plt
+        fig = plt.figure()
+        return fig
+
+    tft.plot_prediction = MethodType(_blank_plot, tft)
+
     # Train the model
     trainer.fit(tft, train_dataloader, val_dataloader)
 
