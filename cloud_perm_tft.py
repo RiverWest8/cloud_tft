@@ -1745,7 +1745,7 @@ if __name__ == "__main__":
                 GroupNormalizer(
                     groups=GROUP_ID,
                     center=False,
-                    scale_by_group=True,
+                    standardize = True,
                     transformation="asinh",
                 ),
                 TorchNormalizer(method="identity", center=False),   # direction
