@@ -1632,6 +1632,11 @@ if __name__ == "__main__":
     test_dataset = TimeSeriesDataSet.from_dataset(
         training_dataset, test_df, predict=False, stop_randomization=True
     )
+    # DEBUG: Force small subset for overfitting test
+    subset_size = 512
+    training_dataset.data = training_dataset.data.iloc[:subset_size]
+    validation_dataset.data = validation_dataset.data.iloc[:subset_size]
+    test_dataset.data = test_dataset.data.iloc[:subset_size]
 
     # (optional) quick alignment check
     try:
