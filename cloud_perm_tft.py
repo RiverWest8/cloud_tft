@@ -1027,7 +1027,7 @@ def get_resume_ckpt_path():
     except Exception as e:
         print(f"[WARN] Could not fetch resume checkpoint from GCS: {e}")
     return None
-
+'''
 def mirror_local_ckpts_to_gcs():
     if fs is None:
         print("[WARN] GCS not available; skipping checkpoint upload.")
@@ -1048,7 +1048,7 @@ class MirrorCheckpoints(pl.Callback):
         mirror_local_ckpts_to_gcs()
     def on_train_end(self, trainer, pl_module):
         mirror_local_ckpts_to_gcs()
-
+'''
 GROUP_ID: List[str] = ["asset"]
 TIME_COL = "Time"
 TARGETS  = ["realised_vol", "direction"]
