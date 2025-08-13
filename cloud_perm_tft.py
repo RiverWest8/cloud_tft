@@ -17,18 +17,16 @@ from pytorch_forecasting.models import TemporalFusionTransformer
 from pytorch_forecasting.metrics import QuantileLoss
 
 # Google Cloud Storage config
+# Google Cloud Storage config with env + CLI override support
 GCS_BUCKET = os.environ.get("GCS_BUCKET", "river-ml-bucket")
 GCS_DATA_PREFIX = f"gs://{GCS_BUCKET}/Data/CleanedData"
 GCS_OUTPUT_PREFIX = f"gs://{GCS_BUCKET}/Dissertation/TFT"
-TRAIN_URI = f"{GCS_DATA_PREFIX}/universal_train.parquet"
-VAL_URI   = f"{GCS_DATA_PREFIX}/universal_val.parquet"
-TEST_URI  = f"{GCS_DATA_PREFIX}/universal_test.parquet"
-READ_PATHS = [str(TRAIN_URI), str(VAL_URI), str(TEST_URI)]
 
-HOME = Path.home()
-TRAIN_P = Path(os.getenv("TRAIN_PATH", str(HOME / "Desktop" / "Data" / "CleanedData" / "universal_train.parquet")))
-VAL_P   = Path(os.getenv("VAL_PATH", str(HOME / "Desktop" / "Data" / "CleanedData" / "universal_val.parquet")))
-TEST_P  = Path(os.getenv("TEST_PATH", str(HOME / "Desktop" / "Data" / "CleanedData" / "universal_test.parquet")))
+# Allow CLI overrides later in main()
+TRAIN_P = Path(f"{GCS_DATA_PREFIX}/universal_train.parquet")
+VAL_P   = Path(f"{GCS_DATA_PREFIX}/universal_val.parquet")
+TEST_P  = Path(f"{GCS_DATA_PREFIX}/universal_test.parquet")
+READ_PATHS = [str(TRAIN_P), str(VAL_P), str(TEST_P)]
 
 # -----------------------
 # 0) Register asinh
