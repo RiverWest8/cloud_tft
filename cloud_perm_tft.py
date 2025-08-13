@@ -1816,6 +1816,26 @@ if __name__ == "__main__":
         log_every_n_steps=int(ARGS.log_every_n_steps),
     )
 
+
+    # put this right before trainer.fit(...)
+    from types import MethodType
+    def _safe_plot(self, *args, **kwargs):
+        import torch
+        def cast(x):
+            if torch.is_tensor(x): return x.detach().float().cpu()
+            if isinstance(x, (list, tuple)): return type(x)(cast(v) for v in x)
+            if isinstance(x, dict): return {k: cast(v) for k, v in x.items()}
+            return x
+        args = tuple(cast(a) for a in args)
+        kwargs = {k: cast(v) for k, v in kwargs.items()}
+        try:
+            return super(type(self), self).plot_prediction(*args, **kwargs)
+        except Exception:
+            return None
+
+    tft.plot_prediction = MethodType(_safe_plot, tft)
+    tft.log_interval = 50
+    tft.log_val_interval = 10
     # Train the model
     trainer.fit(tft, train_dataloader, val_dataloader)
 
@@ -1842,7 +1862,7 @@ if __name__ == "__main__":
     # --- Safe plotting/logging: deep-cast any nested tensors to CPU float32 ---
     # --- Safe plotting/logging: class-level patch to handle bf16 + integer lengths robustly ---
 
-    from pytorch_forecasting.models.base._base_model import BaseModel
+    from pytorch_forecasting.models.base._base_model import BaseModel # type: ignore
 
     def _deep_cpu_float(x):
         if torch.is_tensor(x):
@@ -1895,17 +1915,3 @@ if __name__ == "__main__":
                     x[key] = _to_numpy_int64_array(x[key])
         return x
 
-# Patch BaseModel.plot_prediction so it always receives CPU float32 data and int64 lengths
-if hasattr(BaseModel, "plot_prediction"):
-    _orig_plot_prediction = BaseModel.plot_prediction
-
-    def _plot_prediction_safe(self, x, *args, **kwargs):
-        try:
-            x = _fix_lengths_in_x(_deep_cpu_float(x))
-            args = tuple(_deep_cpu_float(a) for a in args)
-            kwargs = {k: _deep_cpu_float(v) for k, v in kwargs.items()}
-        except Exception:
-            pass
-        return _orig_plot_prediction(self, x, *args, **kwargs)
-
-    BaseModel.plot_prediction = _plot_prediction_safe
