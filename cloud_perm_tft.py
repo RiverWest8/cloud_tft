@@ -465,17 +465,27 @@ class PerAssetMetrics(pl.Callback):
         pd_cpu = pdir.detach().cpu() if pdir is not None else None
 
         # --- Calibrate predictions before metrics ---
+        # --- Robust calibration BEFORE metrics (pull median(y/p) → 1) ---
         with torch.no_grad():
             mask = torch.isfinite(yv_dec_all) & torch.isfinite(pv_dec_all) & (pv_dec_all.abs() > 1e-12)
             if mask.any():
-                # Solve y ≈ a * p + b via least squares
-                A = torch.stack([pv_dec_all[mask], torch.ones_like(pv_dec_all[mask])], dim=1)
-                sol = torch.linalg.lstsq(A, yv_dec_all[mask]).solution
-                a, b = float(sol[0]), float(sol[1])
-                # Clamp extremes to avoid blow-ups
-                a = max(0.25, min(4.0, a))
-                b = max(-5.0, min(5.0, b))
-                pv_dec_all = a * pv_dec_all + b
+                # Global multiplicative scale via median ratio
+                ratio = yv_dec_all[mask] / (pv_dec_all[mask] + 1e-12)
+                a_global = float(torch.nanmedian(ratio).item())
+                a_global = max(0.25, min(4.0, a_global))
+                pv_dec_all = pv_dec_all * a_global
+
+                # Optional per-asset refinement (keeps assets on their own scales)
+                try:
+                    for gid in torch.unique(g_cpu):
+                        m = (g_cpu == gid) & mask
+                        if m.any():
+                            r_g = yv_dec_all[m] / (pv_dec_all[m] + 1e-12)
+                            a_g = float(torch.nanmedian(r_g).item())
+                            a_g = max(0.25, min(4.0, a_g))
+                            pv_dec_all[m] = pv_dec_all[m] * a_g
+                except Exception:
+                    pass
 
         # Debug check
         print(f"[VAL DEBUG] mean(y)={yv_dec_all.mean():.6g} mean(p)={pv_dec_all.mean():.6g}")
@@ -1082,8 +1092,8 @@ RUN_SUFFIX = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 MODEL_SAVE_PATH = (LOCAL_CKPT_DIR / f"tft_realised_vol_e{MAX_EPOCHS}_{RUN_SUFFIX}.ckpt")
 
 SEED = 50
-WEIGHT_DECAY = 0.00578350719515325     # weight decay for AdamW
-GRADIENT_CLIP_VAL = 0.78    # gradient clipping value for Trainer
+WEIGHT_DECAY = 1e-4 #0.00578350719515325     # weight decay for AdamW
+GRADIENT_CLIP_VAL = 1 #0.78    # gradient clipping value for Trainer
 # Feature-importance controls
 ENABLE_FEATURE_IMPORTANCE = True   # gate FI so you can toggle it
 FI_MAX_BATCHES = 16       # number of val batches to sample for FI
@@ -1197,6 +1207,19 @@ def _extract_norm_from_dataset(ds: TimeSeriesDataSet):
         pass
     return None
 
+def _point_from_quantiles(vol_q: torch.Tensor) -> torch.Tensor:
+    """
+    Turn 7 vol quantiles into a point forecast using trapezoid rule.
+    """
+    assert vol_q.size(-1) == 7
+    p = torch.tensor([0.05, 0.165, 0.25, 0.50, 0.75, 0.835, 0.95],
+                    device=vol_q.device, dtype=vol_q.dtype)
+    w = torch.empty_like(p)
+    w[0]  = 0.5 * (p[1] - 0.0)
+    w[-1] = 0.5 * (1.0 - p[-2])
+    w[1:-1] = 0.5 * (p[2:] - p[:-2])
+    w = w / w.sum()
+    return (vol_q * w).sum(dim=-1)
 
 
 def _evaluate_decoded_metrics(
@@ -1379,7 +1402,7 @@ def _evaluate_decoded_metrics(
 
             p_vol, p_dir = None, None
             if isinstance(pred, (list, tuple)):
-                p_vol = _to_median_q(pred[0])
+                p_vol = _point_from_quantiles(pred[0])
                 p_dir = _to_dir_logit(pred[1] if len(pred) > 1 else None)
             elif torch.is_tensor(pred):
                 t = pred
@@ -1717,7 +1740,7 @@ if __name__ == "__main__":
         training_dataset,
         hidden_size=64,
         attention_head_size=2,
-        dropout=0.0833704625250354,
+        dropout=0.05 #0.0833704625250354,
         hidden_continuous_size=16,
         learning_rate=(LR_OVERRIDE if LR_OVERRIDE is not None else 0.0019),
         optimizer="AdamW",
@@ -1726,7 +1749,7 @@ if __name__ == "__main__":
         loss=MultiLoss([
             AsymmetricQuantileLoss(
                 quantiles=[0.05, 0.165, 0.25, 0.5, 0.75, 0.835, 0.95],
-                underestimation_factor=1.115,  # keep asymmetric penalty
+                underestimation_factor= 1 #1.115,  # keep asymmetric penalty
             ),
             LabelSmoothedBCE(smoothing=0.1),
         ], weights=[FIXED_VOL_WEIGHT, FIXED_DIR_WEIGHT]),
