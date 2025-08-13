@@ -1826,5 +1826,3 @@ if __name__ == "__main__":
                     x[key] = _to_numpy_int64_array(x[key])
         return x
 
-    # Patch BaseModel.plot_prediction so it always receives CPU float32 data and int64 lengths
-    if hasattr(BaseModel, "plot_prediction"):
