@@ -642,7 +642,7 @@ class PerAssetMetrics(pl.Callback):
                 "overall": {k: v for k, v in overall.items() if k in ("mae","rmse","mse","qlike","val_loss","dir_bce")},
                 "direction_overall": dir_overall,
                 "per_asset": [
-                    {"asset": r[0], "mae": r[1], "rmse": r[2], "mse": r[3], "qlike": r[4], "acc": r[5], "n": r[6], "val_l" : r[7]}
+                    {"asset": r[0], "mae": r[1], "rmse": r[2], "mse": r[3], "qlike": r[4], "acc": r[5], "n": r[6]}
                     for r in rows
                 ],
             }
