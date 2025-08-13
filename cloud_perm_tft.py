@@ -1770,6 +1770,30 @@ if __name__ == "__main__":
         reduce_on_plateau_patience=5,
         reduce_on_plateau_min_lr=1e-5,
     )
+    # ---------------------------------------------------------------
+    # Train the model
+    trainer.fit(tft, train_dataloader, val_dataloader, ckpt_path=resume_ckpt)
+
+    # Run FI permutation testing if enabled
+    if ENABLE_FEATURE_IMPORTANCE:
+        fi_csv = str(LOCAL_OUTPUT_DIR / f"tft_perm_importance_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv")
+        feats = time_varying_unknown_reals.copy()
+        # (optional) drop calendar features from FI to focus on learned signals
+        feats = [f for f in feats if f not in ("sin_tod", "cos_tod", "sin_dow", "cos_dow", "Is_Weekend")]
+        run_permutation_importance(
+            model=tft,
+            base_df=val_df,
+            build_ds_fn=build_dataset,
+            features=feats,
+            block_size=int(PERM_BLOCK_SIZE) if PERM_BLOCK_SIZE else 1,
+            batch_size=batch_size,
+            max_batches=int(FI_MAX_BATCHES) if FI_MAX_BATCHES else 20,
+            num_workers=worker_cnt,
+            prefetch=prefetch,
+            pin_memory=pin,
+            out_csv_path=fi_csv,
+            uploader=upload_file_to_gcs,
+        )
     # --- Safe plotting/logging: deep-cast any nested tensors to CPU float32 ---
     # --- Safe plotting/logging: class-level patch to handle bf16 + integer lengths robustly ---
 
