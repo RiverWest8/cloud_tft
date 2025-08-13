@@ -413,7 +413,9 @@ def main():
     test_df  = test_df.iloc[:TEST_N].copy()
 
     print(f"[INFO] train={train_df.shape}, val={val_df.shape}, test={test_df.shape}")
-    print(f"[INFO] mean realised_vol(train)={train_df['realised_vol'].mean():.6g}")
+    print(f"[INFO] mean realised_vol (train subset)={train_df['realised_vol'].mean():.6g}")
+    print(f"[INFO] mean realised_vol (val subset)={val_df['realised_vol'].mean():.6g}")
+    print(f"[INFO] mean realised_vol (test subset)={test_df['realised_vol'].mean():.6g}")
 
     # Override constants with CLI args
     MAX_EPOCHS = args.max_epochs
@@ -520,6 +522,12 @@ def main():
         mode="min",
         save_last=True,
     )
+    # Enable Tensor Core acceleration with mixed precision
+    if torch.cuda.is_available():
+        torch.set_float32_matmul_precision('high')
+        precision_mode = "bf16-mixed"
+    else:
+        precision_mode = 32
     accelerator = "gpu" if torch.cuda.is_available() else "cpu"
     trainer = Trainer(
         max_epochs=MAX_EPOCHS,
@@ -529,7 +537,8 @@ def main():
         check_val_every_n_epoch=args.check_val_every_n_epoch,
         default_root_dir=str(local_run_dir),
         callbacks=[checkpoint_callback],
-        enable_checkpointing=True
+        enable_checkpointing=True,
+        precision=precision_mode
     )
     print("[INFO] CLI args:", vars(args))
     print("▶ Training TFT on decoded scale (MAE+MSE)…")
