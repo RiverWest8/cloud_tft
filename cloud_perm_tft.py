@@ -447,6 +447,10 @@ class PerAssetMetrics(pl.Callback):
         except Exception:
             pv_dec_t = pv
         
+        print("DEBUG transformation:", getattr(self.vol_norm, "transformation", None))
+        yv_dec_t_test = self.vol_norm.decode(yv.unsqueeze(-1), group_ids=g.unsqueeze(-1)).squeeze(-1)
+        print("DEBUG mean after decode:", yv_dec_t_test.mean().item())
+        
         print(
         "DEBUG: mean(yv_dec)=", yv_dec_t.mean().item(),
         "mean(pv_dec)=", pv_dec_t.mean().item(),
