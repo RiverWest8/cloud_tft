@@ -1116,9 +1116,9 @@ def gcs_exists(path: str) -> bool:
     except Exception:
         return False
 
-TRAIN_URI = f"{GCS_DATA_PREFIX}/universal_train.parquet"
-VAL_URI   = f"{GCS_DATA_PREFIX}/universal_val.parquet"
-TEST_URI  = f"{GCS_DATA_PREFIX}/universal_test.parquet"
+TRAIN_URI = f"{GCS_DATA_PREFIX}/universal_train.parquet_10k"
+VAL_URI   = f"{GCS_DATA_PREFIX}/universal_val.parquet_10k"
+TEST_URI  = f"{GCS_DATA_PREFIX}/universal_test.parquet_10k"
 READ_PATHS = [str(TRAIN_URI), str(VAL_URI), str(TEST_URI)]
 '''
 # If a local data folder is explicitly provided, use it and skip GCS
@@ -1382,7 +1382,7 @@ def _evaluate_decoded_metrics(
                 break
             # Move all tensors in batch to the model's device
             batch = tuple(t.to(model_device) if torch.is_tensor(t) else t for t in batch)
-            
+
             if isinstance(batch, (list, tuple)) and len(batch) >= 2:
                 x, y = batch[0], batch[1]
             else:
@@ -1929,10 +1929,10 @@ if __name__ == "__main__":
             build_ds_fn=build_dataset,
             features=feats,
             block_size=int(PERM_BLOCK_SIZE) if PERM_BLOCK_SIZE else 1,
-            batch_size=batch_size,
+            batch_size= 2048,
             max_batches=int(FI_MAX_BATCHES) if FI_MAX_BATCHES else 20,
-            num_workers=worker_cnt,
-            prefetch=prefetch,
+            num_workers= 4,
+            prefetch= 2,
             pin_memory=pin,
             out_csv_path=fi_csv,
             uploader=upload_file_to_gcs,
