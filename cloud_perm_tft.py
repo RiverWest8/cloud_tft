@@ -7,6 +7,8 @@ import torch
 import torch.nn.functional as F
 import json
 import gcsfs
+from datetime import datetime
+import io
 
 from lightning.pytorch import Trainer, seed_everything
 from pytorch_forecasting import TimeSeriesDataSet
@@ -289,6 +291,10 @@ def _validation_step_decoded(self, batch, batch_idx):
 # -----------------------
 
 def save_predictions_and_metrics(model, dataloader, output_prefix):
+    """
+    Save validation predictions and metrics either to a local directory or to a GCS prefix.
+    output_prefix: either a local directory or GCS URI (gs://...)
+    """
     model.eval()
     device = next(model.parameters()).device
     y_trues = []
@@ -301,35 +307,67 @@ def save_predictions_and_metrics(model, dataloader, output_prefix):
             p_vol = _extract_vol_pred_from_output(pred)
             y_vol = _extract_y_vol_from_batch(x, y)
             g     = _extract_groups_from_batch(x)
-
             g_ids = g.to(device).unsqueeze(-1)
             y_dec = safe_decode_vol(y_vol.to(device).unsqueeze(-1), model.vol_norm, g_ids).squeeze(-1).cpu()
             p_dec = safe_decode_vol(p_vol.to(device).unsqueeze(-1), model.vol_norm, g_ids).squeeze(-1).cpu()
             p_dec = torch.clamp(p_dec, min=1e-8)
-
             y_trues.append(y_dec)
             y_preds.append(p_dec)
 
     y_true_all = torch.cat(y_trues, dim=0).numpy()
     y_pred_all = torch.cat(y_preds, dim=0).numpy()
-
     df_out = pd.DataFrame({"y_true": y_true_all, "y_pred": y_pred_all})
-
     mae = float(np.mean(np.abs(y_pred_all - y_true_all)))
-    rmse = float(np.sqrt(np.mean((y_pred_all - y_true_all)**2)))
+    rmse = float(np.sqrt(np.mean((y_pred_all - y_true_all) ** 2)))
     metrics = {"mae": mae, "rmse": rmse}
 
-    output_prefix_path = Path(output_prefix)
-    output_prefix_path.mkdir(parents=True, exist_ok=True)
-    parquet_path = output_prefix_path / "val_predictions.parquet"
-    json_path = output_prefix_path / "val_metrics.json"
+    if str(output_prefix).startswith("gs://"):
+        fs = gcsfs.GCSFileSystem()
+        prefix = output_prefix.rstrip("/")
+        # Write val_predictions.parquet
+        parquet_buf = io.BytesIO()
+        df_out.to_parquet(parquet_buf, index=False)
+        parquet_buf.seek(0)
+        parquet_path = f"{prefix}/val_predictions.parquet"
+        with fs.open(parquet_path, "wb") as f:
+            f.write(parquet_buf.read())
+        # Write val_metrics.json
+        json_buf = io.StringIO()
+        json.dump(metrics, json_buf)
+        json_buf.seek(0)
+        json_path = f"{prefix}/val_metrics.json"
+        with fs.open(json_path, "w") as f:
+            f.write(json_buf.read())
+        print(f"[INFO] Saved validation predictions to {parquet_path}")
+        print(f"[INFO] Saved validation metrics to {json_path}")
+    else:
+        output_prefix_path = Path(output_prefix)
+        output_prefix_path.mkdir(parents=True, exist_ok=True)
+        parquet_path = output_prefix_path / "val_predictions.parquet"
+        json_path = output_prefix_path / "val_metrics.json"
+        df_out.to_parquet(parquet_path)
+        with open(json_path, "w") as f:
+            json.dump(metrics, f)
+        print(f"[INFO] Saved validation predictions to {parquet_path}")
+        print(f"[INFO] Saved validation metrics to {json_path}")
 
-    df_out.to_parquet(parquet_path)
-    with open(json_path, "w") as f:
-        json.dump(metrics, f)
 
-    print(f"[INFO] Saved validation predictions to {parquet_path}")
-    print(f"[INFO] Saved validation metrics to {json_path}")
+# -----------------------
+# 8) Helper: upload local checkpoint dir to GCS
+# -----------------------
+def upload_local_dir_to_gcs(local_ckpt_dir, gcs_output_prefix):
+    """
+    Uploads all files from local_ckpt_dir to GCS under gcs_output_prefix/ckpts/
+    """
+    fs = gcsfs.GCSFileSystem()
+    local_ckpt_dir = Path(local_ckpt_dir)
+    gcs_ckpt_prefix = gcs_output_prefix.rstrip("/") + "/ckpts"
+    for file in local_ckpt_dir.glob("*"):
+        if file.is_file():
+            gcs_path = f"{gcs_ckpt_prefix}/{file.name}"
+            with open(file, "rb") as fsrc, fs.open(gcs_path, "wb") as fdst:
+                fdst.write(fsrc.read())
+            print(f"[INFO] Uploaded {file} to {gcs_path}")
 
 def main():
     global MAX_EPOCHS, BATCH_SIZE, ENC_LEN
@@ -344,9 +382,10 @@ def main():
     parser.add_argument("--log_every_n_steps", type=int, default=10)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--prefetch_factor", type=int, default=2)
-    parser.add_argument("--resume", action="store_true", default=False)
+    parser.add_argument("--resume", type=lambda x: str(x).lower() in ["true", "1", "yes"], default=False)
     parser.add_argument("--gcs_data_prefix", type=str, default="")
     parser.add_argument("--gcs_output_prefix", type=str, default="")
+    parser.add_argument("--local_out_dir", type=str, default="/tmp/tft_runs")
     args = parser.parse_args()
 
     # If gcs_data_prefix is given, override data paths to use GCS URIs
@@ -458,6 +497,27 @@ def main():
     tft.training_step  = MethodType(_training_step_decoded, tft)
     tft.validation_step = MethodType(_validation_step_decoded, tft)
 
+    # Build local run directory based on local_out_dir and gcs_output_prefix
+    if args.gcs_output_prefix:
+        # e.g. use last two parts of gcs_output_prefix for subdir
+        gcs_parts = args.gcs_output_prefix.rstrip("/").split("/")
+        run_name = "_".join(gcs_parts[-2:]) if len(gcs_parts) >= 2 else gcs_parts[-1]
+    else:
+        run_name = datetime.now().strftime("%Y%m%d_%H%M%S")
+    local_run_dir = Path(args.local_out_dir) / run_name
+    local_run_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_dir = local_run_dir / "ckpts"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    from lightning.pytorch.callbacks import ModelCheckpoint
+    checkpoint_callback = ModelCheckpoint(
+        dirpath=str(ckpt_dir),
+        filename="{epoch:02d}-{val_mae_dec:.4f}",
+        save_top_k=1,
+        monitor="val_mae_dec",
+        mode="min",
+        save_last=True,
+    )
     accelerator = "gpu" if torch.cuda.is_available() else "cpu"
     trainer = Trainer(
         max_epochs=MAX_EPOCHS,
@@ -465,14 +525,18 @@ def main():
         devices=1,
         log_every_n_steps=args.log_every_n_steps,
         check_val_every_n_epoch=args.check_val_every_n_epoch,
-        default_root_dir=args.gcs_output_prefix,
+        default_root_dir=str(local_run_dir),
+        callbacks=[checkpoint_callback],
         enable_checkpointing=True
     )
     print("[INFO] CLI args:", vars(args))
     print("▶ Training TFT on decoded scale (MAE+MSE)…")
     trainer.fit(tft, train_loader, val_loader)
 
-    save_predictions_and_metrics(tft, val_loader, args.gcs_output_prefix)
+    target_prefix = args.gcs_output_prefix if args.gcs_output_prefix else str(local_run_dir / "artifacts")
+    save_predictions_and_metrics(tft, val_loader, target_prefix)
+    if args.gcs_output_prefix:
+        upload_local_dir_to_gcs(ckpt_dir, args.gcs_output_prefix)
 
 
 if __name__ == "__main__":
