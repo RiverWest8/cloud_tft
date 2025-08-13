@@ -49,7 +49,7 @@ import pandas as pd
 import pandas as _pd
 pd = _pd  # Ensure pd always refers to pandas module
 import lightning as pl
-from lightning.pytorch import Trainer, seed_everything, trainer
+from lightning.pytorch import Trainer, seed_everything
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -1771,6 +1771,17 @@ if __name__ == "__main__":
         reduce_on_plateau_min_lr=1e-5,
     )
     # ---------------------------------------------------------------
+    trainer = Trainer(
+        accelerator=ACCELERATOR,
+        devices=DEVICES,
+        precision=PRECISION,
+        max_epochs=MAX_EPOCHS,
+        gradient_clip_val=GRADIENT_CLIP_VAL,
+        logger=logger,
+        callbacks=[lr_cb, best_ckpt_cb, es_cb, bar_cb, metrics_cb, mirror_cb],
+        check_val_every_n_epoch=int(ARGS.check_val_every_n_epoch),
+        log_every_n_steps=int(ARGS.log_every_n_steps),
+    )
     # Train the model
     trainer.fit(tft, train_dataloader, val_dataloader)
 
