@@ -771,6 +771,16 @@ parser.add_argument("--check_val_every_n_epoch", type=int, default=1, help="Vali
 parser.add_argument("--log_every_n_steps", type=int, default=200, help="How often to log train steps")
 parser.add_argument("--learning_rate", type=float, default=None, help="Override model learning rate")
 parser.add_argument("--resume", type=lambda s: str(s).lower() in ("1","true","t","yes","y","on"), default=True, help="Resume from latest checkpoint if available")
+# Quick-run subsetting for speed
+parser.add_argument("--train_max_rows", type=int, default=None, help="Limit number of rows in TRAIN for fast iterations")
+parser.add_argument("--val_max_rows", type=int, default=None, help="Limit number of rows in VAL (optional; default full)")
+parser.add_argument(
+    "--subset_mode",
+    type=str,
+    default="per_asset_tail",
+    choices=["per_asset_tail", "per_asset_head", "random"],
+    help="Strategy for selecting a subset when limiting rows"
+)
 parser.add_argument("--fi_max_batches", type=int, default=20, help="Max val batches per feature in FI.")
 # Parse known args so stray platform args do not crash the script
 ARGS, _UNKNOWN = parser.parse_known_args()
@@ -1038,6 +1048,7 @@ def add_time_idx(df: pd.DataFrame) -> pd.DataFrame:
 # -----------------------------------------------------------------------
 # Calendar features (help the model learn intraday/weekly seasonality)
 # -----------------------------------------------------------------------
+
 def add_calendar_features(df: pd.DataFrame) -> pd.DataFrame:
     minute_of_day = df[TIME_COL].dt.hour * 60 + df[TIME_COL].dt.minute
     df["sin_tod"] = np.sin(2 * np.pi * minute_of_day / 1440.0).astype("float32")
@@ -1047,6 +1058,43 @@ def add_calendar_features(df: pd.DataFrame) -> pd.DataFrame:
     df["cos_dow"] = np.cos(2 * np.pi * dow / 7.0).astype("float32")
     df["Is_Weekend"] = (dow >= 5).astype("int8")
     return df
+
+# -----------------------------------------------------------------------
+# Fast subset helper (keeps temporal structure per asset when possible)
+# -----------------------------------------------------------------------
+def subset_time_series(df: pd.DataFrame, max_rows: int | None, mode: str = "per_asset_tail") -> pd.DataFrame:
+    """Return a subset of *approximately* max_rows, preserving sequence order.
+    modes:
+      • per_asset_tail: take roughly equal tail slices per asset, then trim
+      • per_asset_head: same but from the head
+      • random: global random sample (may break sequences; use only for quick smoke tests)
+    """
+    if max_rows is None or max_rows <= 0 or max_rows >= len(df):
+        return df
+    df = df.sort_values(GROUP_ID + [TIME_COL]).reset_index(drop=True)
+    if mode == "random":
+        out = df.sample(n=int(max_rows), random_state=SEED).sort_values(GROUP_ID + [TIME_COL])
+        return out.reset_index(drop=True)
+
+    # Per-asset slicing
+    groups = list(df.groupby(GROUP_ID[0], observed=True)) if GROUP_ID else [(None, df)]
+    n_assets = max(1, len(groups))
+    take_each = max(1, int(np.ceil(max_rows / n_assets)))
+    parts = []
+    for _, gdf in groups:
+        if mode == "per_asset_head":
+            parts.append(gdf.head(take_each))
+        else:  # per_asset_tail
+            parts.append(gdf.tail(take_each))
+    out = pd.concat(parts, axis=0, ignore_index=True)
+    # trim to target size while preserving order (head or tail consistent with mode)
+    out = out.sort_values(GROUP_ID + [TIME_COL]).reset_index(drop=True)
+    if len(out) > max_rows:
+        if mode == "per_asset_head":
+            out = out.head(int(max_rows))
+        else:
+            out = out.tail(int(max_rows))
+    return out.reset_index(drop=True)
 
 # -----------------------------------------------------------------------
 # Permutation Importance helpers at module scope (decoded metric = MAE + RMSE + 0.05 * DirBCE)
@@ -1408,7 +1456,8 @@ if __name__ == "__main__":
     print(
         f"[CONFIG] batch_size={BATCH_SIZE} | encoder={MAX_ENCODER_LENGTH} | epochs={MAX_EPOCHS} | "
         f"patience={EARLY_STOP_PATIENCE} | perm_len={PERM_BLOCK_SIZE} | "
-        f"perm_importance={'on' if ENABLE_FEATURE_IMPORTANCE else 'off'} | fi_max_batches={FI_MAX_BATCHES}"
+        f"perm_importance={'on' if ENABLE_FEATURE_IMPORTANCE else 'off'} | fi_max_batches={FI_MAX_BATCHES} | "
+        f"train_max_rows={getattr(ARGS, 'train_max_rows', None)} | val_max_rows={getattr(ARGS, 'val_max_rows', None)} | subset_mode={getattr(ARGS, 'subset_mode', 'per_asset_tail')}"
     )
     print("▶ Loading data …")
     train_df = add_time_idx(load_split(READ_PATHS[0]))
@@ -1439,6 +1488,18 @@ if __name__ == "__main__":
     train_df = add_calendar_features(train_df)
     val_df   = add_calendar_features(val_df)
     test_df  = add_calendar_features(test_df)
+
+    # Optional quick-run subsetting for speed
+    _mode = getattr(ARGS, "subset_mode", "per_asset_tail")
+    if getattr(ARGS, "train_max_rows", None):
+        before = len(train_df)
+        train_df = subset_time_series(train_df, int(ARGS.train_max_rows), mode=_mode)
+        print(f"[SUBSET] TRAIN: {before} -> {len(train_df)} rows using mode='{_mode}'")
+    if getattr(ARGS, "val_max_rows", None):
+        before = len(val_df)
+        val_df = subset_time_series(val_df, int(ARGS.val_max_rows), mode=_mode)
+        print(f"[SUBSET] VAL:   {before} -> {len(val_df)} rows using mode='{_mode}'")
+    # (We leave TEST full by default for honest evaluation; add --test_max_rows if you really need it.)
 
 
     # -----------------------------------------------------------------------
