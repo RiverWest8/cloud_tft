@@ -477,112 +477,72 @@ class PerAssetMetrics(pl.Callback):
 
     @torch.no_grad()
     def on_validation_epoch_end(self, trainer, pl_module):
-        pd_cpu = pdir.detach().cpu() if 'pdir' in locals() and pdir is not None else None
+        # If nothing collected, exit quietly
         if not self._g_dev:
             return
-        device = self._g_dev[0].device
-        g = torch.cat(self._g_dev).to(device)
-        yv = torch.cat(self._yv_dev).to(device)
-        pv = torch.cat(self._pv_dev).to(device)
-        yd = torch.cat(self._yd_dev).to(device) if self._yd_dev else None
-        pdir = torch.cat(self._pd_dev).to(device) if self._pd_dev else None
 
-        # decode realised vol in one shot (robust + consistent with training)
-        yv_dec_t = safe_decode_vol(yv.unsqueeze(-1), self.vol_norm, g.unsqueeze(-1)).squeeze(-1)
-        pv_dec_t = safe_decode_vol(pv.unsqueeze(-1), self.vol_norm, g.unsqueeze(-1)).squeeze(-1)
-        pv_dec_t = torch.clamp(pv_dec_t, min=2e-7)
-        
+        # Gather device tensors accumulated during validation
+        device = self._g_dev[0].device
+        g  = torch.cat(self._g_dev).to(device)
+        yv = torch.cat(self._yv_dev).to(device)            # realised_vol (encoded)
+        pv = torch.cat(self._pv_dev).to(device)            # realised_vol pred (encoded)
+        yd = torch.cat(self._yd_dev).to(device) if self._yd_dev else None  # direction labels
+        pd = torch.cat(self._pd_dev).to(device) if self._pd_dev else None  # direction logits/probs
+
+        # --- Decode realised_vol to physical scale (robust to PF version)
+        yv_dec = safe_decode_vol(yv.unsqueeze(-1), self.vol_norm, g.unsqueeze(-1)).squeeze(-1)
+        pv_dec = safe_decode_vol(pv.unsqueeze(-1), self.vol_norm, g.unsqueeze(-1)).squeeze(-1)
+        pv_dec = torch.clamp(pv_dec, min=2e-7)  # avoid zero in QLIKE
+
+        # Quick sanity prints (match overfit_test style)
         print("DEBUG transformation:", getattr(self.vol_norm, "transformation", None))
-        yv_dec_t_test = safe_decode_vol(yv.unsqueeze(-1), self.vol_norm, g.unsqueeze(-1)).squeeze(-1)
-        print("DEBUG mean after decode:", yv_dec_t_test.mean().item())
-        
+        print("DEBUG mean after decode:", yv_dec.mean().item())
         print(
-        "DEBUG: mean(yv_dec)=", yv_dec_t.mean().item(),
-        "mean(pv_dec)=", pv_dec_t.mean().item(),
-        "ratio=", (yv_dec_t.mean() / pv_dec_t.mean()).item()
+            "DEBUG: mean(yv_dec)=",
+            yv_dec.mean().item(),
+            "mean(pv_dec)=",
+            pv_dec.mean().item(),
+            "ratio=",
+            (yv_dec.mean() / pv_dec.mean()).item() if float(pv_dec.mean()) != 0.0 else float("inf"),
         )
 
-        # move to CPU for numpy-style metrics
-        g_cpu = g.detach().cpu()
-        yv_dec_all = yv_dec_t.detach().cpu()
-        pv_dec_all = pv_dec_t.detach().cpu()
+        # Move to CPU for metric computation
+        y_cpu  = yv_dec.detach().cpu()
+        p_cpu  = pv_dec.detach().cpu()
         yd_cpu = yd.detach().cpu() if yd is not None else None
-        # ---- decoded tensors already computed above ----
+        pd_cpu = pd.detach().cpu() if pd is not None else None
+
+        # --- Decoded regression metrics ---
         eps = 1e-8
-        # Base decoded regression terms
-        overall_mse  = ((pv_dec_all - yv_dec_all) ** 2).mean().item()
+        overall_mae  = (p_cpu - y_cpu).abs().mean().item()
+        overall_mse  = ((p_cpu - y_cpu) ** 2).mean().item()
         overall_rmse = overall_mse ** 0.5
 
-        # QLIKE on variance (use decoded vol → square to variance)
-        sigma2_p = torch.clamp(pv_dec_all.abs(), min=eps) ** 2
-        sigma2_y = torch.clamp(yv_dec_all.abs(), min=eps) ** 2
+        sigma2_p = torch.clamp(p_cpu.abs(), min=eps) ** 2
+        sigma2_y = torch.clamp(y_cpu.abs(), min=eps) ** 2
         ratio    = sigma2_y / sigma2_p
         overall_qlike = (ratio - torch.log(ratio) - 1.0).mean().item()
 
-        # (optional) Direction BCE (logits-aware) with label smoothing like training
-        dir_bce = float("nan")
-        if yd_cpu is not None and pd_cpu is not None and yd_cpu.numel() > 0 and pd_cpu.numel() > 0:
-            yt = yd_cpu.float()
-            pt = pd_cpu
-            # logits? → BCEWithLogits; else plain BCE on probs
-            if torch.isfinite(pt).any() and (pt.min() < 0 or pt.max() > 1):
-                yt_s = yt * 0.9 + 0.05
-                dir_bce = F.binary_cross_entropy_with_logits(pt, yt_s).item()
-            else:
-                p = torch.clamp(pt, 1e-7, 1 - 1e-7)
-                yt_s = yt * 0.9 + 0.05
-                dir_bce = F.binary_cross_entropy(p, yt_s).item()
-
-        # ---- Hybrid decoded validation objective ----
-        ALPHA_MSE   = 1.0
-        BETA_RMSE   = 1.0
-        GAMMA_QLIKE = 0.10      # <— tune this weight
-        W_DIR       = 0.02      # keep small to not dominate vol
-
-        hybrid_val  = ((ALPHA_MSE * overall_mse) + (BETA_RMSE * overall_rmse) + (GAMMA_QLIKE * overall_qlike)) * 10**2
-        if np.isfinite(dir_bce):
-            hybrid_val += W_DIR * dir_bce
-
-        # expose individual pieces (nice for TB & early stopping)
-        trainer.callback_metrics["val_mse_dec"]   = torch.tensor(float(overall_mse))
-        trainer.callback_metrics["val_rmse_dec"]  = torch.tensor(float(overall_rmse))
-        trainer.callback_metrics["val_qlike_dec"] = torch.tensor(float(overall_qlike))
-        trainer.callback_metrics["val_dir_bce"]   = torch.tensor(float(dir_bce)) if np.isfinite(dir_bce) else torch.tensor(float("nan"))
-
-        # THIS is what EarlyStopping/Checkpoint should monitor
-        trainer.callback_metrics["val_loss"] = torch.tensor(float(hybrid_val))
-        trainer.callback_metrics["val_loss_decoded"] = torch.tensor(float(hybrid_val))
-
-        # --- Compute overall decoded metrics ---
-        eps = 1e-8
-        overall_mae = (pv_dec_all - yv_dec_all).abs().mean().item()
-        overall_mse = ((pv_dec_all - yv_dec_all) ** 2).mean().item()
-        overall_rmse = overall_mse ** 0.5
-
-        sigma2_p_all = torch.clamp(pv_dec_all.abs(), min=eps) ** 2
-        sigma2_all   = torch.clamp(yv_dec_all.abs(), min=eps) ** 2
-        ratio_all    = sigma2_all / sigma2_p_all
-        overall_qlike = (ratio_all - torch.log(ratio_all) - 1.0).mean().item()
-
-        # --- End-of-epoch concise printout ---
-        try:
-            epoch_num = int(getattr(trainer, "current_epoch", -1)) + 1
-        except Exception:
-            epoch_num = None
-
-        # Compute accuracy if direction labels are available
+        # --- Optional direction accuracy (logits or probs supported) ---
         acc = None
         if yd_cpu is not None and pd_cpu is not None and yd_cpu.numel() > 0 and pd_cpu.numel() > 0:
             pt = pd_cpu
             try:
                 if torch.isfinite(pt).any() and (pt.min() < 0 or pt.max() > 1):
-                    pt = torch.sigmoid(pt)
+                    pt = torch.sigmoid(pt)  # convert logits to probs
             except Exception:
                 pt = torch.sigmoid(pt)
             pt = torch.clamp(pt, 0.0, 1.0)
             acc = ((pt >= 0.5).int() == yd_cpu.int()).float().mean().item()
 
-        N = int(yv_dec_all.numel())
+        # --- Print one concise per-epoch line + expose to Lightning ---
+        N = int(y_cpu.numel())
+        try:
+            epoch_num = int(getattr(trainer, "current_epoch", -1)) + 1
+        except Exception:
+            epoch_num = None
+
+        val_loss_value = overall_mae + overall_rmse  # decoded objective
         msg = (
             f"[VAL EPOCH {epoch_num}] "
             f"MAE={overall_mae:.6f} "
@@ -590,23 +550,20 @@ class PerAssetMetrics(pl.Callback):
             f"MSE={overall_mse:.6f} "
             f"QLIKE={overall_qlike:.6f} "
             + (f"| ACC={acc:.3f} " if acc is not None else "")
-            + f"| N={N}"
+            + f"| N={N} | VAL_LOSS={val_loss_value:.6f}"
         )
-
-        # Set validation loss to MAE + RMSE (optionally add direction BCE weight if acc is used)
-        val_loss_value = overall_mae + overall_rmse
-        msg += f"| VAL_LOSS={val_loss_value:.6f}"
         print(msg)
 
-        # --- Log to Lightning callback_metrics if desired ---
-        trainer.callback_metrics["val_mae_overall"] = torch.tensor(float(overall_mae))
+        # Log the same metrics for checkpoints/early-stopping
+        trainer.callback_metrics["val_mae_overall"]  = torch.tensor(float(overall_mae))
         trainer.callback_metrics["val_rmse_overall"] = torch.tensor(float(overall_rmse))
-        trainer.callback_metrics["val_mse_overall"] = torch.tensor(float(overall_mse))
-        trainer.callback_metrics["val_qlike_overall"] = torch.tensor(float(overall_qlike))
-        trainer.callback_metrics["val_loss"] = torch.tensor(float(val_loss_value))
+        trainer.callback_metrics["val_mse_overall"]  = torch.tensor(float(overall_mse))
+        trainer.callback_metrics["val_qlike_overall"]= torch.tensor(float(overall_qlike))
+        trainer.callback_metrics["val_loss"]         = torch.tensor(float(val_loss_value))
+        trainer.callback_metrics["val_loss_decoded"] = torch.tensor(float(val_loss_value))
         if acc is not None:
             trainer.callback_metrics["val_acc_overall"] = torch.tensor(float(acc))
-        trainer.callback_metrics["val_N_overall"] = torch.tensor(float(N))
+        trainer.callback_metrics["val_N_overall"]    = torch.tensor(float(N))
 
 
     @torch.no_grad()
