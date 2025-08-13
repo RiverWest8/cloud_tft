@@ -5,15 +5,14 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
+import json
+import gcsfs
 
 from lightning.pytorch import Trainer, seed_everything
 from pytorch_forecasting import TimeSeriesDataSet
 from pytorch_forecasting.data.encoders import GroupNormalizer
 from pytorch_forecasting.models import TemporalFusionTransformer
 from pytorch_forecasting.metrics import QuantileLoss
-
-# Detect if running in Google Cloud environment
-IN_CLOUD = os.getenv("CLOUD_ENV", "false").lower() == "true"
 
 # Google Cloud Storage config
 GCS_BUCKET = os.environ.get("GCS_BUCKET", "river-ml-bucket")
@@ -24,15 +23,10 @@ VAL_URI   = f"{GCS_DATA_PREFIX}/universal_val.parquet"
 TEST_URI  = f"{GCS_DATA_PREFIX}/universal_test.parquet"
 READ_PATHS = [str(TRAIN_URI), str(VAL_URI), str(TEST_URI)]
 
-if IN_CLOUD:
-    TRAIN_P = Path(TRAIN_URI)
-    VAL_P = Path(VAL_URI)
-    TEST_P = Path(TEST_URI)
-else:
-    HOME = Path.home()
-    TRAIN_P = Path(os.getenv("TRAIN_PATH", str(HOME / "Desktop" / "Data" / "CleanedData" / "universal_train.parquet")))
-    VAL_P   = Path(os.getenv("VAL_PATH", str(HOME / "Desktop" / "Data" / "CleanedData" / "universal_val.parquet")))
-    TEST_P  = Path(os.getenv("TEST_PATH", str(HOME / "Desktop" / "Data" / "CleanedData" / "universal_test.parquet")))
+HOME = Path.home()
+TRAIN_P = Path(os.getenv("TRAIN_PATH", str(HOME / "Desktop" / "Data" / "CleanedData" / "universal_train.parquet")))
+VAL_P   = Path(os.getenv("VAL_PATH", str(HOME / "Desktop" / "Data" / "CleanedData" / "universal_val.parquet")))
+TEST_P  = Path(os.getenv("TEST_PATH", str(HOME / "Desktop" / "Data" / "CleanedData" / "universal_test.parquet")))
 
 # -----------------------
 # 0) Register asinh
@@ -70,7 +64,14 @@ def rs_variance(o, h, l, c):
     return np.log(h / c) * np.log(h / o) + np.log(l / c) * np.log(l / o)
 
 def load_and_prepare(path: Path) -> pd.DataFrame:
-    df = pd.read_parquet(path)
+    # If path is a GCS URI, use gcsfs with pandas
+    path_str = str(path)
+    if path_str.startswith("gs://"):
+        fs = gcsfs.GCSFileSystem()
+        with fs.open(path_str, "rb") as f:
+            df = pd.read_parquet(f)
+    else:
+        df = pd.read_parquet(path)
     # standardize column names for target/class
     if "realised_vol" not in df.columns and "Realised_Vol" in df.columns:
         df = df.rename(columns={"Realised_Vol": "realised_vol"})
@@ -106,17 +107,9 @@ def load_and_prepare(path: Path) -> pd.DataFrame:
     df = df.dropna(subset=["realised_vol"]).reset_index(drop=True)
     return df
 
-train_df = load_and_prepare(TRAIN_P)
-val_df   = load_and_prepare(VAL_P) if VAL_P.exists() else train_df.copy()
-test_df  = load_and_prepare(TEST_P) if TEST_P.exists() else train_df.copy()
-
-# take subsets
-train_df = train_df.iloc[:TRAIN_N].copy()
-val_df   = val_df.iloc[:VAL_N].copy()
-test_df  = test_df.iloc[:TEST_N].copy()
-
-print(f"[INFO] train={train_df.shape}, val={val_df.shape}, test={test_df.shape}")
-print(f"[INFO] mean realised_vol(train)={train_df['realised_vol'].mean():.6g}")
+train_df = None
+val_df = None
+test_df = None
 
 # -----------------------
 # 3) Build PF datasets
@@ -353,8 +346,53 @@ tft.validation_step = MethodType(_validation_step_decoded, tft)
 # 7) Train
 # -----------------------
 
+def save_predictions_and_metrics(model, dataloader, output_prefix):
+    model.eval()
+    device = next(model.parameters()).device
+    y_trues = []
+    y_preds = []
+    with torch.no_grad():
+        for batch in dataloader:
+            x, y = batch
+            out = model(x)
+            pred = getattr(out, "prediction", out)
+            p_vol = _extract_vol_pred_from_output(pred)
+            y_vol = _extract_y_vol_from_batch(x, y)
+            g     = _extract_groups_from_batch(x)
+
+            g_ids = g.to(device).unsqueeze(-1)
+            y_dec = safe_decode_vol(y_vol.to(device).unsqueeze(-1), model.vol_norm, g_ids).squeeze(-1).cpu()
+            p_dec = safe_decode_vol(p_vol.to(device).unsqueeze(-1), model.vol_norm, g_ids).squeeze(-1).cpu()
+            p_dec = torch.clamp(p_dec, min=1e-8)
+
+            y_trues.append(y_dec)
+            y_preds.append(p_dec)
+
+    y_true_all = torch.cat(y_trues, dim=0).numpy()
+    y_pred_all = torch.cat(y_preds, dim=0).numpy()
+
+    df_out = pd.DataFrame({"y_true": y_true_all, "y_pred": y_pred_all})
+
+    mae = float(np.mean(np.abs(y_pred_all - y_true_all)))
+    rmse = float(np.sqrt(np.mean((y_pred_all - y_true_all)**2)))
+    metrics = {"mae": mae, "rmse": rmse}
+
+    output_prefix_path = Path(output_prefix)
+    output_prefix_path.mkdir(parents=True, exist_ok=True)
+    parquet_path = output_prefix_path / "val_predictions.parquet"
+    json_path = output_prefix_path / "val_metrics.json"
+
+    df_out.to_parquet(parquet_path)
+    with open(json_path, "w") as f:
+        json.dump(metrics, f)
+
+    print(f"[INFO] Saved validation predictions to {parquet_path}")
+    print(f"[INFO] Saved validation metrics to {json_path}")
+
 def main():
     global MAX_EPOCHS, BATCH_SIZE, ENC_LEN
+    global TRAIN_P, VAL_P, TEST_P
+    global train_df, val_df, test_df
     parser = argparse.ArgumentParser(description="Train TFT on cloud perm data.")
     parser.add_argument("--max_epochs", type=int, default=MAX_EPOCHS)
     parser.add_argument("--early_stop_patience", type=int, default=4)
@@ -369,10 +407,71 @@ def main():
     parser.add_argument("--gcs_output_prefix", type=str, default="")
     args = parser.parse_args()
 
+    # If gcs_data_prefix is given, override data paths to use GCS URIs
+    if args.gcs_data_prefix:
+        gcs_prefix = args.gcs_data_prefix.rstrip("/")
+        TRAIN_P = Path(f"{gcs_prefix}/universal_train.parquet")
+        VAL_P   = Path(f"{gcs_prefix}/universal_val.parquet")
+        TEST_P  = Path(f"{gcs_prefix}/universal_test.parquet")
+
+    # Load datasets from the specified paths (GCS or local)
+    train_df = load_and_prepare(TRAIN_P)
+    # If VAL_P or TEST_P are GCS URIs or local, just try to load; fallback to train_df if fails
+    try:
+        val_df = load_and_prepare(VAL_P)
+    except Exception:
+        val_df = train_df.copy()
+    try:
+        test_df = load_and_prepare(TEST_P)
+    except Exception:
+        test_df = train_df.copy()
+
+    # take subsets
+    train_df = train_df.iloc[:TRAIN_N].copy()
+    val_df   = val_df.iloc[:VAL_N].copy()
+    test_df  = test_df.iloc[:TEST_N].copy()
+
+    print(f"[INFO] train={train_df.shape}, val={val_df.shape}, test={test_df.shape}")
+    print(f"[INFO] mean realised_vol(train)={train_df['realised_vol'].mean():.6g}")
+
     # Override constants with CLI args
     MAX_EPOCHS = args.max_epochs
     BATCH_SIZE = args.batch_size
     ENC_LEN = args.max_encoder_length
+
+    # Rebuild datasets with loaded data
+    global training_dataset, validation_dataset, test_dataset
+    training_dataset = TimeSeriesDataSet(
+        train_df,
+        time_idx="time_idx",
+        target="realised_vol",
+        group_ids=GROUP_ID,
+        min_encoder_length=ENC_LEN,
+        max_encoder_length=ENC_LEN,
+        min_prediction_length=PRED_LEN,
+        max_prediction_length=PRED_LEN,
+        static_categoricals=GROUP_ID,
+        time_varying_known_reals=calendar_cols + ["time_idx"],
+        time_varying_unknown_reals=[
+            c for c in train_df.select_dtypes(include=[np.number]).columns.tolist()
+            if c not in (calendar_cols + ["time_idx", "realised_vol"])
+        ],
+        add_relative_time_idx=True,
+        add_target_scales=True,
+        add_encoder_length=True,
+        target_normalizer=GroupNormalizer(
+            groups=GROUP_ID,
+            center=False,
+            scale_by_group=True,
+            transformation="asinh",
+        ),
+    )
+    validation_dataset = TimeSeriesDataSet.from_dataset(
+        training_dataset, val_df, predict=False, stop_randomization=True
+    )
+    test_dataset = TimeSeriesDataSet.from_dataset(
+        training_dataset, test_df, predict=False, stop_randomization=True
+    )
 
     # Dataloaders with user-specified workers and prefetch
     global train_loader, val_loader
@@ -402,6 +501,8 @@ def main():
     print("[INFO] CLI args:", vars(args))
     print("▶ Training TFT on decoded scale (MAE+MSE)…")
     trainer.fit(tft, train_loader, val_loader)
+
+    save_predictions_and_metrics(tft, val_loader, args.gcs_output_prefix)
 
 
 if __name__ == "__main__":
