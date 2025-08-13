@@ -1376,12 +1376,13 @@ def _evaluate_decoded_metrics(
     model.eval()
     y_all, p_all, yd_all, pd_all, g_all = [], [], [], [], []
     skipped_reasons = {"no_groups": 0, "no_targets": 0, "bad_pred_format": 0}
-
     with torch.no_grad():
         for b_idx, batch in enumerate(dl):
             if max_batches is not None and b_idx >= int(max_batches):
                 break
-
+            # Move all tensors in batch to the model's device
+            batch = tuple(t.to(model_device) if torch.is_tensor(t) else t for t in batch)
+            
             if isinstance(batch, (list, tuple)) and len(batch) >= 2:
                 x, y = batch[0], batch[1]
             else:
