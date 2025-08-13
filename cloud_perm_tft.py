@@ -438,11 +438,11 @@ class PerAssetMetrics(pl.Callback):
 
         # decode realised vol in one shot
         try:
-            yv_dec_t = self.vol_norm.decode(yv.unsqueeze(-1), group_ids=g.unsqueeze(-1)).squeeze(-1)
+            yv_dec_t = torch.sinh(self.vol_norm.decode(yv.unsqueeze(-1), group_ids=g.unsqueeze(-1))).squeeze(-1)
         except Exception:
             yv_dec_t = yv
         try:
-            pv_dec_t = self.vol_norm.decode(pv.unsqueeze(-1), group_ids=g.unsqueeze(-1)).squeeze(-1)
+            pv_dec_t = torch.sinh(self.vol_norm.decode(pv.unsqueeze(-1), group_ids=g.unsqueeze(-1))).squeeze(-1)
             pv_dec_t = torch.clamp(pv_dec_t, min=2e-7)
         except Exception:
             pv_dec_t = pv
