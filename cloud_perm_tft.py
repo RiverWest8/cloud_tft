@@ -1772,7 +1772,7 @@ if __name__ == "__main__":
     )
     # ---------------------------------------------------------------
     # Train the model
-    Trainer.fit(tft, train_dataloader, val_dataloader, ckpt_path=resume_ckpt)
+    Trainer.fit(tft, train_dataloader, val_dataloader)
 
     # Run FI permutation testing if enabled
     if ENABLE_FEATURE_IMPORTANCE:
