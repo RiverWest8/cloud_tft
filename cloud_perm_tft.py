@@ -1712,7 +1712,7 @@ if __name__ == "__main__":
     )
 
     # If you have a custom checkpoint mirroring callback
-    mirror_cb = MirrorCheckpoints()
+    # mirror_cb = MirrorCheckpoints()
     from pytorch_forecasting.metrics import MultiLoss
 
     # Fixed weights
