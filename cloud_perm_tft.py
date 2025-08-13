@@ -1757,23 +1757,36 @@ if __name__ == "__main__":
         else:
             raise RuntimeError("Missing targets in batch")
 
-        # ---- group ids for per-asset decode (must match TRAIN normalizer) ----
-        g = x.get("groups", None)
+        # ---- robust group ids for per-asset decode (must match TRAIN normalizer) ----
+        g_raw = x.get("groups", None)
+        if g_raw is None:
+            g_raw = x.get("group_ids", None)
+
+        # coerce to a tensor: PF sometimes gives a list/tuple of tensors
+        g = None
+        if torch.is_tensor(g_raw):
+            g = g_raw
+        elif isinstance(g_raw, (list, tuple)):
+            for item in g_raw:
+                if torch.is_tensor(item):
+                    g = item
+                    break
+
         if g is None:
-            g = x.get("group_ids", None)
-        if isinstance(g, (list, tuple)):
-            g = g[0] if len(g) > 0 else None
-        if g is None or not torch.is_tensor(g):
-            raise RuntimeError("Missing 'groups' in batch for decoded loss")
-        if g.ndim > 1 and g.size(-1) == 1:
+            raise RuntimeError("Missing 'groups' tensor in batch for decoded loss")
+
+        # squeeze to [B] if shaped like [B,1] or [B,1,1], and ensure integer type
+        while g.ndim > 1 and g.size(-1) == 1:
             g = g.squeeze(-1)
+        g = g.long()
 
         # ---- decode both y and p using TRAIN normalizer attached as self.vol_norm ----
+        g_ids = g.to(self.device).unsqueeze(-1)
         y_dec = safe_decode_vol(
-            y_vol.to(self.device).unsqueeze(-1), self.vol_norm, g.to(self.device).unsqueeze(-1)
+            y_vol.to(self.device).unsqueeze(-1), self.vol_norm, g_ids
         ).squeeze(-1)
         p_dec = safe_decode_vol(
-            p_vol.to(self.device).unsqueeze(-1), self.vol_norm, g.to(self.device).unsqueeze(-1)
+            p_vol.to(self.device).unsqueeze(-1), self.vol_norm, g_ids
         ).squeeze(-1)
         p_dec = torch.clamp(p_dec, min=1e-8)
 
