@@ -98,6 +98,9 @@ import argparse
 import pytorch_forecasting as pf
 import inspect
 
+VOL_QUANTILES = [0.05, 0.165, 0.25, 0.50, 0.75, 0.835, 0.95]
+Q50_IDX = VOL_QUANTILES.index(0.50)  # -> 3
+
 # -----------------------------------------------------------------------
 # Ensure a robust "identity" transformation for GroupNormalizer
 # -----------------------------------------------------------------------
@@ -139,33 +142,22 @@ if hasattr(GroupNormalizer, "INVERSE_TRANSFORMATIONS"):
         lambda x: torch.sinh(x) if torch.is_tensor(x) else np.sinh(x),
     )
 
-
-
-# -----------------------------------------------------------------------
-# Compatibility shim: older PyTorch‑Forecasting versions expose only
-# `.inverse_transform()` but not `.decode()`.  Downstream code expects
-# `.decode()`, so add an alias when missing.
-# -----------------------------------------------------------------------
 # -----------------------------------------------------------------------
 # Robust manual inverse for GroupNormalizer (fallback when decode fails)
 # -----------------------------------------------------------------------
 @torch.no_grad()
 def manual_inverse_transform_groupnorm(normalizer, y: torch.Tensor, group_ids: torch.Tensor | None):
     """
-    Reverse GroupNormalizer transform:
-      1) destandardize: y -> y*scale + center  (center may be None when center=False)
-      2) inverse transform (asinh -> sinh, identity -> no-op, else via registry)
-    Works for both global scale and per-group scale_by_group=True.
-    y can be [B] or [B,1]; returns same shape as y.
+    Reverse GroupNormalizer:
+      1) destandardize: y -> y*scale + center (center may be None when center=False)
+      2) inverse transform: asinh -> sinh, identity -> no-op, else via registry
+    Works with scale_by_group=True (index by group_ids) or global scale.
     """
-    # squeeze to [B]
     y_ = y.squeeze(-1) if y.ndim > 1 else y
 
-    # PF stores per-fit tensors as attributes (varies slightly by version)
-    center = getattr(normalizer, "center", None)   # Tensor or None
-    scale  = getattr(normalizer, "scale",  None)   # Tensor or None
+    center = getattr(normalizer, "center", None)
+    scale  = getattr(normalizer, "scale",  None)
 
-    # If we can't see scale, just return input (no crash)
     if scale is None:
         x = y_
     else:
@@ -174,55 +166,44 @@ def manual_inverse_transform_groupnorm(normalizer, y: torch.Tensor, group_ids: t
             if g.ndim > 1 and g.size(-1) == 1:
                 g = g.squeeze(-1)
             g = g.long()
-            # Gather per-sample scale/center when scale_by_group=True
             s = scale[g] if isinstance(scale, torch.Tensor) else scale
-            if isinstance(center, torch.Tensor):
-                c = center[g]
-            else:
-                c = 0.0
+            c = center[g] if isinstance(center, torch.Tensor) else 0.0
         else:
             s = scale
             c = center if isinstance(center, torch.Tensor) else 0.0
         x = y_ * s + c
 
-    # Now undo the transformation
     tfm = getattr(normalizer, "transformation", None)
     if tfm == "asinh":
         x = torch.sinh(x)
     elif tfm in (None, "identity"):
         pass
     else:
-        # Try registry if present
         try:
-            inv = GroupNormalizer.TRANSFORMATIONS[tfm]["inverse"]
+            inv = type(normalizer).TRANSFORMATIONS[tfm]["inverse"]
             x = inv(x)
         except Exception:
             pass
 
-    # restore original shape
     return x.view_as(y)
 
 @torch.no_grad()
 def safe_decode_vol(y: torch.Tensor, normalizer, group_ids: torch.Tensor | None):
     """
-    Try normalizer.decode(), then normalizer.inverse_transform(),
-    finally fallback to manual_inverse_transform_groupnorm.
-    y expected as [B,1] (we keep it that way so all callers are consistent).
+    Try normalizer.decode(), then inverse_transform(), else manual fallback.
+    y is expected as [B,1].
     """
-    # 1) try decode(...)
     try:
         return normalizer.decode(y, group_ids=group_ids)
     except Exception:
         pass
-    # 2) try inverse_transform(...)
     try:
-        return normalizer.inverse_transform(y, group_ids=group_ids)  # newer PF
+        return normalizer.inverse_transform(y, group_ids=group_ids)
     except Exception:
         try:
-            return normalizer.inverse_transform(y)  # older PF signature
+            return normalizer.inverse_transform(y)
         except Exception:
             pass
-    # 3) manual fallback
     return manual_inverse_transform_groupnorm(normalizer, y, group_ids)
 
 if not hasattr(GroupNormalizer, "decode"):
@@ -402,18 +383,8 @@ class PerAssetMetrics(pl.Callback):
             pred = pred["prediction"]
 
         def _point_from_quantiles(vol_q: torch.Tensor) -> torch.Tensor:
-            """
-            Turn 7 vol quantiles into a point forecast using trapezoid rule.
-            """
-            assert vol_q.size(-1) == 7
-            p = torch.tensor([0.05, 0.165, 0.25, 0.50, 0.75, 0.835, 0.95],
-                            device=vol_q.device, dtype=vol_q.dtype)
-            w = torch.empty_like(p)
-            w[0]  = 0.5 * (p[1] - 0.0)
-            w[-1] = 0.5 * (1.0 - p[-2])
-            w[1:-1] = 0.5 * (p[2:] - p[:-2])
-            w = w / w.sum()
-            return (vol_q * w).sum(dim=-1)
+            # Use 0.5 quantile only (median)
+            return vol_q[..., Q50_IDX]
 
         def _extract_heads(pred):
             """Return (p_vol, p_dir) as 1D tensors [B] on DEVICE.
@@ -535,162 +506,107 @@ class PerAssetMetrics(pl.Callback):
         yv_dec_all = yv_dec_t.detach().cpu()
         pv_dec_all = pv_dec_t.detach().cpu()
         yd_cpu = yd.detach().cpu() if yd is not None else None
-        pd_cpu = pdir.detach().cpu() if pdir is not None else None
-
-        # Debug check
-        print(f"[VAL DEBUG] mean(y)={yv_dec_all.mean():.6g} mean(p)={pv_dec_all.mean():.6g}")
-        print(f"[VAL DEBUG] median(y/p)≈{(yv_dec_all / (pv_dec_all+1e-12)).median():.3f}")
-        uniq = torch.unique(g_cpu)
-        rows = []
+        # ---- decoded tensors already computed above ----
         eps = 1e-8
-        for gid in uniq.tolist():
-            m = g_cpu == gid
-            yvi = yv_dec_all[m]
-            pvi = pv_dec_all[m]
-            mae = (pvi - yvi).abs().mean().item()
-            mse = ((pvi - yvi) ** 2).mean().item()
-            rmse = mse ** 0.5
-            sigma2_p = torch.clamp(pvi.abs(), min=eps) ** 2  # forecast variance
-            sigma2_p = torch.clamp(sigma2_p, min=eps)
-            sigma2   = torch.clamp(yvi.abs(), min=eps) ** 2  # realized variance
-            ratio = sigma2 / sigma2_p  # true/forecast
-            qlike = (ratio - torch.log(ratio) - 1.0).mean().item()
-            acc = None
-            if yd_cpu is not None and pd_cpu is not None and m.sum() > 0:
-                ydi = yd_cpu[m]
-                pdi = pd_cpu[m]
-                try:
-                    if torch.isfinite(pdi).any() and (pdi.min() < 0 or pdi.max() > 1):
-                        pdi = torch.sigmoid(pdi)
-                except Exception:
-                    pdi = torch.sigmoid(pdi)
-                acc = ((pdi >= 0.5).int() == ydi.int()).float().mean().item()
-            name = self.id_to_name.get(int(gid), str(gid))
-            rows.append((name, mae, rmse, mse, qlike, acc, int(m.sum().item())))
+        # Base decoded regression terms
+        overall_mse  = ((pv_dec_all - yv_dec_all) ** 2).mean().item()
+        overall_rmse = overall_mse ** 0.5
 
+        # QLIKE on variance (use decoded vol → square to variance)
+        sigma2_p = torch.clamp(pv_dec_all.abs(), min=eps) ** 2
+        sigma2_y = torch.clamp(yv_dec_all.abs(), min=eps) ** 2
+        ratio    = sigma2_y / sigma2_p
+        overall_qlike = (ratio - torch.log(ratio) - 1.0).mean().item()
+
+        # (optional) Direction BCE (logits-aware) with label smoothing like training
+        dir_bce = float("nan")
+        if yd_cpu is not None and pd_cpu is not None and yd_cpu.numel() > 0 and pd_cpu.numel() > 0:
+            yt = yd_cpu.float()
+            pt = pd_cpu
+            # logits? → BCEWithLogits; else plain BCE on probs
+            if torch.isfinite(pt).any() and (pt.min() < 0 or pt.max() > 1):
+                yt_s = yt * 0.9 + 0.05
+                dir_bce = F.binary_cross_entropy_with_logits(pt, yt_s).item()
+            else:
+                p = torch.clamp(pt, 1e-7, 1 - 1e-7)
+                yt_s = yt * 0.9 + 0.05
+                dir_bce = F.binary_cross_entropy(p, yt_s).item()
+
+        # ---- Hybrid decoded validation objective ----
+        ALPHA_MSE   = 1.0
+        BETA_RMSE   = 1.0
+        GAMMA_QLIKE = 0.10      # <— tune this weight
+        W_DIR       = 0.02      # keep small to not dominate vol
+
+        hybrid_val  = ((ALPHA_MSE * overall_mse) + (BETA_RMSE * overall_rmse) + (GAMMA_QLIKE * overall_qlike)) * 10**2
+        if np.isfinite(dir_bce):
+            hybrid_val += W_DIR * dir_bce
+
+        # expose individual pieces (nice for TB & early stopping)
+        trainer.callback_metrics["val_mse_dec"]   = torch.tensor(float(overall_mse))
+        trainer.callback_metrics["val_rmse_dec"]  = torch.tensor(float(overall_rmse))
+        trainer.callback_metrics["val_qlike_dec"] = torch.tensor(float(overall_qlike))
+        trainer.callback_metrics["val_dir_bce"]   = torch.tensor(float(dir_bce)) if np.isfinite(dir_bce) else torch.tensor(float("nan"))
+
+        # THIS is what EarlyStopping/Checkpoint should monitor
+        trainer.callback_metrics["val_loss"] = torch.tensor(float(hybrid_val))
+        trainer.callback_metrics["val_loss_decoded"] = torch.tensor(float(hybrid_val))
+
+        # --- Compute overall decoded metrics ---
+        eps = 1e-8
         overall_mae = (pv_dec_all - yv_dec_all).abs().mean().item()
         overall_mse = ((pv_dec_all - yv_dec_all) ** 2).mean().item()
         overall_rmse = overall_mse ** 0.5
-        sigma2_p_all = torch.clamp(pv_dec_all.abs(), min=eps) ** 2  # forecast variance
-        sigma2_p_all = torch.clamp(sigma2_p_all, min=eps)
-        sigma2_all   = torch.clamp(yv_dec_all.abs(), min=eps) ** 2  # realized variance
-        ratio_all    = sigma2_all / sigma2_p_all  # true/forecast
+
+        sigma2_p_all = torch.clamp(pv_dec_all.abs(), min=eps) ** 2
+        sigma2_all   = torch.clamp(yv_dec_all.abs(), min=eps) ** 2
+        ratio_all    = sigma2_all / sigma2_p_all
         overall_qlike = (ratio_all - torch.log(ratio_all) - 1.0).mean().item()
 
-        # —— expose decoded metrics and define a combined val_loss = MAE + RMSE + 0.05 * DirBCE ——
-        try:
-            import torch as _torch
-            # Direction BCE (logits-aware) over all collected val samples
-            dir_bce = None
-            if yd_cpu is not None and pd_cpu is not None and yd_cpu.numel() > 0 and pd_cpu.numel() > 0:
-                yt = yd_cpu.float()
-                pt = pd_cpu
-                # if looks like logits, use BCEWithLogits; else plain BCE on probs
-                if _torch.isfinite(pt).any() and (pt.min() < 0 or pt.max() > 1):
-                    # label smoothing 0.1 (same as training)
-                    yt_s = yt * 0.9 + 0.05
-                    dir_bce_t = F.binary_cross_entropy_with_logits(pt, yt_s)
-                else:
-                    p = _torch.clamp(pt, 1e-7, 1 - 1e-7)
-                    yt_s = yt * 0.9 + 0.05
-                    dir_bce_t = F.binary_cross_entropy(p, yt_s)
-                dir_bce = float(dir_bce_t.item())
-
-            # Base composite (decoded): MAE + RMSE
-            comp_val = float(overall_mae) + float(overall_rmse)
-            # Add small weight on direction (BCE) if available
-            if dir_bce is not None and np.isfinite(dir_bce):
-                comp_val_full = comp_val + 0.05 * float(dir_bce)
-            else:
-                comp_val_full = comp_val
-
-            # Log individual components and the combined loss that we want to track
-            trainer.callback_metrics["val_mae_dec"] = _torch.tensor(float(overall_mae))
-            trainer.callback_metrics["val_rmse_dec"] = _torch.tensor(float(overall_rmse))
-            trainer.callback_metrics["val_dir_bce"] = (
-                _torch.tensor(float(dir_bce)) if dir_bce is not None else _torch.tensor(float('nan'))
-            )
-            # The key below is what Lightning callbacks (EarlyStopping/Checkpoint) commonly monitor by default
-            trainer.callback_metrics["val_loss"] = _torch.tensor(comp_val_full)
-            # Keep a named alias for clarity in logs
-            trainer.callback_metrics["val_loss_decoded"] = _torch.tensor(comp_val_full)
-        except Exception:
-            pass
-
-        self._last_rows = sorted(rows, key=lambda r: r[-1], reverse=True)
-        self._last_overall = {
-            "mae": overall_mae,
-            "rmse": overall_rmse,
-            "mse": overall_mse,
-            "qlike": overall_qlike,
-            "val_loss": float(overall_mae + overall_rmse) + (
-                0.05 * float(trainer.callback_metrics.get("val_dir_bce", torch.tensor(float('nan'))).item())
-                if torch.is_tensor(trainer.callback_metrics.get("val_dir_bce")) and torch.isfinite(trainer.callback_metrics["val_dir_bce"]) else 0.0
-            ),
-            "dir_bce": float(trainer.callback_metrics.get("val_dir_bce", torch.tensor(float('nan'))).item())
-                if torch.is_tensor(trainer.callback_metrics.get("val_dir_bce")) else None,
-            "yd": yd_cpu,
-            "pd": pd_cpu,
-        }
-
-        # ---- concise per-epoch validation metrics printout (overall only) ----
+        # --- End-of-epoch concise printout ---
         try:
             epoch_num = int(getattr(trainer, "current_epoch", -1)) + 1
         except Exception:
             epoch_num = None
-        try:
-            # Compute overall accuracy if direction available
-            acc = None
-            if yd_cpu is not None and pd_cpu is not None and yd_cpu.numel() > 0 and pd_cpu.numel() > 0:
-                yt = yd_cpu.float()
-                pt = pd_cpu
-                try:
-                    if torch.isfinite(pt).any() and (pt.min() < 0 or pt.max() > 1):
-                        pt = torch.sigmoid(pt)
-                except Exception:
+
+        # Compute accuracy if direction labels are available
+        acc = None
+        if yd_cpu is not None and pd_cpu is not None and yd_cpu.numel() > 0 and pd_cpu.numel() > 0:
+            pt = pd_cpu
+            try:
+                if torch.isfinite(pt).any() and (pt.min() < 0 or pt.max() > 1):
                     pt = torch.sigmoid(pt)
-                pt = torch.clamp(pt, 0.0, 1.0)
-                acc = ((pt >= 0.5).int() == yt.int()).float().mean().item()
-
-            N = int(yv_dec_all.numel())
-            msg = (
-                f"[VAL EPOCH {epoch_num}] "
-                f"MAE={overall_mae:.6f} "
-                f"RMSE={overall_rmse:.6f} "
-                f"MSE={overall_mse:.6f} "
-                f"QLIKE={overall_qlike:.6f} "
-                + (f"| ACC={acc:.3f} " if acc is not None else "")
-                + f"| N={N}"
-            )
-            # Append combined loss to msg
-            try:
-                # reuse the same composition for display
-                _dir_display = None
-                if yd_cpu is not None and pd_cpu is not None and yd_cpu.numel() > 0 and pd_cpu.numel() > 0:
-                    pt_disp = pd_cpu
-                    if torch.isfinite(pt_disp).any() and (pt_disp.min() < 0 or pt_disp.max() > 1):
-                        _dir_display = float(F.binary_cross_entropy_with_logits(pt_disp, (yd_cpu.float()*0.9+0.05)).item())
-                    else:
-                        _dir_display = float(F.binary_cross_entropy(torch.clamp(pt_disp,1e-7,1-1e-7), (yd_cpu.float()*0.9+0.05)).item())
-                _val_loss_disp = (overall_mae + overall_rmse) + (0.05 * _dir_display if _dir_display is not None else 0.0)
-                msg += f"| VAL_LOSS={_val_loss_disp:.6f}"
             except Exception:
-                pass
-            print(msg)
+                pt = torch.sigmoid(pt)
+            pt = torch.clamp(pt, 0.0, 1.0)
+            acc = ((pt >= 0.5).int() == yd_cpu.int()).float().mean().item()
 
-            # Expose to callback metrics for progress bar if desired
-            try:
-                trainer.callback_metrics["val_mae_overall"] = torch.tensor(float(overall_mae))
-                trainer.callback_metrics["val_rmse_overall"] = torch.tensor(float(overall_rmse))
-                trainer.callback_metrics["val_mse_overall"] = torch.tensor(float(overall_mse))
-                trainer.callback_metrics["val_qlike_overall"] = torch.tensor(float(overall_qlike))
-                if acc is not None:
-                    trainer.callback_metrics["val_acc_overall"] = torch.tensor(float(acc))
-                trainer.callback_metrics["val_N_overall"] = torch.tensor(float(N))
-            except Exception:
-                pass
-        except Exception:
-            pass
+        N = int(yv_dec_all.numel())
+        msg = (
+            f"[VAL EPOCH {epoch_num}] "
+            f"MAE={overall_mae:.6f} "
+            f"RMSE={overall_rmse:.6f} "
+            f"MSE={overall_mse:.6f} "
+            f"QLIKE={overall_qlike:.6f} "
+            + (f"| ACC={acc:.3f} " if acc is not None else "")
+            + f"| N={N}"
+        )
+
+        # Set validation loss to MAE + RMSE (optionally add direction BCE weight if acc is used)
+        val_loss_value = overall_mae + overall_rmse
+        msg += f"| VAL_LOSS={val_loss_value:.6f}"
+        print(msg)
+
+        # --- Log to Lightning callback_metrics if desired ---
+        trainer.callback_metrics["val_mae_overall"] = torch.tensor(float(overall_mae))
+        trainer.callback_metrics["val_rmse_overall"] = torch.tensor(float(overall_rmse))
+        trainer.callback_metrics["val_mse_overall"] = torch.tensor(float(overall_mse))
+        trainer.callback_metrics["val_qlike_overall"] = torch.tensor(float(overall_qlike))
+        trainer.callback_metrics["val_loss"] = torch.tensor(float(val_loss_value))
+        if acc is not None:
+            trainer.callback_metrics["val_acc_overall"] = torch.tensor(float(acc))
+        trainer.callback_metrics["val_N_overall"] = torch.tensor(float(N))
+
 
     @torch.no_grad()
     def on_fit_end(self, trainer, pl_module):
@@ -1809,7 +1725,7 @@ if __name__ == "__main__":
         loss=MultiLoss([
             AsymmetricQuantileLoss(
                 quantiles=[0.05, 0.165, 0.25, 0.5, 0.75, 0.835, 0.95],
-                underestimation_factor= 1.115 #1.115,  # keep asymmetric penalty
+                underestimation_factor= 1.0 #1.115,  # keep asymmetric penalty
             ),
             LabelSmoothedBCE(smoothing=0.1),
         ], weights=[FIXED_VOL_WEIGHT, FIXED_DIR_WEIGHT]),
