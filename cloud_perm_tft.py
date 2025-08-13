@@ -1826,3 +1826,18 @@ if __name__ == "__main__":
                     x[key] = _to_numpy_int64_array(x[key])
         return x
 
+    # Patch BaseModel.plot_prediction so it always receives CPU float32 data and int64 lengths
+    if hasattr(BaseModel, "plot_prediction"):
+        _orig_plot_prediction = BaseModel.plot_prediction
+
+        def _plot_prediction_safe(self, x, *args, **kwargs):
+            try:
+                x = _fix_lengths_in_x(_deep_cpu_float(x))
+                # deep-cast args/kwargs for plotting stability (avoid bf16 on CPU)
+                args = tuple(_deep_cpu_float(a) for a in args)
+                kwargs = {k: _deep_cpu_float(v) for k, v in kwargs.items()}
+            except Exception:
+                pass
+            return _orig_plot_prediction(self, x, *args, **kwargs)
+
+        BaseModel.plot_prediction = _plot_prediction_safe
