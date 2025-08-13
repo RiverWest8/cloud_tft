@@ -390,7 +390,6 @@ def main():
 
     # Force overfitting test mode: very small subset, large model capacity, many epochs
     # (Set these before loading datasets)
-    global TRAIN_N, VAL_N, TEST_N, MAX_EPOCHS, LR
     TRAIN_N = 512
     VAL_N = 512
     TEST_N = 512
