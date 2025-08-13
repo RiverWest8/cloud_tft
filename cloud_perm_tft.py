@@ -146,6 +146,85 @@ if hasattr(GroupNormalizer, "INVERSE_TRANSFORMATIONS"):
 # `.inverse_transform()` but not `.decode()`.  Downstream code expects
 # `.decode()`, so add an alias when missing.
 # -----------------------------------------------------------------------
+# -----------------------------------------------------------------------
+# Robust manual inverse for GroupNormalizer (fallback when decode fails)
+# -----------------------------------------------------------------------
+@torch.no_grad()
+def manual_inverse_transform_groupnorm(normalizer, y: torch.Tensor, group_ids: torch.Tensor | None):
+    """
+    Reverse GroupNormalizer transform:
+      1) destandardize: y -> y*scale + center  (center may be None when center=False)
+      2) inverse transform (asinh -> sinh, identity -> no-op, else via registry)
+    Works for both global scale and per-group scale_by_group=True.
+    y can be [B] or [B,1]; returns same shape as y.
+    """
+    # squeeze to [B]
+    y_ = y.squeeze(-1) if y.ndim > 1 else y
+
+    # PF stores per-fit tensors as attributes (varies slightly by version)
+    center = getattr(normalizer, "center", None)   # Tensor or None
+    scale  = getattr(normalizer, "scale",  None)   # Tensor or None
+
+    # If we can't see scale, just return input (no crash)
+    if scale is None:
+        x = y_
+    else:
+        if group_ids is not None and torch.is_tensor(group_ids):
+            g = group_ids
+            if g.ndim > 1 and g.size(-1) == 1:
+                g = g.squeeze(-1)
+            g = g.long()
+            # Gather per-sample scale/center when scale_by_group=True
+            s = scale[g] if isinstance(scale, torch.Tensor) else scale
+            if isinstance(center, torch.Tensor):
+                c = center[g]
+            else:
+                c = 0.0
+        else:
+            s = scale
+            c = center if isinstance(center, torch.Tensor) else 0.0
+        x = y_ * s + c
+
+    # Now undo the transformation
+    tfm = getattr(normalizer, "transformation", None)
+    if tfm == "asinh":
+        x = torch.sinh(x)
+    elif tfm in (None, "identity"):
+        pass
+    else:
+        # Try registry if present
+        try:
+            inv = GroupNormalizer.TRANSFORMATIONS[tfm]["inverse"]
+            x = inv(x)
+        except Exception:
+            pass
+
+    # restore original shape
+    return x.view_as(y)
+
+@torch.no_grad()
+def safe_decode_vol(y: torch.Tensor, normalizer, group_ids: torch.Tensor | None):
+    """
+    Try normalizer.decode(), then normalizer.inverse_transform(),
+    finally fallback to manual_inverse_transform_groupnorm.
+    y expected as [B,1] (we keep it that way so all callers are consistent).
+    """
+    # 1) try decode(...)
+    try:
+        return normalizer.decode(y, group_ids=group_ids)
+    except Exception:
+        pass
+    # 2) try inverse_transform(...)
+    try:
+        return normalizer.inverse_transform(y, group_ids=group_ids)  # newer PF
+    except Exception:
+        try:
+            return normalizer.inverse_transform(y)  # older PF signature
+        except Exception:
+            pass
+    # 3) manual fallback
+    return manual_inverse_transform_groupnorm(normalizer, y, group_ids)
+
 if not hasattr(GroupNormalizer, "decode"):
     def _gn_decode(self, y, group_ids=None, **kwargs):
         """
@@ -436,19 +515,13 @@ class PerAssetMetrics(pl.Callback):
         yd = torch.cat(self._yd_dev).to(device) if self._yd_dev else None
         pdir = torch.cat(self._pd_dev).to(device) if self._pd_dev else None
 
-        # decode realised vol in one shot
-        try:
-            yv_dec_t = self.vol_norm.decode(yv.unsqueeze(-1), group_ids=g.unsqueeze(-1)).squeeze(-1)
-        except Exception:
-            yv_dec_t = yv
-        try:
-            pv_dec_t = self.vol_norm.decode(pv.unsqueeze(-1), group_ids=g.unsqueeze(-1)).squeeze(-1)
-            pv_dec_t = torch.clamp(pv_dec_t, min=2e-7)
-        except Exception:
-            pv_dec_t = pv
+        # decode realised vol in one shot (robust + consistent with training)
+        yv_dec_t = safe_decode_vol(yv.unsqueeze(-1), self.vol_norm, g.unsqueeze(-1)).squeeze(-1)
+        pv_dec_t = safe_decode_vol(pv.unsqueeze(-1), self.vol_norm, g.unsqueeze(-1)).squeeze(-1)
+        pv_dec_t = torch.clamp(pv_dec_t, min=2e-7)
         
         print("DEBUG transformation:", getattr(self.vol_norm, "transformation", None))
-        yv_dec_t_test = self.vol_norm.decode(yv.unsqueeze(-1), group_ids=g.unsqueeze(-1)).squeeze(-1)
+        yv_dec_t_test = safe_decode_vol(yv.unsqueeze(-1), self.vol_norm, g.unsqueeze(-1)).squeeze(-1)
         print("DEBUG mean after decode:", yv_dec_t_test.mean().item())
         
         print(
@@ -1410,9 +1483,11 @@ def _evaluate_decoded_metrics(
 
             # decode back to physical scale (vol only)
             try:
-                y_dec = vol_norm.decode(y_vol.to(model_device).unsqueeze(-1), group_ids=g.to(model_device).unsqueeze(-1)).squeeze(-1)
-                p_dec = vol_norm.decode(p_vol.to(model_device).unsqueeze(-1), group_ids=g.to(model_device).unsqueeze(-1)).squeeze(-1)
-                p_dec = torch.clamp(p_dec, min=1e-8)  # ensure positive floor       
+                y_dec = safe_decode_vol(y_vol.to(model_device).unsqueeze(-1),
+                                        vol_norm, g.to(model_device).unsqueeze(-1)).squeeze(-1)
+                p_dec = safe_decode_vol(p_vol.to(model_device).unsqueeze(-1),
+                                        vol_norm, g.to(model_device).unsqueeze(-1)).squeeze(-1)
+                p_dec = torch.clamp(p_dec, min=1e-8)    
             except Exception:
                 y_dec, p_dec = y_vol.to(model_device), p_vol.to(model_device)
 
@@ -1605,7 +1680,7 @@ if __name__ == "__main__":
                 GroupNormalizer(
                     groups=GROUP_ID,
                     center=False,
-                    scale_by_group= False,
+                    scale_by_group= True,
                     transformation="asinh",
                 ),
                 TorchNormalizer(method="identity", center=False),   # direction
@@ -1689,6 +1764,8 @@ if __name__ == "__main__":
     )
     rev_asset = {i: lbl for i, lbl in enumerate(asset_vocab)}
 
+    vol_normalizer = _extract_norm_from_dataset(training_dataset)
+
 
     # -----------------------------------------------------------------------
     # Model
@@ -1708,7 +1785,7 @@ if __name__ == "__main__":
 
     metrics_cb = PerAssetMetrics(
         id_to_name=rev_asset,
-        vol_normalizer=_extract_norm_from_dataset(training_dataset)
+        vol_normalizer= vol_normalizer
     )
 
     # If you have a custom checkpoint mirroring callback
