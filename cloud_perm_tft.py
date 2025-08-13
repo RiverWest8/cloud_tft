@@ -1404,32 +1404,62 @@ def _evaluate_decoded_metrics(
                 continue
 
             # ---- targets (robust; avoid `or` with tensors) ----
-            y_vol = None
-            y_dir = None
+            # ---- targets (robust; handles tensor OR list/tuple; avoids truthiness on tensors) ----
+            y_vol, y_dir = None, None
 
-            # Preferred: decoder_target, else target
+            def _extract_targets(obj):
+                """Return (y_vol, y_dir) from PF-style targets."""
+                if torch.is_tensor(obj):
+                    t = obj
+                    # PF often gives [B, 1, n_targets] for decoder_target
+                    if t.ndim == 3 and t.size(-1) == 1:
+                        t = t[..., 0]  # -> [B, n_targets]
+                    # Also seen: [B, 1, n_targets] (pred_len=1) but with the middle dim as length 1
+                    if t.ndim == 3 and t.size(1) == 1:
+                        t = t[:, 0, :]  # -> [B, n_targets]
+                    if t.ndim == 2 and t.size(1) >= 1:
+                        yv = t[:, 0]
+                        yd = t[:, 1] if t.size(1) > 1 else None
+                        return yv, yd
+                    return None, None
+
+                if isinstance(obj, (list, tuple)) and len(obj) >= 1:
+                    yv = obj[0]
+                    yd = obj[1] if len(obj) > 1 else None
+                    # yv may itself be [B, 1, 1] or [B, 1]
+                    if torch.is_tensor(yv):
+                        if yv.ndim == 3 and yv.size(-1) == 1:
+                            yv = yv[..., 0]
+                        if yv.ndim == 3 and yv.size(1) == 1:
+                            yv = yv[:, 0, :]
+                        if yv.ndim == 2 and yv.size(-1) == 1:
+                            yv = yv[:, 0]
+                    if torch.is_tensor(yd):
+                        if yd.ndim == 3 and yd.size(-1) == 1:
+                            yd = yd[..., 0]
+                        if yd.ndim == 3 and yd.size(1) == 1:
+                            yd = yd[:, 0, :]
+                        if yd.ndim == 2 and yd.size(-1) == 1:
+                            yd = yd[:, 0]
+                    return yv if torch.is_tensor(yv) else None, yd if torch.is_tensor(yd) else None
+
+                return None, None
+
+            # Preferred: decoder_target; else target
             dec_t = x.get("decoder_target", None)
             if dec_t is None:
                 dec_t = x.get("target", None)
 
-            if torch.is_tensor(dec_t):
-                t = dec_t
-                if t.ndim == 3 and t.size(-1) == 1:
-                    t = t[..., 0]
-                if t.ndim == 2 and t.size(1) >= 1:
-                    y_vol = t[:, 0]
-                    y_dir = t[:, 1] if t.size(1) > 1 else None
+            if dec_t is not None:
+                y_vol, y_dir = _extract_targets(dec_t)
 
-            # Fallback: dataloader second item
-            if (y_vol is None or (y_dir is None and y is not None)) and torch.is_tensor(y):
-                t = y
-                if t.ndim == 3 and t.size(1) == 1:
-                    t = t[:, 0, :]
-                if t.ndim == 2 and t.size(1) >= 1:
-                    if y_vol is None:
-                        y_vol = t[:, 0]
-                    if y_dir is None and t.size(1) > 1:
-                        y_dir = t[:, 1]
+            # Fallback: dataloader second item (PF often provides batch[1] = targets)
+            if (y_vol is None or (y_dir is None and y is not None)) and y is not None:
+                yv2, yd2 = _extract_targets(y)
+                if y_vol is None:
+                    y_vol = yv2
+                if y_dir is None and yd2 is not None:
+                    y_dir = yd2
 
             if not torch.is_tensor(y_vol):
                 skipped_reasons["no_targets"] += 1
