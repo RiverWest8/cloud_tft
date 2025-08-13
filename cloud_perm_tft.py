@@ -361,24 +361,27 @@ class PerAssetMetrics(pl.Callback):
                 p_dir_t = pred[1] if len(pred) > 1 else None
                 return _to_median_q(p_vol_t), _to_dir_logit(p_dir_t)
 
-            # Case 2: our DualOutputModule returns a stacked tensor
+
+
+            # Case 2: PF TFT with MultiLoss → concatenated last-dim: [B, 1, 7+1] or [B, 7+1]
             if torch.is_tensor(pred):
                 t = pred
-                # squeeze prediction-length dim if present → [B, 2, 7] or [B, 1, 7]
+                # squeeze prediction-length dim if present → [B, D]
                 if t.ndim == 4 and t.size(1) == 1:
-                    t = t.squeeze(1)
-                # Full two-head output: [B, 2, 7]
-                if t.ndim == 3 and t.size(1) == 2:
-                    vol = t[:, 0, :]  # [B,7]
-                    d   = t[:, 1, :]  # [B,7] replicated direction logit
-                    return _to_median_q(vol), _to_dir_logit(d)
-                # Vol-only variants
+                    t = t.squeeze(1)          # [B, 2, K]? or [B, 1, D]
                 if t.ndim == 3 and t.size(1) == 1:
-                    vol = t[:, 0, :]  # [B,7]
-                    return _to_median_q(vol), None
-                if t.ndim == 2 and t.size(-1) >= 1:
-                    return _to_median_q(t), None
-
+                    t = t[:, 0, :]            # [B, D]
+                if t.ndim == 2:
+                    D = t.size(-1)
+                    if D >= 2:
+                        vol_q = t[:, : D-1]   # first K columns = volatility quantiles
+                        d_log = t[:, D-1]     # last column = direction logit
+                        return vol_q.mean(dim=-1), d_log
+                    elif D == 1:
+                        # unlikely for vol head, but handle gracefully
+                        return t.squeeze(-1), None
+                # fallback (t not in an expected shape)
+                return _to_median_q(t), None
             # Fallback: treat as vol-only
             return _to_median_q(pred), None
 
@@ -1336,23 +1339,24 @@ def _evaluate_decoded_metrics(
                 p_dir = _to_dir_logit(pred[1] if len(pred) > 1 else None)
             elif torch.is_tensor(pred):
                 t = pred
-                # squeeze pred_len dim if present: [B, 1, 2, K] -> [B, 2, K]
+                # squeeze prediction-length dim if present → [B, D]
                 if t.ndim >= 4 and t.size(1) == 1:
                     t = t.squeeze(1)
-                if t.ndim == 3 and t.size(1) >= 2:
-                    vol = t[:, 0, :]  # [B, K]
-                    d   = t[:, 1, :]  # [B, K] (replicated logits) or [B, 1]
-                    p_vol = _to_median_q(vol)
-                    p_dir = _to_dir_logit(d)
-                elif t.ndim >= 2:
-                    p_vol = _to_median_q(t)
-                    p_dir = None
-                else:
-                    skipped_reasons["bad_pred_format"] += 1
-                    continue
-            else:
-                skipped_reasons["bad_pred_format"] += 1
-                continue
+                if t.ndim == 3 and t.size(1) == 1:
+                    t = t[:, 0, :]
+                if t.ndim == 2:
+                    D = t.size(-1)
+                    if D >= 2:
+                        vol_q = t[:, : D-1]      # first K columns = vol quantiles
+                        d_log = t[:, D-1]        # last column = dir logit
+                        p_vol = vol_q.mean(dim=-1)
+                        p_dir = d_log
+                    elif D == 1:
+                        p_vol = t.squeeze(-1)
+                        p_dir = None
+                    else:
+                        skipped_reasons["bad_pred_format"] += 1
+                        continue
 
             if not torch.is_tensor(p_vol) or not torch.is_tensor(g):
                 skipped_reasons["bad_pred_format"] += 1
