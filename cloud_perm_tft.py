@@ -341,6 +341,7 @@ tft.validation_step = MethodType(_validation_step_decoded, tft)
 # -----------------------
 
 def main():
+    global MAX_EPOCHS, BATCH_SIZE, ENC_LEN
     parser = argparse.ArgumentParser(description="Train TFT on cloud perm data.")
     parser.add_argument("--max_epochs", type=int, default=MAX_EPOCHS)
     parser.add_argument("--early_stop_patience", type=int, default=4)
@@ -356,7 +357,6 @@ def main():
     args = parser.parse_args()
 
     # Override constants with CLI args
-    global MAX_EPOCHS, BATCH_SIZE, ENC_LEN
     MAX_EPOCHS = args.max_epochs
     BATCH_SIZE = args.batch_size
     ENC_LEN = args.max_encoder_length
