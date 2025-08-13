@@ -1210,7 +1210,7 @@ GROUP_ID: List[str] = ["asset"]
 TIME_COL = "Time"
 TARGETS  = ["realised_vol", "direction"]
 
-MAX_ENCODER_LENGTH = 6
+MAX_ENCODER_LENGTH = 24
 MAX_PRED_LENGTH    = 1
 
 EMBEDDING_CARDINALITY = {}
@@ -1815,7 +1815,7 @@ if __name__ == "__main__":
     seed_everything(SEED, workers=True)
     # Loss and output_size for multi-target: realised_vol (quantile regression), direction (classification)
     print("▶ Building model …")
-    print(f"[LR] learning_rate={LR_OVERRIDE if LR_OVERRIDE is not None else 0.00187}")
+    print(f"[LR] learning_rate={LR_OVERRIDE if LR_OVERRIDE is not None else 0.0017978}")
     
     es_cb = EarlyStopping(
     monitor="val_loss",
@@ -1836,7 +1836,7 @@ if __name__ == "__main__":
 
     # Fixed weights
     FIXED_VOL_WEIGHT = 1.0
-    FIXED_DIR_WEIGHT = 0.1
+    FIXED_DIR_WEIGHT = 0.0
 
     tft = TemporalFusionTransformer.from_dataset(
         training_dataset,
