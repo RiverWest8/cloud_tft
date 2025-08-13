@@ -438,11 +438,11 @@ class PerAssetMetrics(pl.Callback):
 
         # decode realised vol in one shot
         try:
-            yv_dec_t = torch.sinh(self.vol_norm.decode(yv.unsqueeze(-1), group_ids=g.unsqueeze(-1))).squeeze(-1)
+            yv_dec_t = self.vol_norm.decode(yv.unsqueeze(-1), group_ids=g.unsqueeze(-1)).squeeze(-1)
         except Exception:
             yv_dec_t = yv
         try:
-            pv_dec_t = torch.sinh(self.vol_norm.decode(pv.unsqueeze(-1), group_ids=g.unsqueeze(-1))).squeeze(-1)
+            pv_dec_t = self.vol_norm.decode(pv.unsqueeze(-1), group_ids=g.unsqueeze(-1)).squeeze(-1)
             pv_dec_t = torch.clamp(pv_dec_t, min=2e-7)
         except Exception:
             pv_dec_t = pv
@@ -572,13 +572,6 @@ class PerAssetMetrics(pl.Callback):
             "yd": yd_cpu,
             "pd": pd_cpu,
         }
-        # Simple multiplicative calibration to remove residual scale bias
-        with torch.no_grad():
-            mask = torch.isfinite(yv_dec_all) & torch.isfinite(pv_dec_all) & (pv_dec_all.abs() > 1e-12)
-            if mask.any():
-                a = (yv_dec_all[mask] / (pv_dec_all[mask] + 1e-12)).median().item()
-                a = float(max(0.25, min(4.0, a)))  # clamp extremes
-                pv_dec_all = pv_dec_all * a
 
         # ---- concise per-epoch validation metrics printout (overall only) ----
         try:
@@ -1216,26 +1209,15 @@ def _evaluate_decoded_metrics(
     pin_memory: bool,
     vol_norm=None,
 ):
-    def _evaluate_decoded_metrics(
-    model,
-    ds: TimeSeriesDataSet,
-    batch_size: int,
-    max_batches: int,
-    num_workers: int,
-    prefetch: int,
-    pin_memory: bool,
-    vol_norm=None,  # default to None
-):
-        # Resolve the normalizer if not provided
-        if vol_norm is None:
-            vol_norm = _extract_norm_from_dataset(ds)
+    # Resolve the normalizer if not provided
+    if vol_norm is None:
+        vol_norm = _extract_norm_from_dataset(ds)
 
     # ... rest of your function ...
     """
     Compute decoded MAE, RMSE, DirBCE and combined val_loss on up to max_batches.
     Returns: (mae, rmse, dir_bce, val_loss, n)
     """
-    vol_norm = _extract_norm_from_dataset(ds)
 
     dl = ds.to_dataloader(
         train=False,
@@ -1500,13 +1482,14 @@ def run_permutation_importance(
     Saves CSV with: feature, baseline_val_loss, permuted_val_loss, delta, mae, rmse, dir_bce, n.
     """
     ds_base = TimeSeriesDataSet.from_dataset(template_ds, base_df, predict=False, stop_randomization=True)
+    train_vol_norm = _extract_norm_from_dataset(template_ds)
     max_batches = 24
     try:
         print(f"[FI] Dataset size (samples): {len(ds_base)} | batch_size={batch_size}")
     except Exception:
         pass
     b_mae, b_rmse, b_dir, b_val, n = _evaluate_decoded_metrics(
-        model, ds_base, batch_size, max_batches, num_workers, prefetch, pin_memory
+        model, ds_base, batch_size, max_batches, num_workers, prefetch, pin_memory, vol_norm = train_vol_norm
     )
     print(f"[FI] Baseline val_loss = {b_val:.6f} (MAE={b_mae:.6f}, RMSE={b_rmse:.6f}, DirBCE={b_dir:.6f}) | N={n}")
 
@@ -1519,7 +1502,7 @@ def run_permutation_importance(
         _permute_series_inplace(df_p, feat, block=block_size, group_col=GROUP_ID[0] if GROUP_ID else "asset")
         ds_p = TimeSeriesDataSet.from_dataset(template_ds, df_p, predict=False, stop_randomization=True)
         p_mae, p_rmse, p_dir, p_val, n_p = _evaluate_decoded_metrics(
-            model, ds_p, batch_size, max_batches, num_workers, prefetch, pin_memory
+            model, ds_p, batch_size, max_batches, num_workers, prefetch, pin_memory, vol_norm = train_vol_norm
         )
         delta = (p_val - b_val) if (np.isfinite(p_val) and np.isfinite(b_val)) else float("nan")
         print(f"[FI] {feat:>20} | val_p={p_val:.6f} | Δ={delta:.6f} | (MAE={p_mae:.6f}, RMSE={p_rmse:.6f}, DirBCE={p_dir:.6f})")
