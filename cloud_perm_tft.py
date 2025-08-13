@@ -1477,7 +1477,7 @@ def _evaluate_decoded_metrics(
 
 def run_permutation_importance(
     model,
-    template_ds : TimeSeriesDataSet
+    template_ds : TimeSeriesDataSet,
     base_df: pd.DataFrame,
     build_ds_fn,
     features: List[str],
