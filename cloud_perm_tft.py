@@ -1573,10 +1573,11 @@ if __name__ == "__main__":
 
     print("▶ Building TimeSeriesDataSets …")
     # DEBUG: Force small subset for overfitting test BEFORE building datasets
-    subset_size = 10000
+    subset_size = 5000
+    subset_size1 = 1000
     train_df = train_df.iloc[:subset_size]
-    val_df = val_df.iloc[:subset_size]
-    test_df = test_df.iloc[:subset_size]
+    val_df = val_df.iloc[:subset_size1]
+    test_df = test_df.iloc[:subset_size1]
     training_dataset = build_dataset(train_df, predict=False)
 
     # Build validation/test from TRAIN template so group ID mapping and normalizer stats MATCH
