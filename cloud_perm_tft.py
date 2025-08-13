@@ -1809,6 +1809,7 @@ if __name__ == "__main__":
         precision=PRECISION,
         max_epochs=MAX_EPOCHS,
         gradient_clip_val=GRADIENT_CLIP_VAL,
+        num_sanity_val_steps = 0,
         logger=logger,
         callbacks=[lr_cb, best_ckpt_cb, es_cb, bar_cb, metrics_cb, mirror_cb],
         check_val_every_n_epoch=int(ARGS.check_val_every_n_epoch),
