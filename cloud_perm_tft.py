@@ -477,6 +477,7 @@ class PerAssetMetrics(pl.Callback):
 
     @torch.no_grad()
     def on_validation_epoch_end(self, trainer, pl_module):
+        pd_cpu = pdir.detach().cpu() if 'pdir' in locals() and pdir is not None else None
         if not self._g_dev:
             return
         device = self._g_dev[0].device
