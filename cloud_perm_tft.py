@@ -322,6 +322,20 @@ class PerAssetMetrics(pl.Callback):
         if isinstance(pred, dict) and "prediction" in pred:
             pred = pred["prediction"]
 
+        def _point_from_quantiles(vol_q: torch.Tensor) -> torch.Tensor:
+            """
+            Turn 7 vol quantiles into a point forecast using trapezoid rule.
+            """
+            assert vol_q.size(-1) == 7
+            p = torch.tensor([0.05, 0.165, 0.25, 0.50, 0.75, 0.835, 0.95],
+                            device=vol_q.device, dtype=vol_q.dtype)
+            w = torch.empty_like(p)
+            w[0]  = 0.5 * (p[1] - 0.0)
+            w[-1] = 0.5 * (1.0 - p[-2])
+            w[1:-1] = 0.5 * (p[2:] - p[:-2])
+            w = w / w.sum()
+            return (vol_q * w).sum(dim=-1)
+
         def _extract_heads(pred):
             """Return (p_vol, p_dir) as 1D tensors [B] on DEVICE.
             Handles outputs as:
@@ -359,7 +373,7 @@ class PerAssetMetrics(pl.Callback):
             if isinstance(pred, (list, tuple)):
                 p_vol_t = pred[0]
                 p_dir_t = pred[1] if len(pred) > 1 else None
-                return _to_median_q(p_vol_t), _to_dir_logit(p_dir_t)
+                return _point_from_quantiles(p_vol_t), _to_dir_logit(p_dir_t)
 
 
 
@@ -1349,11 +1363,7 @@ def _evaluate_decoded_metrics(
                     if D >= 2:
                         vol_q = t[:, : D-1]      # first K columns = vol quantiles
                         d_log = t[:, D-1]        # last column = dir logit
-                        p_vol = vol_q.mean(dim=-1)
-                        p_dir = d_log
-                    elif D == 1:
-                        p_vol = t.squeeze(-1)
-                        p_dir = None
+                        return _point_from_quantiles(vol_q), d_log  
                     else:
                         skipped_reasons["bad_pred_format"] += 1
                         continue
