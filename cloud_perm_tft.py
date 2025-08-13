@@ -22,11 +22,10 @@ GCS_BUCKET = os.environ.get("GCS_BUCKET", "river-ml-bucket")
 GCS_DATA_PREFIX = f"gs://{GCS_BUCKET}/Data/CleanedData"
 GCS_OUTPUT_PREFIX = f"gs://{GCS_BUCKET}/Dissertation/TFT"
 
-# Allow CLI overrides later in main()
-TRAIN_P = Path(f"{GCS_DATA_PREFIX}/universal_train.parquet")
-VAL_P   = Path(f"{GCS_DATA_PREFIX}/universal_val.parquet")
-TEST_P  = Path(f"{GCS_DATA_PREFIX}/universal_test.parquet")
-READ_PATHS = [str(TRAIN_P), str(VAL_P), str(TEST_P)]
+TRAIN_P = f"{GCS_DATA_PREFIX}/universal_train.parquet"
+VAL_P   = f"{GCS_DATA_PREFIX}/universal_val.parquet"
+TEST_P  = f"{GCS_DATA_PREFIX}/universal_test.parquet"
+READ_PATHS = [TRAIN_P, VAL_P, TEST_P]
 
 # -----------------------
 # 0) Register asinh
