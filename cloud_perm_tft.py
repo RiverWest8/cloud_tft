@@ -1770,7 +1770,38 @@ if __name__ == "__main__":
         reduce_on_plateau_patience=5,
         reduce_on_plateau_min_lr=1e-5,
     )
-    # ---------------------------------------------------------------
+
+        # ----------------------------
+    # Create callbacks BEFORE Trainer
+    # ----------------------------
+    lr_cb = LearningRateMonitor(logging_interval="step")
+
+    best_ckpt_cb = ModelCheckpoint(
+        monitor="val_loss",
+        mode="min",
+        save_top_k=1,
+        save_last=True,
+        filename=f"tft_best_e{MAX_EPOCHS}_{RUN_SUFFIX}",
+        dirpath=str(LOCAL_CKPT_DIR),
+    )
+
+    es_cb = EarlyStopping(
+        monitor="val_loss",
+        patience=EARLY_STOP_PATIENCE,
+        mode="min"
+    )
+
+    bar_cb = TQDMProgressBar()
+
+    # Example of your custom metrics callback
+    metrics_cb = PerAssetMetrics(id_to_name=rev_asset, vol_normalizer=None)
+
+    # If you have a custom checkpoint mirroring callback
+    mirror_cb = MirrorCheckpoints()
+
+    # ----------------------------
+    # Trainer instance
+    # ----------------------------
     trainer = Trainer(
         accelerator=ACCELERATOR,
         devices=DEVICES,
@@ -1782,6 +1813,7 @@ if __name__ == "__main__":
         check_val_every_n_epoch=int(ARGS.check_val_every_n_epoch),
         log_every_n_steps=int(ARGS.log_every_n_steps),
     )
+
     # Train the model
     trainer.fit(tft, train_dataloader, val_dataloader)
 
