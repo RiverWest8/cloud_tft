@@ -369,8 +369,12 @@ class PerAssetMetrics(pl.Callback):
             pred = pred["prediction"]
 
         def _point_from_quantiles(vol_q: torch.Tensor) -> torch.Tensor:
-            # Use 0.5 quantile only (median)
-            return vol_q[..., Q50_IDX]
+            """
+            Use the 0.5 quantile (median) to compute a point forecast, matching the
+            PerAssetMetrics callback behaviour. Assumes last dim is quantiles:
+            [0.05, 0.165, 0.25, 0.50, 0.75, 0.835, 0.95]
+            """
+            return vol_q[..., 3]
 
         def _extract_heads(pred):
             """Return (p_vol, p_dir) as 1D tensors [B] on DEVICE.
@@ -1060,17 +1064,11 @@ def _extract_norm_from_dataset(ds: TimeSeriesDataSet):
 
 def _point_from_quantiles(vol_q: torch.Tensor) -> torch.Tensor:
     """
-    Turn 7 vol quantiles into a point forecast using trapezoid rule.
+    Use the 0.5 quantile (median) to compute a point forecast, matching the
+    PerAssetMetrics callback behaviour. Assumes last dim is quantiles:
+    [0.05, 0.165, 0.25, 0.50, 0.75, 0.835, 0.95]
     """
-    assert vol_q.size(-1) == 7
-    p = torch.tensor([0.05, 0.165, 0.25, 0.50, 0.75, 0.835, 0.95],
-                    device=vol_q.device, dtype=vol_q.dtype)
-    w = torch.empty_like(p)
-    w[0]  = 0.5 * (p[1] - 0.0)
-    w[-1] = 0.5 * (1.0 - p[-2])
-    w[1:-1] = 0.5 * (p[2:] - p[:-2])
-    w = w / w.sum()
-    return (vol_q * w).sum(dim=-1)
+    return vol_q[..., 3]
 
 
 def _evaluate_decoded_metrics(
@@ -1499,12 +1497,7 @@ if __name__ == "__main__":
         )
 
     print("▶ Building TimeSeriesDataSets …")
-    # DEBUG: Force small subset for overfitting test BEFORE building datasets
-    subset_size = 5000
-    subset_size1 = 1000
-    train_df = train_df.iloc[:subset_size]
-    val_df = val_df.iloc[:subset_size1]
-    test_df = test_df.iloc[:subset_size1]
+
     training_dataset = build_dataset(train_df, predict=False)
 
     # Build validation/test from TRAIN template so group ID mapping and normalizer stats MATCH
@@ -1611,7 +1604,7 @@ if __name__ == "__main__":
         loss=MultiLoss([
             AsymmetricQuantileLoss(
                 quantiles=[0.05, 0.165, 0.25, 0.5, 0.75, 0.835, 0.95],
-                underestimation_factor= 1.0 #1.115,  # keep asymmetric penalty
+                underestimation_factor= 1.5 #1.115,  # keep asymmetric penalty
             ),
             LabelSmoothedBCE(smoothing=0.1),
         ], weights=[FIXED_VOL_WEIGHT, FIXED_DIR_WEIGHT]),
