@@ -1741,6 +1741,20 @@ if __name__ == "__main__":
     # Loss and output_size for multi-target: realised_vol (quantile regression), direction (classification)
     print("▶ Building model …")
     print(f"[LR] learning_rate={LR_OVERRIDE if LR_OVERRIDE is not None else 0.00187}")
+    
+    es_cb = EarlyStopping(
+    monitor="val_loss",
+    patience=EARLY_STOP_PATIENCE,
+    mode="min"
+    )
+
+    bar_cb = TQDMProgressBar()
+
+    # Example of your custom metrics callback
+    metrics_cb = PerAssetMetrics(id_to_name=rev_asset, vol_normalizer=None)
+
+    # If you have a custom checkpoint mirroring callback
+    mirror_cb = MirrorCheckpoints()
     from pytorch_forecasting.metrics import MultiLoss
 
     # Fixed weights
@@ -1785,19 +1799,6 @@ if __name__ == "__main__":
         dirpath=str(LOCAL_CKPT_DIR),
     )
 
-    es_cb = EarlyStopping(
-        monitor="val_loss",
-        patience=EARLY_STOP_PATIENCE,
-        mode="min"
-    )
-
-    bar_cb = TQDMProgressBar()
-
-    # Example of your custom metrics callback
-    metrics_cb = PerAssetMetrics(id_to_name=rev_asset, vol_normalizer=None)
-
-    # If you have a custom checkpoint mirroring callback
-    mirror_cb = MirrorCheckpoints()
 
     # ----------------------------
     # Trainer instance
