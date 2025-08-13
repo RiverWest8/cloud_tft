@@ -49,7 +49,7 @@ import pandas as pd
 import pandas as _pd
 pd = _pd  # Ensure pd always refers to pandas module
 import lightning as pl
-from lightning.pytorch import Trainer, seed_everything
+from lightning.pytorch import Trainer, seed_everything, trainer
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -1772,7 +1772,7 @@ if __name__ == "__main__":
     )
     # ---------------------------------------------------------------
     # Train the model
-    Trainer.fit(tft, train_dataloader, val_dataloader)
+    trainer.fit(tft, train_dataloader, val_dataloader)
 
     # Run FI permutation testing if enabled
     if ENABLE_FEATURE_IMPORTANCE:
