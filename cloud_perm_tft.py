@@ -117,42 +117,7 @@ test_df = None
 calendar_cols = []
 time_varying_known_reals = calendar_cols + ["time_idx"]  # + any of your calendar cols
 
-# (optional) remove realised_vol from the feature frame if you really want zero chance of leak
-# NOTE: PF will still get the target from the 'target' argument, so we keep the column.
-# If you insist on removing from the dataframe copy used for features, PF handles internally.
 
-training_dataset = TimeSeriesDataSet(
-    train_df,
-    time_idx="time_idx",
-    target="realised_vol",
-    group_ids=GROUP_ID,
-    min_encoder_length=ENC_LEN,
-    max_encoder_length=ENC_LEN,
-    min_prediction_length=PRED_LEN,
-    max_prediction_length=PRED_LEN,
-    static_categoricals=GROUP_ID,
-    time_varying_known_reals=time_varying_known_reals,
-    time_varying_unknown_reals=time_varying_unknown_reals,
-    add_relative_time_idx=True,
-    add_target_scales=True,
-    add_encoder_length=True,
-    target_normalizer=GroupNormalizer(
-        groups=GROUP_ID,
-        center=False,
-        scale_by_group=True,
-        transformation="asinh",
-    ),
-)
-
-validation_dataset = TimeSeriesDataSet.from_dataset(
-    training_dataset, val_df, predict=False, stop_randomization=True
-)
-test_dataset = TimeSeriesDataSet.from_dataset(
-    training_dataset, test_df, predict=False, stop_randomization=True
-)
-
-train_loader = training_dataset.to_dataloader(train=True,  batch_size=BATCH_SIZE, num_workers=0)
-val_loader   = validation_dataset.to_dataloader(train=False, batch_size=BATCH_SIZE, num_workers=0)
 
 # -----------------------
 # 4) Helpers: extract normalizer & safe decode
