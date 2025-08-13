@@ -338,7 +338,7 @@ class PerAssetMetrics(pl.Callback):
                 if t.ndim == 3 and t.size(1) == 1:
                     t = t.squeeze(1)  # [B,7]
                 if t.ndim == 2 and t.size(-1) >= 1:
-                    return t[:, t.size(-1) // 2]
+                    return t.mean(dim=-1)  # mean-of-quantiles
                 if t.ndim == 1:
                     return t
                 return t.reshape(t.size(0), -1)[:, 0]
@@ -426,6 +426,7 @@ class PerAssetMetrics(pl.Callback):
             yv_dec_t = yv
         try:
             pv_dec_t = self.vol_norm.decode(pv.unsqueeze(-1), group_ids=g.unsqueeze(-1)).squeeze(-1)
+            pv_dec_t = torch.clamp(pv_dec_t, min=2e-7)
         except Exception:
             pv_dec_t = pv
 
@@ -891,7 +892,7 @@ class LearnableMultiTaskLoss(nn.Module):
             if t.ndim == 3 and t.size(1) == 1:
                 t = t.squeeze(1)
             if t.ndim >= 2 and t.size(-1) > 1:
-                return t[..., t.size(-1) // 2]
+                return t.mean(dim=-1)
             return t.squeeze(-1)
 
         vol, dir_ = _split_heads(y_pred)
@@ -1493,7 +1494,7 @@ def _evaluate_decoded_metrics(
                     if t.ndim == 3 and t.size(1) == 1:
                         t = t.squeeze(1)  # [B, K] or [B, 1]
                     if t.ndim == 2 and t.size(-1) >= 1:
-                        return t[:, t.size(-1) // 2]  # median quantile
+                        return t.mean(dim=-1)  # mean-of-quantiles
                     if t.ndim == 1:
                         return t
                 return t
@@ -1553,6 +1554,7 @@ def _evaluate_decoded_metrics(
             try:
                 y_dec = vol_norm.decode(y_vol.to(model_device).unsqueeze(-1), group_ids=g.to(model_device).unsqueeze(-1)).squeeze(-1)
                 p_dec = vol_norm.decode(p_vol.to(model_device).unsqueeze(-1), group_ids=g.to(model_device).unsqueeze(-1)).squeeze(-1)
+                p_dec = torch.clamp(p_dec, min=1e-6)  # ensure positive floor       
             except Exception:
                 y_dec, p_dec = y_vol.to(model_device), p_vol.to(model_device)
 
