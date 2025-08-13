@@ -389,9 +389,9 @@ def main():
     # If gcs_data_prefix is given, override data paths to use GCS URIs
     if args.gcs_data_prefix:
         gcs_prefix = args.gcs_data_prefix.rstrip("/")
-        TRAIN_P = Path(f"{gcs_prefix}/universal_train.parquet")
-        VAL_P   = Path(f"{gcs_prefix}/universal_val.parquet")
-        TEST_P  = Path(f"{gcs_prefix}/universal_test.parquet")
+        TRAIN_P = f"{gcs_prefix}/universal_train.parquet"
+        VAL_P   = f"{gcs_prefix}/universal_val.parquet"
+        TEST_P  = f"{gcs_prefix}/universal_test.parquet"
 
     # Load datasets from the specified paths (GCS or local)
     train_df = load_and_prepare(TRAIN_P)
