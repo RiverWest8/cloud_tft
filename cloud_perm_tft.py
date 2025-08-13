@@ -1204,7 +1204,23 @@ def _evaluate_decoded_metrics(
     num_workers: int,
     prefetch: int,
     pin_memory: bool,
+    vol_norm=None,
 ):
+    def _evaluate_decoded_metrics(
+    model,
+    ds: TimeSeriesDataSet,
+    batch_size: int,
+    max_batches: int,
+    num_workers: int,
+    prefetch: int,
+    pin_memory: bool,
+    vol_norm=None,  # default to None
+):
+        # Resolve the normalizer if not provided
+        if vol_norm is None:
+            vol_norm = _extract_norm_from_dataset(ds)
+
+    # ... rest of your function ...
     """
     Compute decoded MAE, RMSE, DirBCE and combined val_loss on up to max_batches.
     Returns: (mae, rmse, dir_bce, val_loss, n)
@@ -1472,7 +1488,7 @@ def run_permutation_importance(
     val_loss = MAE + RMSE + 0.05 * DirBCE (decoded scale).
     Saves CSV with: feature, baseline_val_loss, permuted_val_loss, delta, mae, rmse, dir_bce, n.
     """
-    ds_base = build_ds_fn(base_df, predict=False)
+    ds_base = TimeSeriesDataSet.from_dataset(template_ds, base_df, predict=False, stop_randomization=True)
     max_batches = 24
     try:
         print(f"[FI] Dataset size (samples): {len(ds_base)} | batch_size={batch_size}")
@@ -1490,7 +1506,7 @@ def run_permutation_importance(
             continue
         df_p = base_df.copy()
         _permute_series_inplace(df_p, feat, block=block_size, group_col=GROUP_ID[0] if GROUP_ID else "asset")
-        ds_p = build_ds_fn(df_p, predict=False)
+        ds_p = TimeSeriesDataSet.from_dataset(template_ds, df_p, predict=False, stop_randomization=True)
         p_mae, p_rmse, p_dir, p_val, n_p = _evaluate_decoded_metrics(
             model, ds_p, batch_size, max_batches, num_workers, prefetch, pin_memory
         )
@@ -1612,12 +1628,25 @@ if __name__ == "__main__":
             predict_mode=predict
         )
 
-
     print("▶ Building TimeSeriesDataSets …")
     training_dataset = build_dataset(train_df, predict=False)
-    validation_dataset = build_dataset(val_df, predict=False)
-    # use predict=False so we obtain one sample **per time‑step**, not just the last step of each series
-    test_dataset = build_dataset(test_df, predict=False)
+
+    # Build validation/test from TRAIN template so group ID mapping and normalizer stats MATCH
+    validation_dataset = TimeSeriesDataSet.from_dataset(
+        training_dataset, val_df, predict=False, stop_randomization=True
+    )
+    test_dataset = TimeSeriesDataSet.from_dataset(
+        training_dataset, test_df, predict=False, stop_randomization=True
+    )
+
+    # (optional) quick alignment check
+    try:
+        train_vocab = training_dataset.get_parameters()["categorical_encoders"]["asset"].classes_
+        val_vocab   = validation_dataset.get_parameters()["categorical_encoders"]["asset"].classes_
+        print(f"[ALIGN] val uses train encoders: {np.array_equal(train_vocab, val_vocab)}; "
+            f"len(train_vocab)={len(train_vocab)} len(val_vocab)={len(val_vocab)}")
+    except Exception:
+        pass
 
     batch_size = min(BATCH_SIZE, len(training_dataset))
 
@@ -1777,14 +1806,14 @@ if __name__ == "__main__":
         feats = [f for f in feats if f not in ("sin_tod", "cos_tod", "sin_dow", "cos_dow", "Is_Weekend")]
         run_permutation_importance(
             model=tft,
+            template_ds=training_dataset,            # << use train template
             base_df=val_df,
-            build_ds_fn=build_dataset,
             features=feats,
             block_size=int(PERM_BLOCK_SIZE) if PERM_BLOCK_SIZE else 1,
-            batch_size= 2048,
+            batch_size=2048,
             max_batches=int(FI_MAX_BATCHES) if FI_MAX_BATCHES else 20,
-            num_workers= 4,
-            prefetch= 2,
+            num_workers=4,
+            prefetch=2,
             pin_memory=pin,
             out_csv_path=fi_csv,
             uploader=upload_file_to_gcs,
