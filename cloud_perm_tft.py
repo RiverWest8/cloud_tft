@@ -1364,8 +1364,16 @@ def _evaluate_decoded_metrics(
         pin_memory=pin_memory,
     )
 
+    # Get model device (first parameter device)
+    try:
+        model_device = next(model.parameters()).device
+    except Exception:
+        model_device = torch.device("cpu")
+
     model.eval()
     y_all, p_all, yd_all, pd_all, g_all = [], [], [], [], []
+    skipped_reasons = {"no_groups":0, "no_targets":0, "bad_pred_format":0}
+
     with torch.no_grad():
         for b_idx, batch in enumerate(dl):
             if max_batches is not None and b_idx >= int(max_batches):
@@ -1376,20 +1384,26 @@ def _evaluate_decoded_metrics(
             else:
                 x, y = batch, None
 
-            y_hat = model(x)
-            pred = getattr(y_hat, "prediction", y_hat)
+            if not isinstance(x, dict):
+                skipped_reasons["bad_pred_format"] += 1
+                continue
 
-            # groups for decoding
-            g = x.get("groups")
-            if isinstance(g, (list, tuple)):
+            # ---- groups (robust) ----
+            g = x.get("groups") or x.get("group_ids")
+            if isinstance(g, (list, tuple)) and len(g) > 0:
                 g = g[0]
             if torch.is_tensor(g) and g.ndim > 1 and g.size(-1) == 1:
                 g = g.squeeze(-1)
+            if not torch.is_tensor(g):
+                skipped_reasons["no_groups"] += 1
+                continue
 
-            # decoder target
-            dec_t = x.get("decoder_target")
+            # ---- targets (robust) ----
             y_vol = None
             y_dir = None
+
+            # Preferred: decoder_target
+            dec_t = x.get("decoder_target") or x.get("target")
             if torch.is_tensor(dec_t):
                 t = dec_t
                 if t.ndim == 3 and t.size(-1) == 1:
@@ -1397,15 +1411,39 @@ def _evaluate_decoded_metrics(
                 if t.ndim == 2 and t.size(1) >= 1:
                     y_vol = t[:, 0]
                     y_dir = t[:, 1] if t.size(1) > 1 else None
-            if y_vol is None and torch.is_tensor(y):
+
+            # Fallback: dataloader second item
+            if (y_vol is None or (y_dir is None and y is not None)) and torch.is_tensor(y):
                 t = y
                 if t.ndim == 3 and t.size(1) == 1:
                     t = t[:, 0, :]
                 if t.ndim == 2 and t.size(1) >= 1:
-                    y_vol = t[:, 0]
-                    y_dir = t[:, 1] if t.size(1) > 1 else y_dir
+                    if y_vol is None:
+                        y_vol = t[:, 0]
+                    if y_dir is None and t.size(1) > 1:
+                        y_dir = t[:, 1]
 
-            # take median quantile for vol and extract direction logit/prob
+            if not torch.is_tensor(y_vol):
+                skipped_reasons["no_targets"] += 1
+                continue
+
+            # ---- forward pass (move to model device) ----
+            # Move only tensors inside x that are torch.Tensors
+            x_dev = {}
+            for k, v in x.items():
+                if torch.is_tensor(v):
+                    x_dev[k] = v.to(model_device, non_blocking=True)
+                elif isinstance(v, (list, tuple)):
+                    x_dev[k] = [vv.to(model_device, non_blocking=True) if torch.is_tensor(vv) else vv for vv in v]
+                else:
+                    x_dev[k] = v
+
+            y_hat = model(x_dev)
+            pred = getattr(y_hat, "prediction", y_hat)
+            if isinstance(pred, dict) and "prediction" in pred:
+                pred = pred["prediction"]
+
+            # ---- extract heads ----
             def _median_q(t):
                 if torch.is_tensor(t) and t.ndim == 3 and t.size(1) == 1:
                     t = t.squeeze(1)
@@ -1427,13 +1465,15 @@ def _evaluate_decoded_metrics(
                     p_vol = _median_q(t)
                     p_dir = None
                 else:
-                    p_vol = t
-                    p_dir = None
+                    skipped_reasons["bad_pred_format"] += 1
+                    continue
             else:
-                return float("nan"), float("nan"), float("nan"), float("nan"), 0
+                skipped_reasons["bad_pred_format"] += 1
+                continue
 
-            if not (torch.is_tensor(y_vol) and torch.is_tensor(p_vol) and torch.is_tensor(g)):
-                return float("nan"), float("nan"), float("nan"), float("nan"), 0
+            if not (torch.is_tensor(p_vol) and torch.is_tensor(g)):
+                skipped_reasons["bad_pred_format"] += 1
+                continue
 
             # collapse dir head to single logit if needed
             if p_dir is not None and torch.is_tensor(p_dir) and p_dir.ndim >= 2 and p_dir.size(-1) > 1:
@@ -1442,10 +1482,10 @@ def _evaluate_decoded_metrics(
 
             # decode back to physical scale (vol only)
             try:
-                y_dec = vol_norm.decode(y_vol.unsqueeze(-1), group_ids=g.unsqueeze(-1)).squeeze(-1)
-                p_dec = vol_norm.decode(p_vol.unsqueeze(-1), group_ids=g.unsqueeze(-1)).squeeze(-1)
+                y_dec = vol_norm.decode(y_vol.to(model_device).unsqueeze(-1), group_ids=g.to(model_device).unsqueeze(-1)).squeeze(-1)
+                p_dec = vol_norm.decode(p_vol.to(model_device).unsqueeze(-1), group_ids=g.to(model_device).unsqueeze(-1)).squeeze(-1)
             except Exception:
-                y_dec, p_dec = y_vol, p_vol
+                y_dec, p_dec = y_vol.to(model_device), p_vol.to(model_device)
 
             y_all.append(y_dec.detach().cpu())
             p_all.append(p_dec.detach().cpu())
@@ -1456,6 +1496,8 @@ def _evaluate_decoded_metrics(
                 pd_all.append(p_dir.detach().cpu())
 
     if not y_all:
+        print("[FI] No valid batches produced targets/predictions; dataset may be empty or shapes unexpected.")
+        print(f"[FI] Skips — groups:{skipped_reasons['no_groups']}, targets:{skipped_reasons['no_targets']}, pred:{skipped_reasons['bad_pred_format']}")
         return float("nan"), float("nan"), float("nan"), float("nan"), 0
 
     y = torch.cat(y_all)
@@ -1504,6 +1546,10 @@ def run_permutation_importance(
     Saves CSV with: feature, baseline_val_loss, permuted_val_loss, delta, mae, rmse, dir_bce, n.
     """
     ds_base = build_ds_fn(base_df, predict=False)
+    try:
+        print(f"[FI] Dataset size (samples): {len(ds_base)} | batch_size={batch_size}")
+    except Exception:
+        pass
     b_mae, b_rmse, b_dir, b_val, n = _evaluate_decoded_metrics(
         model, ds_base, batch_size, max_batches, num_workers, prefetch, pin_memory
     )
@@ -1818,434 +1864,4 @@ if __name__ == "__main__":
                     *([1] * (diff.ndim - 1)), -1
                 )
                 alpha = self.underestimation_factor
-                return torch.where(diff >= 0, alpha * q * diff, (1 - q) * (-diff))
-
-    # Vol loss (fixed 1.115 penalty for underprediction)
-    vol_loss = _LossClass(
-        quantiles=[0.05, 0.165, 0.25, 0.5, 0.75, 0.835, 0.95],
-        underestimation_factor=1.115,
-    )
-
-    # Direction loss
-    dir_loss = StaticPosWeightBCE(pos_weight=1.1)
-
-    # Combine with fixed weights
-    from pytorch_forecasting.metrics import MultiLoss
-    tft.loss = MultiLoss(
-        [vol_loss, dir_loss],
-        weights=[1.0, 0.1]
-    )
-
-    # Replace default linear heads with DualHead and bias-init direction from pos_weight=1.1
-    dual_head = DualHead(hidden_size=int(getattr(tft.hparams, "hidden_size", 64)))
-    p0 = 1.0 / (1.0 + 1.1)
-    bias0 = float(np.log(p0 / (1.0 - p0)))
-    with torch.no_grad():
-        dual_head.dir[-1].bias.data.fill_(bias0)
-    tft.output_layer = nn.ModuleList([dual_head.vol, dual_head.dir])
-
-    # -----------------------------------------------------------------------
-    # Training
-    # -----------------------------------------------------------------------
-
-
-    # ----------------- Permutation importance loss scaling helper -----------------
-    def _scale_loss(val):
-        try:
-            return (val - 0.3) * 10.0
-        except Exception:
-            return val
-
-
-    class ComponentLossLogger(pl.Callback):
-        def __init__(self, path: str = str(LOCAL_RUN_DIR / f"tft_component_losses_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv")):
-            super().__init__()
-            self.path = path
-            self.rows = []
-
-        def _safe_get(self, seq, idx):
-            try:
-                if seq is None:
-                    return None
-                if idx < len(seq):
-                    return seq[idx]
-            except Exception:
-                return None
-            return None
-
-        def _row(self, trainer, pl_module, phase: str):
-            try:
-                loss_mod = getattr(pl_module, "loss", None)
-                L1 = float(loss_mod.last_L1.cpu().item()) if hasattr(loss_mod, "last_L1") else float('nan')
-                L2 = float(loss_mod.last_L2.cpu().item()) if hasattr(loss_mod, "last_L2") else float('nan')
-                s = getattr(loss_mod, "last_s", None)
-                if torch.is_tensor(s):
-                    s = s.cpu().tolist()
-                w = getattr(loss_mod, "last_w", None)
-                if torch.is_tensor(w):
-                    w = w.cpu().tolist()
-
-                r = {
-                    "epoch": trainer.current_epoch,
-                    "phase": phase,
-                    "L1": L1,
-                    "L2": L2,
-                    "s1": self._safe_get(s, 0),
-                    "s2": self._safe_get(s, 1),
-                    "w1": self._safe_get(w, 0),
-                    "w2": self._safe_get(w, 1),
-                }
-
-                # TensorBoard logging
-                try:
-                    if L1 is not None and not math.isnan(L1):
-                        trainer.logger.experiment.add_scalar(f"components/{phase}_L1_vol", L1, trainer.global_step)
-                    if L2 is not None and not math.isnan(L2):
-                        trainer.logger.experiment.add_scalar(f"components/{phase}_L2_dir", L2, trainer.global_step)
-                except Exception:
-                    pass
-                return r
-            except Exception:
-                return None
-
-        def on_train_epoch_end(self, trainer, pl_module):
-            r = self._row(trainer, pl_module, "train")
-            if r:
-                self.rows.append(r)
-                try:
-                    ep = int(getattr(trainer, "current_epoch", -1)) + 1
-                    l1 = r.get("L1", float("nan"))
-                    l2 = r.get("L2", float("nan"))
-                    w1 = r.get("w1", float("nan"))
-                    w2 = r.get("w2", float("nan"))
-                    msg = f"[TRAIN EPOCH {ep}] L1_vol={l1:.6f} L2_dir={l2:.6f} | w=({w1 if w1 is not None else float('nan'):.3f},{w2 if w2 is not None else float('nan'):.3f})"
-                    print(msg)
-                except Exception:
-                    pass
-
-        def on_validation_epoch_end(self, trainer, pl_module):
-            r = self._row(trainer, pl_module, "val")
-            if r:
-                self.rows.append(r)
-                try:
-                    ep = int(getattr(trainer, "current_epoch", -1)) + 1
-                    l1 = r.get("L1", float("nan"))
-                    l2 = r.get("L2", float("nan"))
-                    w1 = r.get("w1", float("nan"))
-                    w2 = r.get("w2", float("nan"))
-                    msg = f"[VAL   EPOCH {ep}] L1_vol={l1:.6f} L2_dir={l2:.6f} | w=({w1 if w1 is not None else float('nan'):.3f},{w2 if w2 is not None else float('nan'):.3f})"
-                    print(msg)
-                except Exception:
-                    pass
-
-        def on_train_end(self, trainer, pl_module):
-            try:
-                import pandas as pd
-                if self.rows:
-                    pd.DataFrame(self.rows).to_csv(self.path, index=False)
-                    print(f"✓ Saved component losses → {self.path}")
-                    try:
-                        upload_file_to_gcs(self.path, f"{GCS_OUTPUT_PREFIX}/{os.path.basename(self.path)}")
-                    except Exception as e:
-                        print(f"[WARN] Could not upload component losses: {e}")
-            except Exception as e:
-                print(f"[WARN] Could not save component losses: {e}")
-
-
-    class LossHistory(pl.Callback):
-        def __init__(self, path: str = str(LOCAL_RUN_DIR / f"tft_loss_history_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv")):
-            self.path = path
-            self.records = []
-
-        def _safe_float(self, val):
-            try:
-                if val is None:
-                    return None
-                f = float(val)
-                if math.isnan(f):
-                    return None
-                return float(f"{f:.8f}")
-            except Exception:
-                return None
-
-        def on_train_epoch_end(self, trainer, pl_module):
-            try:
-                loss = trainer.callback_metrics.get("train_loss_epoch")
-                loss_val = self._safe_float(loss)
-                if loss_val is not None:
-                    self.records.append({
-                        "epoch": int(getattr(trainer, "current_epoch", -1)),
-                        "train_loss": loss_val
-                    })
-            except Exception:
-                pass
-
-        def on_train_end(self, trainer, pl_module):
-            if not self.records:
-                return
-            try:
-                import pandas as pd
-                pd.DataFrame(self.records).to_csv(self.path, index=False)
-                print(f"✓ Saved loss history → {self.path}")
-                try:
-                    upload_file_to_gcs(self.path, f"{GCS_OUTPUT_PREFIX}/{os.path.basename(self.path)}")
-                except Exception as e:
-                    print(f"[WARN] Could not upload loss history: {e}")
-            except Exception as e:
-                print(f"[WARN] Could not save loss history: {e}")
-
-
-    # ---------- Utility ----------
-    def _safe_float(val):
-        try:
-            if val is None:
-                return None
-            f = float(val)
-            if math.isnan(f):
-                return None
-            return float(f"{f:.8f}")
-        except Exception:
-            return None
-
-    # ---------- HighPrecisionTQDM ----------
-    class HighPrecisionTQDM(TQDMProgressBar):
-        """Progress bar that shows key metrics with higher precision."""
-        def get_metrics(self, trainer, pl_module):
-            metrics = super().get_metrics(trainer, pl_module)
-            keys = (
-                "loss", "train_loss_step", "train_loss", "train_loss_epoch",
-                "val_loss", "val_loss_decoded", "val_mae_dec", "val_rmse_dec"
-            )
-            for k in keys:
-                val = trainer.callback_metrics.get(k, metrics.get(k, None))
-                sf = _safe_float(val)
-                if sf is not None:
-                    metrics[k] = f"{sf:.8f}"
-            return metrics
-
-    # ---------- StepLossSaver ----------
-    class StepLossSaver(pl.Callback):
-        """Saves train_loss_step every logged batch with high precision."""
-        def __init__(self, path: str = str(LOCAL_RUN_DIR / f"tft_step_losses_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv")):
-            self.path = path
-            self.rows = []
-
-        def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-            v = _safe_float(trainer.callback_metrics.get("train_loss_step"))
-            if v is not None:
-                self.rows.append({
-                    "global_step": int(getattr(trainer, "global_step", 0)),
-                    "epoch": int(getattr(trainer, "current_epoch", -1)),
-                    "train_loss_step": v
-                })
-
-        def on_train_end(self, trainer, pl_module):
-            if not self.rows:
-                return
-            try:
-                pd.DataFrame(self.rows).to_csv(self.path, index=False)
-                print(f"✓ Saved step loss history → {self.path}")
-                try:
-                    upload_file_to_gcs(self.path, f"{GCS_OUTPUT_PREFIX}/{os.path.basename(self.path)}")
-                except Exception as e:
-                    print(f"[WARN] Could not upload step loss history: {e}")
-            except Exception as e:
-                print(f"[WARN] Could not save step loss history: {e}")
-
-    # ---------- LossHistory ----------
-    class LossHistory(pl.Callback):
-        def __init__(self, path: str = str(LOCAL_RUN_DIR / f"tft_loss_history_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv")):
-            self.path = path
-            self.records = []
-
-        def on_train_epoch_end(self, trainer, pl_module):
-            loss_val = _safe_float(trainer.callback_metrics.get("train_loss_epoch"))
-            if loss_val is not None:
-                self.records.append({
-                    "epoch": int(getattr(trainer, "current_epoch", -1)),
-                    "train_loss": loss_val
-                })
-
-        def on_train_end(self, trainer, pl_module):
-            if not self.records:
-                return
-            try:
-                pd.DataFrame(self.records).to_csv(self.path, index=False)
-                print(f"✓ Saved loss history → {self.path}")
-                try:
-                    upload_file_to_gcs(self.path, f"{GCS_OUTPUT_PREFIX}/{os.path.basename(self.path)}")
-                except Exception as e:
-                    print(f"[WARN] Could not upload loss history: {e}")
-            except Exception as e:
-                print(f"[WARN] Could not save loss history: {e}")
-
-    # ---------- EpochPrinter ----------
-    class EpochPrinter(pl.Callback):
-        """Print lightweight, periodic training status updates per epoch."""
-        def __init__(self, total_epochs: int):
-            super().__init__()
-            self.total = int(total_epochs)
-
-        def _format_lr(self, trainer):
-            try:
-                opt = trainer.optimizers[0]
-                lr = opt.param_groups[0].get("lr", None)
-                return None if lr is None else f"{float(lr):.2e}"
-            except Exception:
-                return None
-
-        def on_train_epoch_start(self, trainer, pl_module):
-            print(f"▶ Epoch {trainer.current_epoch + 1}/{self.total} — training …")
-
-        def on_train_epoch_end(self, trainer, pl_module):
-            metrics = trainer.callback_metrics
-            parts = [f"✓ Epoch {trainer.current_epoch + 1}/{self.total} done"]
-
-            for k in ["train_loss_epoch", "val_loss", "val_mae_dec", "val_rmse_dec", "val_loss_decoded"]:
-                v = _safe_float(metrics.get(k))
-                if v is not None:
-                    parts.append(f"{k}={v:.8f}")
-
-            lr_str = self._format_lr(trainer)
-            if lr_str is not None:
-                parts.append(f"lr={lr_str}")
-
-            print(" | ".join(parts))
-
-        def on_validation_epoch_end(self, trainer, pl_module):
-            if not getattr(pl_module, "enable_perm_importance", False):
-                return
-
-            try:
-                print("▶ Running permutation feature importance...")
-                # --- Get original validation DataFrame ---
-                if "val_df" in globals() and isinstance(val_df, pd.DataFrame):
-                    base_df = val_df.copy()
-                elif hasattr(validation_dataset, "data") and isinstance(validation_dataset.data, pd.DataFrame):
-                    base_df = validation_dataset.data.copy()
-                else:
-                    print("[WARN] No validation DataFrame available for FI — skipping.")
-                    return
-
-                # Ensure asset & time_idx types are consistent
-                if "asset" in base_df.columns:
-                    base_df["asset"] = base_df["asset"].astype(str)
-                if "time_idx" in base_df.columns:
-                    base_df["time_idx"] = pd.to_numeric(base_df["time_idx"], errors="coerce").astype(int)
-
-                # Pick features that exist in the DataFrame
-                feats = [f for f in time_varying_unknown_reals if f in base_df.columns]
-
-                run_permutation_importance(
-                    model=pl_module,
-                    base_df=base_df,
-                    build_ds_fn=lambda df, predict: TimeSeriesDataSet.from_dataset(training_dataset, df, predict=False),
-                    features=feats,
-                    block_size=int(PERM_BLOCK_SIZE) if PERM_BLOCK_SIZE else 1,
-                    batch_size=batch_size,
-                    max_batches=int(FI_MAX_BATCHES) if FI_MAX_BATCHES else 20,
-                    num_workers=worker_cnt,
-                    prefetch=prefetch,
-                    pin_memory=pin,
-                    out_csv_path=str(LOCAL_RUN_DIR / f"tft_perm_importance_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv"),
-                    uploader=upload_file_to_gcs,
-                )
-
-            except Exception as e:
-                print(f"[WARN] FI computation failed in on_validation_epoch_end: {e}")
-
-  
-
-
-    best_ckpt_cb = ModelCheckpoint(
-        monitor="val_loss",
-        mode="min",
-        save_top_k=1,
-        save_last=True,  # writes last.ckpt
-        filename=f"tft_best_e{MAX_EPOCHS}_{RUN_SUFFIX}",
-        dirpath=str(LOCAL_CKPT_DIR),
-    )
-    ckpt_uploader_cb = MirrorCheckpoints()
-
-    callbacks = [
-        HighPrecisionTQDM(),
-        best_ckpt_cb,
-        ckpt_uploader_cb,
-        EpochPrinter(MAX_EPOCHS),
-        LearningRateMonitor(logging_interval="epoch"),
-        EarlyStopping(monitor="val_loss", patience=EARLY_STOP_PATIENCE, mode="min"),
-        ComponentLossLogger(),
-        LossHistory(),
-        StepLossSaver(),
-        PerAssetMetrics(
-            rev_asset,
-            vol_normalizer=(
-                training_dataset.target_normalizer.normalizers[0]
-                if hasattr(training_dataset.target_normalizer, "normalizers")
-                else training_dataset.target_normalizer
-            ),
-        ),
-    ]
-    print("▶ Creating Trainer …")
-    trainer = Trainer(
-        num_sanity_val_steps=0,
-        max_epochs=MAX_EPOCHS,
-        accelerator=ACCELERATOR,
-        devices=DEVICES,
-        precision=PRECISION,
-        default_root_dir=str(LOCAL_RUN_DIR),
-        callbacks=callbacks,
-        logger=logger,
-        check_val_every_n_epoch=int(getattr(ARGS, "check_val_every_n_epoch", 1)),
-        log_every_n_steps=int(getattr(ARGS, "log_every_n_steps", 200)),
-        gradient_clip_val=GRADIENT_CLIP_VAL,
-    )
-
-    # Resume logic with epoch bump if needed
-    resume_ckpt = get_resume_ckpt_path() if RESUME_ENABLED else None
-    if resume_ckpt:
-        print(f"▶ Resuming from checkpoint: {resume_ckpt}")
-        try:
-            import torch as _torch
-            _meta = _torch.load(resume_ckpt, map_location="cpu")
-            _epoch = None
-            for k in ("epoch", "current_epoch"):
-                if isinstance(_meta, dict) and k in _meta:
-                    _epoch = int(_meta[k])
-                    break
-            if _epoch is not None:
-                need = int(_epoch) + 1
-                fit_loop = getattr(trainer, "fit_loop", None)
-                if fit_loop is not None and getattr(fit_loop, "max_epochs", None) is not None:
-                    if fit_loop.max_epochs < need:
-                        print(f"[INFO] Bumping Trainer.max_epochs to {MAX_EPOCHS} to align logging intervals.")
-        except Exception as e:
-            print(f"[WARN] Could not bump max_epochs: {e}")
-    # >>> ACTUALLY TRAIN THE MODEL <<<
-    trainer.fit(tft, train_dataloader, val_dataloader, ckpt_path = resume_ckpt )
-
-    # ---------------- Permutation Feature Importance (decoded) ----------------
-    try:
-        if ENABLE_FEATURE_IMPORTANCE:
-            fi_csv = str(LOCAL_OUTPUT_DIR / f"tft_perm_importance_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv")
-            feats = time_varying_unknown_reals.copy()
-            # (optional) drop calendar features from FI to focus on learned signals
-            feats = [f for f in feats if f not in ("sin_tod", "cos_tod", "sin_dow", "cos_dow", "Is_Weekend")]
-            run_permutation_importance(
-                model=tft,
-                base_df=val_df,
-                build_ds_fn=build_dataset,
-                features=feats,
-                block_size=int(PERM_BLOCK_SIZE) if PERM_BLOCK_SIZE else 1,
-                batch_size=batch_size,
-                max_batches=int(FI_MAX_BATCHES) if FI_MAX_BATCHES else 20,
-                num_workers=worker_cnt,
-                prefetch=prefetch,
-                pin_memory=pin,
-                out_csv_path=fi_csv,
-                uploader=upload_file_to_gcs,
-            )
-    except Exception as e:
-        print(f"[WARN] FI failed: {e}")
-        
-    
+                return torch.where(diff >= 0, alpha * q * diff, (1 - q)<truncated__content/>
