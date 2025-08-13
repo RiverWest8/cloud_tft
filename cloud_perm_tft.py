@@ -230,7 +230,7 @@ if not hasattr(GroupNormalizer, "decode"):
 from pytorch_forecasting.metrics import QuantileLoss, MultiLoss
 
 class LabelSmoothedBCE(nn.Module):
-    def __init__(self, smoothing: float = 0.1, pos_weight: float = 1.15):
+    def __init__(self, smoothing: float = 0.1, pos_weight: float = 1.5):
         super().__init__()
         self.smoothing = smoothing
         self.register_buffer("pos_weight", torch.tensor(pos_weight))
@@ -957,8 +957,8 @@ RUN_SUFFIX = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 MODEL_SAVE_PATH = (LOCAL_CKPT_DIR / f"tft_realised_vol_e{MAX_EPOCHS}_{RUN_SUFFIX}.ckpt")
 
 SEED = 50
-WEIGHT_DECAY = 1e-6 #0.00578350719515325     # weight decay for AdamW
-GRADIENT_CLIP_VAL = 1 #0.78    # gradient clipping value for Trainer
+WEIGHT_DECAY = 0.00578350719515325 #0.00578350719515325     # weight decay for AdamW
+GRADIENT_CLIP_VAL = 0.78 #0.78    # gradient clipping value for Trainer
 # Feature-importance controls
 ENABLE_FEATURE_IMPORTANCE = True   # gate FI so you can toggle it
 FI_MAX_BATCHES = 16       # number of val batches to sample for FI
@@ -1686,7 +1686,7 @@ if __name__ == "__main__":
 
     # Fixed weights
     FIXED_VOL_WEIGHT = 1.0
-    FIXED_DIR_WEIGHT = 0.05
+    FIXED_DIR_WEIGHT = 0.1
 
     tft = TemporalFusionTransformer.from_dataset(
         training_dataset,
@@ -1694,14 +1694,14 @@ if __name__ == "__main__":
         attention_head_size=2,
         dropout=0.0833704625250354, #0.0833704625250354,
         hidden_continuous_size=16,
-        learning_rate=(LR_OVERRIDE if LR_OVERRIDE is not None else 0.01), #0.0019
+        learning_rate=(LR_OVERRIDE if LR_OVERRIDE is not None else 0.0017978), #0.0019
         optimizer="AdamW",
         optimizer_params={"weight_decay": WEIGHT_DECAY},
         output_size=[7, 1],  # 7 quantiles + 1 logit
         loss=MultiLoss([
             AsymmetricQuantileLoss(
                 quantiles=[0.05, 0.165, 0.25, 0.5, 0.75, 0.835, 0.95],
-                underestimation_factor= 1.25 #1.115,  # keep asymmetric penalty
+                underestimation_factor= 1.115 #1.115,  # keep asymmetric penalty
             ),
             LabelSmoothedBCE(smoothing=0.1),
         ], weights=[FIXED_VOL_WEIGHT, FIXED_DIR_WEIGHT]),
