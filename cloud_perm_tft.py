@@ -1489,6 +1489,12 @@ if __name__ == "__main__":
     val_df   = add_calendar_features(val_df)
     test_df  = add_calendar_features(test_df)
 
+
+    train_df = train_df[train_df["asset"] == "BTC"].reset_index(drop=True)
+    val_df   = val_df[val_df["asset"] == "BTC"].reset_index(drop=True)
+    test_df  = test_df[test_df["asset"] == "BTC"].reset_index(drop=True)
+
+
     # Optional quick-run subsetting for speed
     _mode = getattr(ARGS, "subset_mode", "per_asset_tail")
     if getattr(ARGS, "train_max_rows", None):
@@ -1499,7 +1505,37 @@ if __name__ == "__main__":
         before = len(val_df)
         val_df = subset_time_series(val_df, int(ARGS.val_max_rows), mode=_mode)
         print(f"[SUBSET] VAL:   {before} -> {len(val_df)} rows using mode='{_mode}'")
-    # (We leave TEST full by default for honest evaluation; add --test_max_rows if you really need it.)
+
+    # Ensure VAL/TEST only contain assets present in TRAIN and have enough history
+    _val_df_raw = val_df.copy()
+    _test_df_raw = test_df.copy()
+    min_required = int(MAX_ENCODER_LENGTH + MAX_PRED_LENGTH)
+    _val_before_rows, _val_before_assets = len(val_df), val_df["asset"].nunique()
+    _test_before_rows, _test_before_assets = len(test_df), test_df["asset"].nunique()
+    train_assets = set(train_df["asset"].unique())
+
+    # Keep only assets seen in TRAIN
+    val_df = val_df[val_df["asset"].isin(train_assets)]
+    test_df = test_df[test_df["asset"].isin(train_assets)]
+
+    # Drop groups with too few timesteps for at least one window
+    val_df = val_df.groupby("asset", observed=True).filter(lambda g: len(g) >= min_required)
+    test_df = test_df.groupby("asset", observed=True).filter(lambda g: len(g) >= min_required)
+
+    print(
+        f"[FILTER] VAL rows {_val_before_rows}→{len(val_df)} | assets {_val_before_assets}→{val_df['asset'].nunique()} (min_len={min_required})"
+    )
+    print(
+        f"[FILTER] TEST rows {_test_before_rows}→{len(test_df)} | assets {_test_before_assets}→{test_df['asset'].nunique()} (min_len={min_required})"
+    )
+
+    # If overly strict and we filtered everything out, relax to overlap-only and let PF handle windows
+    if len(val_df) == 0:
+        val_df = _val_df_raw[_val_df_raw["asset"].isin(train_assets)]
+        print(f"[FILTER] VAL relaxed to overlap-only: {len(val_df)} rows")
+    if len(test_df) == 0:
+        test_df = _test_df_raw[_test_df_raw["asset"].isin(train_assets)]
+        print(f"[FILTER] TEST relaxed to overlap-only: {len(test_df)} rows")
 
 
     # -----------------------------------------------------------------------
@@ -1656,7 +1692,7 @@ if __name__ == "__main__":
         training_dataset,
         hidden_size=64,
         attention_head_size=2,
-        dropout=0.1, #0.0833704625250354,
+        dropout=0.0833704625250354, #0.0833704625250354,
         hidden_continuous_size=16,
         learning_rate=(LR_OVERRIDE if LR_OVERRIDE is not None else 0.01), #0.0019
         optimizer="AdamW",
@@ -1665,7 +1701,7 @@ if __name__ == "__main__":
         loss=MultiLoss([
             AsymmetricQuantileLoss(
                 quantiles=[0.05, 0.165, 0.25, 0.5, 0.75, 0.835, 0.95],
-                underestimation_factor= 1.5 #1.115,  # keep asymmetric penalty
+                underestimation_factor= 1.25 #1.115,  # keep asymmetric penalty
             ),
             LabelSmoothedBCE(smoothing=0.1),
         ], weights=[FIXED_VOL_WEIGHT, FIXED_DIR_WEIGHT]),
