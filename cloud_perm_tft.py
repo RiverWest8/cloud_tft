@@ -1834,8 +1834,6 @@ if __name__ == "__main__":
             return None
 
     tft.plot_prediction = MethodType(_safe_plot, tft)
-    tft.log_interval = 50
-    tft.log_val_interval = 10
     # Train the model
     trainer.fit(tft, train_dataloader, val_dataloader)
 
