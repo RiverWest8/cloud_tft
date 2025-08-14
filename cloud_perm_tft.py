@@ -230,7 +230,7 @@ if not hasattr(GroupNormalizer, "decode"):
 from pytorch_forecasting.metrics import QuantileLoss, MultiLoss
 
 class LabelSmoothedBCE(nn.Module):
-    def __init__(self, smoothing: float = 0.1, pos_weight: float = 4):
+    def __init__(self, smoothing: float = 0.1, pos_weight: float = 1.05):
         super().__init__()
         self.smoothing = smoothing
         self.register_buffer("pos_weight", torch.tensor(pos_weight))
@@ -243,30 +243,56 @@ class LabelSmoothedBCE(nn.Module):
             pos_weight=self.pos_weight,
         )
 
+import torch
+import torch.nn.functional as F
+
 class AsymmetricQuantileLoss(QuantileLoss):
     """
-    Pinball (quantile) loss with an extra multiplier applied *only* when the
-    prediction is BELOW the ground‑truth value (i.e. under‑prediction).
+    Pinball (quantile) loss with an extra multiplier applied only when the
+    prediction is BELOW the ground-truth value (i.e. under-prediction).
+
     Setting ``underestimation_factor`` > 1 makes the model pay a larger
     penalty for forecasts that are too low.
+
+    Additionally, an optional small mean-bias penalty encourages the
+    median prediction to match the target mean across the batch, helping
+    correct persistent under-prediction on the decoded scale.
     """
-    def __init__(self, quantiles, underestimation_factor: float = 1.115, **kwargs):
+    def __init__(self, quantiles, underestimation_factor: float = 1.115,
+                 mean_bias_weight: float = 0.0, **kwargs):
         super().__init__(quantiles=quantiles, **kwargs)
         self.underestimation_factor = float(underestimation_factor)
+        self.mean_bias_weight = float(mean_bias_weight)
+        try:
+            self._q50_idx = self.quantiles.index(0.5)
+        except Exception:
+            self._q50_idx = len(self.quantiles) // 2
 
     def loss_per_prediction(self, y_pred, target):
-        diff = target.unsqueeze(-1) - y_pred  # positive ⇒ under‑prediction
+        diff = target.unsqueeze(-1) - y_pred  # positive ⇒ under-prediction
         q = torch.tensor(self.quantiles, device=y_pred.device).view(
             *([1] * (diff.ndim - 1)), -1
         )
         alpha = torch.as_tensor(self.underestimation_factor, dtype=y_pred.dtype, device=y_pred.device)
-        # Heavier penalty when under‑predicting (diff >= 0)
+        # Heavier penalty when under-predicting
         loss = torch.where(
             diff >= 0,
             alpha * q * diff,
             (1 - q) * (-diff),
         )
         return loss
+
+    def forward(self, y_pred, target):
+        base = super().forward(y_pred, target)
+        if self.mean_bias_weight > 0:
+            try:
+                med = y_pred[..., self._q50_idx]
+                mean_diff = (target - med).mean()
+                penalty = F.relu(mean_diff) ** 2 * self.mean_bias_weight
+                return base + penalty
+            except Exception:
+                return base
+        return base
 
 
 class PerAssetMetrics(pl.Callback):
@@ -1701,7 +1727,8 @@ if __name__ == "__main__":
         loss=MultiLoss([
             AsymmetricQuantileLoss(
                 quantiles=[0.05, 0.165, 0.25, 0.5, 0.75, 0.835, 0.95],
-                underestimation_factor= 1.515 #1.115,  # keep asymmetric penalty
+                underestimation_factor= 1.815 #1.115,  # keep asymmetric penalty
+                mean_bias_weight = 0.1
             ),
             LabelSmoothedBCE(smoothing=0.05),
         ], weights=[FIXED_VOL_WEIGHT, FIXED_DIR_WEIGHT]),
