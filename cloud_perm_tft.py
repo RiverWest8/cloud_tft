@@ -114,6 +114,19 @@ Q50_IDX = VOL_QUANTILES.index(0.50)  # -> 3
 
 from pytorch_forecasting.data.encoders import GroupNormalizer
 
+if ("log1p" not in GroupNormalizer.TRANSFORMATIONS
+    or not isinstance(GroupNormalizer.TRANSFORMATIONS["log1p"], dict)):
+    GroupNormalizer.TRANSFORMATIONS["log1p"] = {
+        "forward": lambda x: torch.log1p(x) if torch.is_tensor(x) else np.log1p(x),
+        "inverse": lambda x: torch.expm1(x) if torch.is_tensor(x) else np.expm1(x),
+    }
+if hasattr(GroupNormalizer, "INVERSE_TRANSFORMATIONS"):
+    GroupNormalizer.INVERSE_TRANSFORMATIONS.setdefault(
+        "log1p",
+        lambda x: torch.expm1(x) if torch.is_tensor(x) else np.expm1(x),
+    )
+
+
 if ("asinh" not in GroupNormalizer.TRANSFORMATIONS
     or not isinstance(GroupNormalizer.TRANSFORMATIONS["asinh"], dict)):
     GroupNormalizer.TRANSFORMATIONS["asinh"] = {
@@ -177,10 +190,12 @@ def manual_inverse_transform_groupnorm(normalizer, y: torch.Tensor, group_ids: t
 
 @torch.no_grad()
 def safe_decode_vol(y: torch.Tensor, normalizer, group_ids: torch.Tensor | None):
-    """
-    Try normalizer.decode(), then inverse_transform(), else manual fallback.
-    y is expected as [B,1].
-    """
+    tfm = getattr(normalizer, "transformation", None)
+    # Prefer our known-correct path for these transforms
+    if tfm in ("log1p", "asinh"):
+        return manual_inverse_transform_groupnorm(normalizer, y, group_ids)
+
+    # Otherwise try the library decode/inverse then fall back
     try:
         return normalizer.decode(y, group_ids=group_ids)
     except Exception:
@@ -672,8 +687,9 @@ class PerAssetMetrics(pl.Callback):
             pd_cpu = torch.cat(self._pd_dev).detach().cpu() if self._pd_dev else None
             # decode vol back to physical scale
             if g_cpu is not None and yv_cpu is not None and pv_cpu is not None:
-                yv_dec = self.vol_norm.decode(yv_cpu.unsqueeze(-1), group_ids=g_cpu.unsqueeze(-1)).squeeze(-1)
-                pv_dec = self.vol_norm.decode(pv_cpu.unsqueeze(-1), group_ids=g_cpu.unsqueeze(-1)).squeeze(-1)
+                yv_dec = safe_decode_vol(yv_cpu.unsqueeze(-1), self.vol_norm,  g_cpu.unsqueeze(-1)).squeeze(-1)
+                pv_dec = safe_decode_vol(pv_cpu.unsqueeze(-1), self.vol_norm,  g_cpu.unsqueeze(-1)).squeeze(-1)
+                pv_dec = torch.clamp(pv_dec, min=2e-7)
                 # map group id -> name
                 assets = [self.id_to_name.get(int(i), str(int(i))) for i in g_cpu.tolist()]
                 # time index (may be missing)
