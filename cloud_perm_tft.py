@@ -729,7 +729,7 @@ class PerAssetMetrics(pl.Callback):
             print(f"[WARN] Could not save validation predictions: {e}")
 
 class BiasWarmupCallback(pl.Callback):
-    def __init__(self, vol_loss, target_under=1.1115, target_mean_bias=0.05, warmup_epochs=3):
+    def __init__(self, vol_loss, target_under=1.1115, target_mean_bias=0.15, warmup_epochs=3):
         super().__init__()
         self.vol_loss = vol_loss
         self.target_under = float(target_under)
@@ -1778,7 +1778,7 @@ if __name__ == "__main__":
     VOL_LOSS = AsymmetricQuantileLoss(
         quantiles=[0.05, 0.165, 0.25, 0.5, 0.75, 0.835, 0.95],
         underestimation_factor=1.15,   # final target (will be warmed up)
-        mean_bias_weight=0.001,        # will be 0 during warmup, then enabled
+        mean_bias_weight=0.05,        # will be 0 during warmup, then enabled
     )
     # one-off in your data prep (TRAIN split)
     counts = train_df["direction"].value_counts()
@@ -1828,11 +1828,17 @@ if __name__ == "__main__":
         dirpath=str(LOCAL_CKPT_DIR),
     )
 
+    bias_cb = BiasWarmupCallback(
+        vol_loss=VOL_LOSS,
+        target_under=1.1,        # smaller than 3.0 to avoid overshoot
+        target_mean_bias=0.00,    # add a mild mean-bias penalty
+        warmup_epochs=5
+    )
 
 
    
     
-    lr_decay_cb = EpochLRDecay(gamma=0.95, start_epoch=10) 
+    lr_decay_cb = EpochLRDecay(gamma=0.95, start_epoch=7) 
 
     # ----------------------------
     # Trainer instance
@@ -1845,7 +1851,7 @@ if __name__ == "__main__":
         gradient_clip_val=GRADIENT_CLIP_VAL,
         num_sanity_val_steps = 0,
         logger=logger,
-        callbacks=[best_ckpt_cb, es_cb, bar_cb, metrics_cb, mirror_cb, lr_decay_cb],
+        callbacks=[best_ckpt_cb, es_cb, bar_cb, metrics_cb, mirror_cb, lr_decay_cb, lr_cb, bias_cb],
         check_val_every_n_epoch=int(ARGS.check_val_every_n_epoch),
         log_every_n_steps=int(ARGS.log_every_n_steps),
     )
