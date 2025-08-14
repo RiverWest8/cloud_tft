@@ -2040,8 +2040,20 @@ if __name__ == "__main__":
         tail_weight = 3.0,
     )
     # Composite: base quantile loss + high-vol penalty (encoded space)
-    BASE_VOL_LOSS = QuantileLoss(quantiles=[0.1, 0.5, 0.9])
-    VOL_LOSS = CompositeVolMetric(BASE_VOL_LOSS, high_q=0.95, penalty_weight=0.1, warmup_epochs=2)
+    BASE_VOL_LOSS = AsymmetricQuantileLoss(
+        quantiles=VOL_QUANTILES,
+        underestimation_factor=1.15,  # start gentle
+        mean_bias_weight=0.15,
+        tail_q=0.9,
+        tail_weight=3.0,
+    )
+
+    VOL_LOSS = CompositeVolMetric(
+        BASE_VOL_LOSS,
+        high_q=0.95,
+        penalty_weight=0.1,
+        warmup_epochs=2
+    )
     # one-off in your data prep (TRAIN split)
     counts = train_df["direction"].value_counts()
     n_pos = counts.get(1, 1)
