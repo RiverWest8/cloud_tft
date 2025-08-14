@@ -319,34 +319,31 @@ class CompositeVolMetric(Metric):
         self.base_loss = base_loss
         self.high_q = high_q
         self.penalty_weight = penalty_weight
-        
     def forward(self, y_pred, target, **kwargs):
-        # PF passes target as tuple for multi-target: (encoder_target, decoder_target)
+        # PF passes multi-target as tuple (vol, dir) — pick vol
         if isinstance(target, tuple):
-            target_tensor = target[1]  # decoder target
+            target_tensor = target[0]
         else:
             target_tensor = target
 
-        # Call the base quantile loss on the same inputs
-        main = self.base_loss(y_pred, target, **kwargs)  # target can still be tuple for PF's internal handling
+        # Guard if target_tensor is None
+        if target_tensor is None:
+            return self.base_loss(y_pred, target, **kwargs)
 
-        # Median quantile extraction
-        try:
-            pred_med_enc = y_pred[..., Q50_IDX]
-        except Exception:
-            pred_med_enc = y_pred.reshape(y_pred.size(0), -1)[:, 0]
+        # Base loss
+        main_loss = self.base_loss(y_pred, target, **kwargs)
 
-        # Penalty on high volatility cases
-        try:
+        # Penalty part
+        with torch.no_grad():
             thresh = torch.quantile(target_tensor.detach(), self.high_q)
-            mask = target_tensor > thresh
-        except Exception:
-            mask = torch.zeros_like(target_tensor, dtype=torch.bool)
 
-        if mask.any():
-            penalty = F.mse_loss(pred_med_enc[mask], target_tensor[mask])
-            return main + self.penalty_weight * penalty
-        return main
+        mask = target_tensor > thresh
+        penalty = (y_pred[..., 3] - target_tensor).abs()  # example: pick median quantile
+        penalty = penalty[mask].mean() if mask.any() else torch.tensor(0.0, device=penalty.device)
+
+        return main_loss + self.penalty_weight * penalty    
+
+
 
 
 class UnderPenaltyScheduler(Callback):
