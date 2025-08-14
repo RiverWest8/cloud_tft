@@ -527,7 +527,7 @@ class PerAssetMetrics(pl.Callback):
         mean_y = yv_dec.mean()
         mean_p = pv_dec.mean()
         if torch.isfinite(mean_y) and torch.isfinite(mean_p) and mean_p.abs() > 1e-12:
-            scale_factor = (mean_y / mean_p).clamp(0.25, 4.0)  # guard against extremes
+            scale_factor = (mean_y / mean_p).clamp(0.5, 420)  # guard against extremes
             pv_dec = pv_dec * scale_factor
             try:
                 print(f"[SCALE DEBUG] Applied scale factor: {float(scale_factor):.4f}")
@@ -1813,8 +1813,8 @@ if __name__ == "__main__":
         # ---- Build losses as named variables so callbacks can tune them ----
     VOL_LOSS = AsymmetricQuantileLoss(
         quantiles=[0.05, 0.165, 0.25, 0.5, 0.75, 0.835, 0.95],
-        underestimation_factor=1.115,   # final target (will be warmed up)
-        mean_bias_weight=0.1,        # will be 0 during warmup, then enabled
+        underestimation_factor=1.225,   # final target (will be warmed up)
+        mean_bias_weight=0.10,        # will be 0 during warmup, then enabled
     )
     # one-off in your data prep (TRAIN split)
     counts = train_df["direction"].value_counts()
@@ -1836,7 +1836,7 @@ if __name__ == "__main__":
         attention_head_size=4,
         dropout=0.0833704625250354, #0.0833704625250354,
         hidden_continuous_size=32,
-        learning_rate=(LR_OVERRIDE if LR_OVERRIDE is not None else 0.000815), #0.0019 0017978
+        learning_rate=(LR_OVERRIDE if LR_OVERRIDE is not None else 0.000685), #0.0019 0017978
         optimizer="AdamW",
         optimizer_params={"weight_decay": WEIGHT_DECAY},
         output_size=[7, 1],  # 7 quantiles + 1 logit
@@ -1868,13 +1868,13 @@ if __name__ == "__main__":
         vol_loss=VOL_LOSS,
         target_under=1.115,        # smaller than 3.0 to avoid overshoot
         target_mean_bias=0.12,    # add a mild mean-bias penalty
-        warmup_epochs=5
+        warmup_epochs=4
     )
 
 
    
     
-    lr_decay_cb = EpochLRDecay(gamma=0.95, start_epoch=15) 
+    lr_decay_cb = EpochLRDecay(gamma=0.95, start_epoch=8) 
 
     # ----------------------------
     # Trainer instance
