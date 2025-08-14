@@ -1358,16 +1358,21 @@ def add_vol_lags(df: pd.DataFrame) -> pd.DataFrame:
 def add_vol_spike_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_values(GROUP_ID + [TIME_COL]).copy()
     g = df.groupby(GROUP_ID[0], observed=True)
+
     # rolling max (2 days @ 30m = 96)
     df["rv_rollmax_96"] = g["realised_vol"].rolling(96, min_periods=1).max().reset_index(level=0, drop=True)
     df["rv_rel_to_max_96"] = df["realised_vol"] / (df["rv_rollmax_96"] + 1e-8)
 
     # rolling mean/std & z-score (recent 48 steps ~ 1 day)
-    mu48  = g["realised_vol"].rolling(48, min_periods=1).mean().reset_index(level=0, drop=True)
+    mu48 = g["realised_vol"].rolling(48, min_periods=1).mean().reset_index(level=0, drop=True)
     std48 = g["realised_vol"].rolling(48, min_periods=1).std().reset_index(level=0, drop=True).fillna(0.0)
     df["rv_z_48"] = (df["realised_vol"] - mu48) / (std48 + 1e-8)
 
-    return df.fillna(0)
+    # Fill numeric NaNs with 0 (leave categoricals untouched)
+    for col in df.select_dtypes(include="number").columns:
+        df[col] = df[col].fillna(0)
+
+    return df
 
 
 
