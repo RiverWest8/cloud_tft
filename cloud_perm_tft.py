@@ -367,13 +367,15 @@ class CompositeVolMetric(Metric):
     @staticmethod
     def _squeeze_last1(t: torch.Tensor) -> torch.Tensor:
         if torch.is_tensor(t):
-            if t.ndim == 2 and t.size(-1) == 1:
-                t = t[:, 0]
             if t.ndim == 3 and t.size(-1) == 1:
                 t = t[..., 0]
         return t
 
     def _extract_decoder_vol_target(self, target):
+        """
+        Extract decoder target for volatility. 
+        Preserve [B,1] where possible to keep base_loss happy.
+        """
         if isinstance(target, (list, tuple)) and len(target) >= 2:
             t = target[1]  # decoder target
         else:
@@ -382,9 +384,7 @@ class CompositeVolMetric(Metric):
             return None
         t = self._squeeze_pred_len(t)
         t = self._squeeze_last1(t)
-        if t.ndim == 2 and t.size(1) >= 1:
-            t = t[:, 0]
-        return t
+        return t  # do NOT collapse [B,1] → [B]
 
     def _extract_vol_quantiles(self, y_pred: torch.Tensor) -> torch.Tensor:
         K = len(VOL_QUANTILES)
@@ -404,6 +404,10 @@ class CompositeVolMetric(Metric):
         if target_vol is None or not torch.is_tensor(target_vol):
             target_vol = vol_q[..., Q50_IDX].detach()
 
+        # --- Ensure target_vol is at least 2D for base_loss ---
+        if target_vol.ndim == 1:
+            target_vol = target_vol.unsqueeze(-1)
+
         # Base quantile loss
         main = self.base_loss(vol_q, target_vol)
 
@@ -412,11 +416,9 @@ class CompositeVolMetric(Metric):
             tgt_dec = decode_asinh(target_vol)
             med_dec = decode_asinh(vol_q[..., Q50_IDX])
         except Exception:
-            # --- tiny decoded mean-calibration (symmetric) ---
+            # tiny decoded mean-calibration term
             cal = (med_dec.mean() - tgt_dec.mean()) ** 2
-            # small weight so it doesn't dominate
-            main = main + 0.02 * cal
-            return main
+            return main + 0.02 * cal
 
         try:
             thresh_dec = torch.quantile(tgt_dec.detach(), self.high_q)
@@ -444,7 +446,6 @@ class CompositeVolMetric(Metric):
         if torch.is_tensor(t) and t.ndim >= 2 and t.size(-1) >= (Q50_IDX + 1):
             return t[..., Q50_IDX].unsqueeze(-1)
         return t.mean(dim=-1, keepdim=True)
-
 
 
 class UnderPenaltyScheduler(Callback):
