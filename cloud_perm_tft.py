@@ -1712,11 +1712,11 @@ if __name__ == "__main__":
 
     # Fixed weights
     FIXED_VOL_WEIGHT = 1.0
-    FIXED_DIR_WEIGHT = 0.23
+    FIXED_DIR_WEIGHT = 0.3
 
     tft = TemporalFusionTransformer.from_dataset(
         training_dataset,
-        hidden_size=128,
+        hidden_size=96,
         attention_head_size=2,
         dropout=0.0833704625250354, #0.0833704625250354,
         hidden_continuous_size=16,
@@ -1727,7 +1727,7 @@ if __name__ == "__main__":
         loss=MultiLoss([
             AsymmetricQuantileLoss(
                 quantiles=[0.05, 0.165, 0.25, 0.5, 0.75, 0.835, 0.95],
-                underestimation_factor= 5, #1.115,  # keep asymmetric penalty
+                underestimation_factor= 2.8, #1.115,  # keep asymmetric penalty
                 mean_bias_weight = 0.1
             ),
             LabelSmoothedBCE(smoothing=0.05),
