@@ -99,7 +99,7 @@ import argparse
 import pytorch_forecasting as pf
 import inspect
 
-VOL_QUANTILES = [0.05, 0.165, 0.25, 0.50, 0.75, 0.835, 0.95]
+VOL_QUANTILES = [0.05, 0.165, 0.25, 0.50, 0.75, 0.835, 0.9, 0.975, 0.99]
 Q50_IDX = VOL_QUANTILES.index(0.50)  # -> 3
 
 # -----------------------------------------------------------------------
@@ -265,51 +265,69 @@ import torch.nn.functional as F
 
 class AsymmetricQuantileLoss(QuantileLoss):
     """
-    Pinball (quantile) loss with an extra multiplier applied only when the
-    prediction is BELOW the ground-truth value (i.e. under-prediction).
-
-    Setting ``underestimation_factor`` > 1 makes the model pay a larger
-    penalty for forecasts that are too low.
-
-    Additionally, an optional small mean-bias penalty encourages the
-    median prediction to match the target mean across the batch, helping
-    correct persistent under-prediction on the decoded scale.
+    Pinball loss with:
+      • heavier penalty when y_pred < y_true (under-prediction)
+      • extra sample-weights for high-volatility tail (targets above tail_q)
+      • optional small mean-bias penalty on the median
     """
-    def __init__(self, quantiles, underestimation_factor: float = 1.1115,
-                 mean_bias_weight: float = 0.0, **kwargs):
+    def __init__(self, quantiles,
+                 underestimation_factor: float = 1.15,
+                 mean_bias_weight: float = 0.0,
+                 tail_q: float = 0.90,
+                 tail_weight: float = 3.0,
+                 **kwargs):
         super().__init__(quantiles=quantiles, **kwargs)
         self.underestimation_factor = float(underestimation_factor)
         self.mean_bias_weight = float(mean_bias_weight)
+        self.tail_q = float(tail_q)
+        self.tail_weight = float(tail_weight)
         try:
             self._q50_idx = self.quantiles.index(0.5)
         except Exception:
             self._q50_idx = len(self.quantiles) // 2
 
     def loss_per_prediction(self, y_pred, target):
-        diff = target.unsqueeze(-1) - y_pred  # positive ⇒ under-prediction
-        q = torch.tensor(self.quantiles, device=y_pred.device).view(
-            *([1] * (diff.ndim - 1)), -1
-        )
+        # y_pred [..., K], target [...]
+        diff = target.unsqueeze(-1) - y_pred  # >0 ⇒ under-prediction
+        q = torch.tensor(self.quantiles, device=y_pred.device, dtype=y_pred.dtype)
+        # broadcast q to diff
+        view = [1] * (diff.ndim - 1) + [-1]
+        q = q.view(*view)
         alpha = torch.as_tensor(self.underestimation_factor, dtype=y_pred.dtype, device=y_pred.device)
-        # Heavier penalty when under-predicting
-        loss = torch.where(
+
+        # pinball with heavier under-pred penalties
+        return torch.where(
             diff >= 0,
             alpha * q * diff,
-            (1 - q) * (-diff),
+            (1.0 - q) * (-diff),
         )
-        return loss
 
     def forward(self, y_pred, target):
-        base = super().forward(y_pred, target)
+        # base per-sample, per-quantile loss
+        loss = self.loss_per_prediction(y_pred, target)  # shape [..., K]
+
+        # ---- Tail re-weighting (in encoded space) ----
+        if self.tail_weight > 1.0:
+            try:
+                thresh = torch.quantile(target.detach(), self.tail_q)
+                w = torch.ones_like(target, dtype=loss.dtype, device=loss.device)
+                w = torch.where(target > thresh, w * self.tail_weight, w)  # shape [...]
+                loss = loss * w.unsqueeze(-1)  # broadcast onto quantile dim
+            except Exception:
+                pass  # be conservative if quantile fails
+
+        # reduce
+        out = loss.mean()
+
+        # optional mean-bias penalty on median (kept small)
         if self.mean_bias_weight > 0:
             try:
                 med = y_pred[..., self._q50_idx]
                 mean_diff = (target - med).mean()
-                penalty = F.relu(mean_diff) ** 2 * self.mean_bias_weight
-                return base + penalty
+                out = out + (F.relu(mean_diff) ** 2) * self.mean_bias_weight
             except Exception:
-                return base
-        return base
+                pass
+        return out
 
 import torch
 from pytorch_forecasting.metrics import QuantileLoss
@@ -658,7 +676,7 @@ class PerAssetMetrics(pl.Callback):
             (yv_dec.mean() / pv_dec.mean()).item() if float(pv_dec.mean()) != 0.0 else float("inf"),
         )
 
-        # --- Regime-dependent scaling ---
+        # --- Regime-dependent scaling (diagnostic only) ---
         q33, q66 = torch.quantile(yv_dec, torch.tensor([0.33, 0.66], device=yv_dec.device))
         low_mask  = yv_dec <= q33
         high_mask = yv_dec >= q66
@@ -669,14 +687,12 @@ class PerAssetMetrics(pl.Callback):
         mean_y_high = yv_dec[high_mask].mean()
 
         if torch.isfinite(mean_y_low) and torch.isfinite(mean_p_low) and mean_p_low.abs() > 1e-12:
-            scale_low = (mean_y_low / mean_p_low).clamp(0.5, 2.0)
-            pv_dec[low_mask] *= scale_low
-            print(f"[SCALE DEBUG] Low-vol scale: {float(scale_low):.4f}")
+            scale_low = (mean_y_low / mean_p_low)
+            print(f"[SCALE DEBUG] Low-vol scale (diag): {float(scale_low):.4f}")
 
         if torch.isfinite(mean_y_high) and torch.isfinite(mean_p_high) and mean_p_high.abs() > 1e-12:
-            scale_high = (mean_y_high / mean_p_high).clamp(0.5, 2.0)
-            pv_dec[high_mask] *= scale_high
-            print(f"[SCALE DEBUG] High-vol scale: {float(scale_high):.4f}")
+            scale_high = (mean_y_high / mean_p_high)
+            print(f"[SCALE DEBUG] High-vol scale (diag): {float(scale_high):.4f}")
 
         # Move to CPU for metric computation
         y_cpu  = yv_dec.detach().cpu()
@@ -1339,6 +1355,22 @@ def add_vol_lags(df: pd.DataFrame) -> pd.DataFrame:
         df[f"rv_rollmean_{w}"] = g["realised_vol"].rolling(w, min_periods=1).mean().reset_index(level=0, drop=True)
     return df
 
+def add_vol_spike_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.sort_values(GROUP_ID + [TIME_COL]).copy()
+    g = df.groupby(GROUP_ID[0], observed=True)
+    # rolling max (2 days @ 30m = 96)
+    df["rv_rollmax_96"] = g["realised_vol"].rolling(96, min_periods=1).max().reset_index(level=0, drop=True)
+    df["rv_rel_to_max_96"] = df["realised_vol"] / (df["rv_rollmax_96"] + 1e-8)
+
+    # rolling mean/std & z-score (recent 48 steps ~ 1 day)
+    mu48  = g["realised_vol"].rolling(48, min_periods=1).mean().reset_index(level=0, drop=True)
+    std48 = g["realised_vol"].rolling(48, min_periods=1).std().reset_index(level=0, drop=True).fillna(0.0)
+    df["rv_z_48"] = (df["realised_vol"] - mu48) / (std48 + 1e-8)
+
+    return df.fillna(0)
+
+
+
 # -----------------------------------------------------------------------
 # Fast subset helper (keeps temporal structure per asset when possible)
 # -----------------------------------------------------------------------
@@ -1773,6 +1805,9 @@ if __name__ == "__main__":
     train_df = add_vol_lags(train_df)
     val_df   = add_vol_lags(val_df)
     test_df  = add_vol_lags(test_df)
+    train_df = add_vol_spike_features(train_df)
+    val_df   = add_vol_spike_features(val_df)
+    test_df  = add_vol_spike_features(test_df)
     # Fill NaNs in all lag columns before building the dataset
     lag_cols = [col for col in train_df.columns if col.startswith("rv_lag_")]
     train_df[lag_cols] = train_df[lag_cols].fillna(0)
@@ -1994,17 +2029,19 @@ if __name__ == "__main__":
         # Fixed weights
     BASE_VOL_LOSS = AsymmetricQuantileLoss(
         quantiles=VOL_QUANTILES,      # you already defined VOL_QUANTILES above
-        underestimation_factor=10,  # gentle from epoch 0
+        underestimation_factor=1.15,  # gentle from epoch 0
         mean_bias_weight=0.15,        # mild mean-bias to fight persistent under
+        tail_q = 0.9
+        tail_weight = 3.0
     )
     # Composite: base quantile loss + high-vol penalty (encoded space)
     BASE_VOL_LOSS = QuantileLoss(quantiles=[0.1, 0.5, 0.9])
-    VOL_LOSS = CompositeVolMetric(BASE_VOL_LOSS, high_q=0.85, penalty_weight=0.1, warmup_epochs=5)
+    VOL_LOSS = CompositeVolMetric(BASE_VOL_LOSS, high_q=0.95, penalty_weight=0.1, warmup_epochs=2)
     # one-off in your data prep (TRAIN split)
     counts = train_df["direction"].value_counts()
     n_pos = counts.get(1, 1)
     n_neg = counts.get(0, 1)
-    pos_weight = float(n_neg / n_pos)
+    pos_weight = 1.1
 
     # then build the loss with:
     DIR_LOSS = LabelSmoothedBCE(smoothing=0.05, pos_weight=pos_weight)
@@ -2023,7 +2060,7 @@ if __name__ == "__main__":
         learning_rate=(LR_OVERRIDE if LR_OVERRIDE is not None else 0.000815), #0.0019 0017978
         optimizer="AdamW",
         optimizer_params={"weight_decay": WEIGHT_DECAY},
-        output_size=[7, 1],  # 7 quantiles + 1 logit
+        output_size=[len(VOL_QUANTILES), 1],  # 7 quantiles + 1 logit
         loss=MultiLoss([VOL_LOSS, DIR_LOSS], weights=[FIXED_VOL_WEIGHT, FIXED_DIR_WEIGHT]),
         logging_metrics=[],
         log_interval=50,
