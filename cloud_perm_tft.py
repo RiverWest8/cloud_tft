@@ -1774,7 +1774,7 @@ if __name__ == "__main__":
     VOL_LOSS = AsymmetricQuantileLoss(
         quantiles=[0.05, 0.165, 0.25, 0.5, 0.75, 0.835, 0.95],
         underestimation_factor=3,   # final target (will be warmed up)
-        mean_bias_weight=0.05,        # will be 0 during warmup, then enabled
+        mean_bias_weight=0.00,        # will be 0 during warmup, then enabled
     )
     DIR_LOSS = LabelSmoothedBCE(smoothing=0.05)
 
@@ -1820,9 +1820,9 @@ if __name__ == "__main__":
     vol_loss=VOL_LOSS,
     target_under=1.115,
     target_mean_bias=0.05,
-    warmup_epochs=3,
+    warmup_epochs=1,
     )
-    lr_decay_cb = EpochLRDecay(gamma=0.95, start_epoch=3) 
+    lr_decay_cb = EpochLRDecay(gamma=0.95, start_epoch=1) 
 
     # ----------------------------
     # Trainer instance
