@@ -2123,7 +2123,7 @@ if __name__ == "__main__":
 
     vol_warmup_cb = BiasWarmupCallback(
         vol_loss=BASE_VOL_LOSS,
-        target_under=1.1,          # was 5 or 3 earlier — way too high
+        target_under=1.0,          # was 5 or 3 earlier — way too high
         target_mean_bias=0.05,     # also reduce mean bias weight
         warmup_epochs=3
     )
