@@ -313,29 +313,31 @@ class AsymmetricQuantileLoss(QuantileLoss):
 from pytorch_forecasting.metrics.base_metrics import Metric
 
 class CompositeVolMetric(Metric):
-    def __init__(self, base_loss, high_q=0.90, penalty_weight=0.5, **kwargs):
-        super().__init__(**kwargs)
-        self.base_loss = base_loss
-        self.high_q = float(high_q)
-        self.penalty_weight = float(penalty_weight)
-
     def forward(self, y_pred, target, **kwargs):
-        main = self.base_loss(y_pred, target, **kwargs)
+        # PF passes target as tuple for multi-target: (encoder_target, decoder_target)
+        if isinstance(target, tuple):
+            target_tensor = target[1]  # decoder target
+        else:
+            target_tensor = target
 
-        # index for median quantile
+        # Call the base quantile loss on the same inputs
+        main = self.base_loss(y_pred, target, **kwargs)  # target can still be tuple for PF's internal handling
+
+        # Median quantile extraction
         try:
             pred_med_enc = y_pred[..., Q50_IDX]
         except Exception:
             pred_med_enc = y_pred.reshape(y_pred.size(0), -1)[:, 0]
 
+        # Penalty on high volatility cases
         try:
-            thresh = torch.quantile(target.detach(), self.high_q)
-            mask = target > thresh
+            thresh = torch.quantile(target_tensor.detach(), self.high_q)
+            mask = target_tensor > thresh
         except Exception:
-            mask = torch.zeros_like(target, dtype=torch.bool)
+            mask = torch.zeros_like(target_tensor, dtype=torch.bool)
 
         if mask.any():
-            penalty = F.mse_loss(pred_med_enc[mask], target[mask])
+            penalty = F.mse_loss(pred_med_enc[mask], target_tensor[mask])
             return main + self.penalty_weight * penalty
         return main
 
