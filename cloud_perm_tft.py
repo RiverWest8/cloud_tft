@@ -1696,7 +1696,7 @@ if __name__ == "__main__":
             target_normalizer = MultiNormalizer([
                 GroupNormalizer(
                     groups=GROUP_ID,
-                    center=False,
+                    center=True,
                     scale_by_group= True,
                     transformation="asinh",
                 ),
@@ -1786,10 +1786,10 @@ if __name__ == "__main__":
     seed_everything(SEED, workers=True)
     # Loss and output_size for multi-target: realised_vol (quantile regression), direction (classification)
     print("▶ Building model …")
-    print(f"[LR] learning_rate={LR_OVERRIDE if LR_OVERRIDE is not None else 0.0017978}")
+    print(f"[LR] learning_rate={LR_OVERRIDE if LR_OVERRIDE is not None else 0.0003978}")
     
     es_cb = EarlyStopping(
-    monitor="val_qlike_overall",
+    monitor="val_rmse_overall",
     patience=EARLY_STOP_PATIENCE,
     mode="min"
     )
@@ -1809,7 +1809,7 @@ if __name__ == "__main__":
         # ---- Build losses as named variables so callbacks can tune them ----
     VOL_LOSS = AsymmetricQuantileLoss(
         quantiles=[0.05, 0.165, 0.25, 0.5, 0.75, 0.835, 0.95],
-        underestimation_factor=3,   # final target (will be warmed up)
+        underestimation_factor=10,   # final target (will be warmed up)
         mean_bias_weight=0.05,        # will be 0 during warmup, then enabled
     )
     # one-off in your data prep (TRAIN split)
@@ -1828,10 +1828,10 @@ if __name__ == "__main__":
 
     tft = TemporalFusionTransformer.from_dataset(
         training_dataset,
-        hidden_size=128,
+        hidden_size=64,
         attention_head_size=4,
         dropout=0.0833704625250354, #0.0833704625250354,
-        hidden_continuous_size=32,
+        hidden_continuous_size=64,
         learning_rate=(LR_OVERRIDE if LR_OVERRIDE is not None else 0.000815), #0.0019 0017978
         optimizer="AdamW",
         optimizer_params={"weight_decay": WEIGHT_DECAY},
@@ -1862,8 +1862,8 @@ if __name__ == "__main__":
 
     bias_cb = BiasWarmupCallback(
         vol_loss=VOL_LOSS,
-        target_under=1.115,        # smaller than 3.0 to avoid overshoot
-        target_mean_bias=0.12,    # add a mild mean-bias penalty
+        target_under=10,        # smaller than 3.0 to avoid overshoot
+        target_mean_bias=0.2,    # add a mild mean-bias penalty
         warmup_epochs=5
     )
 
