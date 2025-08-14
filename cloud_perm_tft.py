@@ -230,7 +230,7 @@ if not hasattr(GroupNormalizer, "decode"):
 from pytorch_forecasting.metrics import QuantileLoss, MultiLoss
 
 class LabelSmoothedBCE(nn.Module):
-    def __init__(self, smoothing: float = 0.1, pos_weight: float = 1.05):
+    def __init__(self, smoothing: float = 0.1, pos_weight: float = 1.0):
         super().__init__()
         self.smoothing = smoothing
         self.register_buffer("pos_weight", torch.tensor(pos_weight))
@@ -1716,7 +1716,7 @@ if __name__ == "__main__":
 
     tft = TemporalFusionTransformer.from_dataset(
         training_dataset,
-        hidden_size=64,
+        hidden_size=128,
         attention_head_size=2,
         dropout=0.0833704625250354, #0.0833704625250354,
         hidden_continuous_size=16,
@@ -1727,7 +1727,7 @@ if __name__ == "__main__":
         loss=MultiLoss([
             AsymmetricQuantileLoss(
                 quantiles=[0.05, 0.165, 0.25, 0.5, 0.75, 0.835, 0.95],
-                underestimation_factor= 1.815, #1.115,  # keep asymmetric penalty
+                underestimation_factor= 5, #1.115,  # keep asymmetric penalty
                 mean_bias_weight = 0.1
             ),
             LabelSmoothedBCE(smoothing=0.05),
