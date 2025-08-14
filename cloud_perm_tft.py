@@ -114,6 +114,19 @@ Q50_IDX = VOL_QUANTILES.index(0.50)  # -> 3
 
 from pytorch_forecasting.data.encoders import GroupNormalizer
 
+if ("log1p" not in GroupNormalizer.TRANSFORMATIONS
+    or not isinstance(GroupNormalizer.TRANSFORMATIONS["log1p"], dict)):
+    GroupNormalizer.TRANSFORMATIONS["log1p"] = {
+        "forward": lambda x: torch.log1p(x) if torch.is_tensor(x) else np.log1p(x),
+        "inverse": lambda x: torch.expm1(x) if torch.is_tensor(x) else np.expm1(x),
+    }
+if hasattr(GroupNormalizer, "INVERSE_TRANSFORMATIONS"):
+    GroupNormalizer.INVERSE_TRANSFORMATIONS.setdefault(
+        "log1p",
+        lambda x: torch.expm1(x) if torch.is_tensor(x) else np.expm1(x),
+    )
+
+
 if ("asinh" not in GroupNormalizer.TRANSFORMATIONS
     or not isinstance(GroupNormalizer.TRANSFORMATIONS["asinh"], dict)):
     GroupNormalizer.TRANSFORMATIONS["asinh"] = {
@@ -141,9 +154,16 @@ def manual_inverse_transform_groupnorm(normalizer, y: torch.Tensor, group_ids: t
     """
     y_ = y.squeeze(-1) if y.ndim > 1 else y
 
-    center = getattr(normalizer, "center", None)
-    scale  = getattr(normalizer, "scale",  None)
+    center = (getattr(normalizer, "center", None)
+            or getattr(normalizer, "centers", None)
+            or getattr(normalizer, "center_", None)
+            or getattr(normalizer, "centers_", None))
 
+    scale  = (getattr(normalizer, "scale", None)
+            or getattr(normalizer, "scales", None)
+            or getattr(normalizer, "scale_", None)
+            or getattr(normalizer, "scales_", None))
+    
     if scale is None:
         x = y_
     else:
@@ -162,6 +182,8 @@ def manual_inverse_transform_groupnorm(normalizer, y: torch.Tensor, group_ids: t
     tfm = getattr(normalizer, "transformation", None)
     if tfm == "asinh":
         x = torch.sinh(x)
+    elif tfm == "log1p":
+        x = torch.expm1(x)
     elif tfm in (None, "identity"):
         pass
     else:
@@ -175,10 +197,12 @@ def manual_inverse_transform_groupnorm(normalizer, y: torch.Tensor, group_ids: t
 
 @torch.no_grad()
 def safe_decode_vol(y: torch.Tensor, normalizer, group_ids: torch.Tensor | None):
-    """
-    Try normalizer.decode(), then inverse_transform(), else manual fallback.
-    y is expected as [B,1].
-    """
+    tfm = getattr(normalizer, "transformation", None)
+    # Prefer our known-correct path for these transforms
+    if tfm in ("log1p", "asinh"):
+        return manual_inverse_transform_groupnorm(normalizer, y, group_ids)
+
+    # Otherwise try the library decode/inverse then fall back
     try:
         return normalizer.decode(y, group_ids=group_ids)
     except Exception:
@@ -258,7 +282,7 @@ class AsymmetricQuantileLoss(QuantileLoss):
     median prediction to match the target mean across the batch, helping
     correct persistent under-prediction on the decoded scale.
     """
-    def __init__(self, quantiles, underestimation_factor: float = 1.1115,
+    def __init__(self, quantiles, underestimation_factor: float = 1,
                  mean_bias_weight: float = 0.0, **kwargs):
         super().__init__(quantiles=quantiles, **kwargs)
         self.underestimation_factor = float(underestimation_factor)
@@ -322,174 +346,161 @@ class PerAssetMetrics(pl.Callback):
     def on_validation_epoch_start(self, trainer, pl_module):
         self.reset()
 
-    @torch.no_grad()
-    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx: int = 0):
-        # batch is (x, y, weight) from PF dataloader
-        if not isinstance(batch, (list, tuple)):
-            return
-        x = batch[0]
-        if not isinstance(x, dict):
-            return
-        groups = x.get("groups")
-        dec_t = x.get("decoder_target")
-        # optional time index for plotting/joining later
-        dec_time = x.get("decoder_time_idx", None)
-        if dec_time is None:
-            # some PF versions may expose relative index or time via different keys; try a few
-            dec_time = x.get("decoder_relative_idx", None)
-        # also fetch explicit targets from batch[1] as a fallback
-        y_batch = batch[1] if isinstance(batch, (list, tuple)) and len(batch) >= 2 else None
-        if groups is None:
-            return
+@torch.no_grad()
+def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx: int = 0):
+    # batch is (x, y, weight) from PF dataloader
+    if not isinstance(batch, (list, tuple)):
+        return
+    x = batch[0]
+    if not isinstance(x, dict):
+        return
+    groups = x.get("groups")
+    dec_t = x.get("decoder_target")
+    dec_time = x.get("decoder_time_idx", None)
+    if dec_time is None:
+        dec_time = x.get("decoder_relative_idx", None)
+    y_batch = batch[1] if isinstance(batch, (list, tuple)) and len(batch) >= 2 else None
+    if groups is None:
+        return
 
-        # groups can be a Tensor or a list[Tensor]; take the first if list
-        groups_raw = groups[0] if isinstance(groups, (list, tuple)) else groups
-        g = groups_raw
-        # squeeze trailing singleton dims to get [B]
-        while torch.is_tensor(g) and g.ndim > 1 and g.size(-1) == 1:
-            g = g.squeeze(-1)
-        if not torch.is_tensor(g):
-            return
+    groups_raw = groups[0] if isinstance(groups, (list, tuple)) else groups
+    g = groups_raw
+    while torch.is_tensor(g) and g.ndim > 1 and g.size(-1) == 1:
+        g = g.squeeze(-1)
+    if not torch.is_tensor(g):
+        return
 
-        # --- Extract targets (try decoder_target first, else fall back to batch[1]) ---
-        y_vol_t, y_dir_t = None, None
-        if dec_t is not None:
-            if torch.is_tensor(dec_t):
-                y = dec_t
-                if y.ndim == 3 and y.size(-1) == 1:
-                    y = y[..., 0]  # → [B, n_targets]
-                if y.ndim == 2 and y.size(1) >= 1:
-                    y_vol_t = y[:, 0]
-                    if y.size(1) > 1:
-                        y_dir_t = y[:, 1]
-            elif isinstance(dec_t, (list, tuple)) and len(dec_t) >= 1:
-                y_vol_t = dec_t[0]
-                if torch.is_tensor(y_vol_t):
-                    if y_vol_t.ndim == 3 and y_vol_t.size(-1) == 1:
-                        y_vol_t = y_vol_t[..., 0]
-                    if y_vol_t.ndim == 2 and y_vol_t.size(-1) == 1:
-                        y_vol_t = y_vol_t[:, 0]
-                if len(dec_t) > 1 and torch.is_tensor(dec_t[1]):
-                    y_dir_t = dec_t[1]
-                    if y_dir_t.ndim == 3 and y_dir_t.size(-1) == 1:
-                        y_dir_t = y_dir_t[..., 0]
-                    if y_dir_t.ndim == 2 and y_dir_t.size(-1) == 1:
-                        y_dir_t = y_dir_t[:, 0]
-        # Fallback: PF sometimes provides targets in batch[1] as [B, pred_len, n_targets]
-        if (y_vol_t is None or y_dir_t is None) and torch.is_tensor(y_batch):
-            yb = y_batch
-            if yb.ndim == 3 and yb.size(1) == 1:
-                yb = yb[:, 0, :]
-            if yb.ndim == 2 and yb.size(1) >= 1:
-                if y_vol_t is None:
-                    y_vol_t = yb[:, 0]
-                if y_dir_t is None and yb.size(1) > 1:
-                    y_dir_t = yb[:, 1]
-        if y_vol_t is None:
-            return
-      
-        # Forward pass to get predictions for this batch
-        y_hat = pl_module(x)
-        pred = getattr(y_hat, "prediction", y_hat)
-        if isinstance(pred, dict) and "prediction" in pred:
-            pred = pred["prediction"]
+    y_vol_t, y_dir_t = None, None
+    if dec_t is not None:
+        if torch.is_tensor(dec_t):
+            y = dec_t
+            if y.ndim == 3 and y.size(-1) == 1:
+                y = y[..., 0]
+            if y.ndim == 2 and y.size(1) >= 1:
+                y_vol_t = y[:, 0]
+                if y.size(1) > 1:
+                    y_dir_t = y[:, 1]
+        elif isinstance(dec_t, (list, tuple)) and len(dec_t) >= 1:
+            y_vol_t = dec_t[0]
+            if torch.is_tensor(y_vol_t):
+                if y_vol_t.ndim == 3 and y_vol_t.size(-1) == 1:
+                    y_vol_t = y_vol_t[..., 0]
+                if y_vol_t.ndim == 2 and y_vol_t.size(-1) == 1:
+                    y_vol_t = y_vol_t[:, 0]
+            if len(dec_t) > 1 and torch.is_tensor(dec_t[1]):
+                y_dir_t = dec_t[1]
+                if y_dir_t.ndim == 3 and y_dir_t.size(-1) == 1:
+                    y_dir_t = y_dir_t[..., 0]
+                if y_dir_t.ndim == 2 and y_dir_t.size(-1) == 1:
+                    y_dir_t = y_dir_t[:, 0]
 
-        def _point_from_quantiles(vol_q: torch.Tensor) -> torch.Tensor:
-            """
-            Use the 0.5 quantile (median) to compute a point forecast, matching the
-            PerAssetMetrics callback behaviour. Assumes last dim is quantiles:
-            [0.05, 0.165, 0.25, 0.50, 0.75, 0.835, 0.95]
-            """
-            return vol_q[..., 3]
+    if (y_vol_t is None or y_dir_t is None) and torch.is_tensor(y_batch):
+        yb = y_batch
+        if yb.ndim == 3 and yb.size(1) == 1:
+            yb = yb[:, 0, :]
+        if yb.ndim == 2 and yb.size(1) >= 1:
+            if y_vol_t is None:
+                y_vol_t = yb[:, 0]
+            if y_dir_t is None and yb.size(1) > 1:
+                y_dir_t = yb[:, 1]
+    if y_vol_t is None:
+        return
 
-        def _extract_heads(pred):
-            """Return (p_vol, p_dir) as 1D tensors [B] on DEVICE.
-            Handles outputs as:
-              • list/tuple: [vol(…,7), dir(…,7 or 1/2)]
-              • tensor [B, 2, 7] (after our predict_step squeeze)
-              • tensor [B, 1, 7] (vol only)
-              • tensor [B, 7] (vol only)
-            """
-            import torch
-            def _to_median_q(t):
-                if t is None:
-                    return None
-                if t.ndim == 3 and t.size(1) == 1:
-                    t = t.squeeze(1)       # [B, K]
-                if t.ndim == 2 and t.size(-1) >= 4:
-                    return t[:, 3]         # index of 0.50 in VOL_QUANTILES
-                if t.ndim == 1:
-                    return t
-                return t.reshape(t.size(0), -1)[:, 0]  # last-ditch fallback
+    y_hat = pl_module(x)
+    pred = getattr(y_hat, "prediction", y_hat)
+    if isinstance(pred, dict) and "prediction" in pred:
+        pred = pred["prediction"]
 
-            def _to_dir_logit(t):
-                if t is None:
-                    return None
-                if t.ndim == 3 and t.size(1) == 1:
-                    t = t.squeeze(1)  # [B,7] or [B,1]
-                # if replicated across 7, take middle slot; if single, squeeze
-                if t.ndim == 2 and t.size(-1) >= 1:
-                    return t[:, t.size(-1) // 2]
-                if t.ndim == 1:
-                    return t
-                return t.reshape(t.size(0), -1)[:, 0]
+    def _point_from_quantiles(vol_q: torch.Tensor) -> torch.Tensor:
+        return vol_q[..., 3]
 
-            # Case 1: PF-style list/tuple per target
-            if isinstance(pred, (list, tuple)):
-                p_vol_t = pred[0]
-                p_dir_t = pred[1] if len(pred) > 1 else None
-                return _point_from_quantiles(p_vol_t), _to_dir_logit(p_dir_t)
+    def _extract_heads(pred):
+        import torch
 
+        def _to_median_q(t):
+            if t is None:
+                return None
+            if t.ndim == 3 and t.size(1) == 1:
+                t = t.squeeze(1)
+            if t.ndim == 2 and t.size(-1) >= 4:
+                return t[:, 3]
+            if t.ndim == 1:
+                return t
+            return t.reshape(t.size(0), -1)[:, 0]
 
+        def _to_dir_logit(t):
+            if t is None:
+                return None
+            if t.ndim == 3 and t.size(1) == 1:
+                t = t.squeeze(1)
+            if t.ndim == 2 and t.size(-1) >= 1:
+                return t[:, t.size(-1) // 2]
+            if t.ndim == 1:
+                return t
+            return t.reshape(t.size(0), -1)[:, 0]
 
-            # Case 2: PF TFT with MultiLoss → concatenated last-dim: [B, 1, 7+1] or [B, 7+1]
-            if torch.is_tensor(pred):
-                t = pred
-                # squeeze prediction-length dim if present → [B, D]
-                if t.ndim == 4 and t.size(1) == 1:
-                    t = t.squeeze(1)          # [B, 2, K]? or [B, 1, D]
-                if t.ndim == 3 and t.size(1) == 1:
-                    t = t[:, 0, :]            # [B, D]
-                if t.ndim == 2:
-                    D = t.size(-1)
-                    if D >= 2:
-                        vol_q = t[:, : D-1]   # first K columns = volatility quantiles
-                        d_log = t[:, D-1]     # last column = direction logit
+        if isinstance(pred, (list, tuple)):
+            p_vol_t = pred[0]
+            p_dir_t = pred[1] if len(pred) > 1 else None
+            return _point_from_quantiles(p_vol_t), _to_dir_logit(p_dir_t)
+
+        if torch.is_tensor(pred):
+            t = pred
+            if t.ndim == 4 and t.size(1) == 1:
+                t = t.squeeze(1)
+            if t.ndim == 3 and t.size(1) == 1:
+                t = t[:, 0, :]
+            if t.ndim == 2:
+                D = t.size(-1)
+
+                # DEBUG first batch
+                if batch_idx == 0:
+                    print(f"[DEBUG] pred shape: {t.shape}")
+                    print(f"[DEBUG] first row: {t[0].detach().cpu().numpy()}")
+
+                if D == 8:  # 1 dir + 7 vol quantiles OR 7 vol + 1 dir
+                    first_col_std = t[:, 0].std().item()
+                    if abs(first_col_std) > 0.2 and abs(first_col_std) < 5.0:
+                        # assume dir first
+                        d_log = t[:, 0]
+                        vol_q = t[:, 1:]
                         return _point_from_quantiles(vol_q), d_log
-                    elif D == 1:
-                        # unlikely for vol head, but handle gracefully
-                        return t.squeeze(-1), None
-                # fallback (t not in an expected shape)
-                return _to_median_q(t), None
-            # Fallback: treat as vol-only
-            return _to_median_q(pred), None
+                    else:
+                        # assume vol first
+                        vol_q = t[:, :7]
+                        d_log = t[:, 7]
+                        return _point_from_quantiles(vol_q), d_log
+                elif D >= 2:
+                    vol_q = t[:, : D-1]
+                    d_log = t[:, D-1]
+                    return _point_from_quantiles(vol_q), d_log
+            return _to_median_q(t), None
 
-        p_vol, p_dir = _extract_heads(pred)
-        if p_vol is None:
-            return
+        return _to_median_q(pred), None
 
-        # Store device tensors; no decode/CPU here
-        L = g.shape[0]
-        self._g_dev.append(g.reshape(L))
-        self._yv_dev.append(y_vol_t.reshape(L))
-        self._pv_dev.append(p_vol.reshape(L))
-        # capture time index if available and shape-compatible
-        if dec_time is not None and torch.is_tensor(dec_time):
-            tvec = dec_time
-            # squeeze to [B]
-            while tvec.ndim > 1 and tvec.size(-1) == 1:
-                tvec = tvec.squeeze(-1)
-            if tvec.numel() >= L:
-                self._t_dev.append(tvec.reshape(-1)[:L])
+    p_vol, p_dir = _extract_heads(pred)
+    if p_vol is None:
+        return
 
-        if y_dir_t is not None and p_dir is not None:
-            y_flat = y_dir_t.reshape(-1)
-            p_flat = p_dir.reshape(-1)
-            L2 = min(L, y_flat.numel(), p_flat.numel())
-            if L2 > 0:
-                self._yd_dev.append(y_flat[:L2])
-                self._pd_dev.append(p_flat[:L2])
+    L = g.shape[0]
+    self._g_dev.append(g.reshape(L))
+    self._yv_dev.append(y_vol_t.reshape(L))
+    self._pv_dev.append(p_vol.reshape(L))
 
+    if dec_time is not None and torch.is_tensor(dec_time):
+        tvec = dec_time
+        while tvec.ndim > 1 and tvec.size(-1) == 1:
+            tvec = tvec.squeeze(-1)
+        if tvec.numel() >= L:
+            self._t_dev.append(tvec.reshape(-1)[:L])
+
+    if y_dir_t is not None and p_dir is not None:
+        y_flat = y_dir_t.reshape(-1)
+        p_flat = p_dir.reshape(-1)
+        L2 = min(L, y_flat.numel(), p_flat.numel())
+        if L2 > 0:
+            self._yd_dev.append(y_flat[:L2])
+            self._pd_dev.append(p_flat[:L2])
     @torch.no_grad()
     def on_validation_epoch_end(self, trainer, pl_module):
         # If nothing collected, exit quietly
@@ -508,6 +519,34 @@ class PerAssetMetrics(pl.Callback):
         yv_dec = safe_decode_vol(yv.unsqueeze(-1), self.vol_norm, g.unsqueeze(-1)).squeeze(-1)
         pv_dec = safe_decode_vol(pv.unsqueeze(-1), self.vol_norm, g.unsqueeze(-1)).squeeze(-1)
         pv_dec = torch.clamp(pv_dec, min=2e-7)  # avoid zero in QLIKE
+
+        print(f"[NORM DEBUG] mean(y_norm)={yv.mean().item():.6f} mean(p_norm)={pv.mean().item():.6f}")
+        mae_norm = (pv - yv).abs().mean().item()
+        print(f"[NORM DEBUG] MAE_norm={mae_norm:.6f}")
+
+        # Pre-inverse (destandardised but not yet expm1 / sinh)
+        center = getattr(self.vol_norm, "center", None)
+        scale  = getattr(self.vol_norm, "scale",  None)
+        g_long = g.long()
+
+        def _pick(arr, g):
+            if isinstance(arr, torch.Tensor):
+                return arr[g]
+            return arr  # fallback (scalar/None)
+
+        s_used = _pick(scale, g_long)  if scale  is not None else None
+        c_used = _pick(center, g_long) if center is not None else None 
+
+        if s_used is None:
+            preinv_y = yv.mean().item()
+            preinv_p = pv.mean().item()
+            print("[PREINV DEBUG] scale=None -> using normalised values directly")
+        else:
+            preinv_y = (yv * s_used + (0.0 if c_used is None else c_used)).mean().item()
+            preinv_p = (pv * s_used + (0.0 if c_used is None else c_used)).mean().item()
+
+        print(f"[PREINV DEBUG] mean(preinv_y)={preinv_y:.6f} mean(preinv_p)={preinv_p:.6f}  # inverse applies expm1/asinh next")
+
 
         # Quick sanity prints (match overfit_test style)
         print("DEBUG transformation:", getattr(self.vol_norm, "transformation", None))
@@ -670,8 +709,9 @@ class PerAssetMetrics(pl.Callback):
             pd_cpu = torch.cat(self._pd_dev).detach().cpu() if self._pd_dev else None
             # decode vol back to physical scale
             if g_cpu is not None and yv_cpu is not None and pv_cpu is not None:
-                yv_dec = self.vol_norm.decode(yv_cpu.unsqueeze(-1), group_ids=g_cpu.unsqueeze(-1)).squeeze(-1)
-                pv_dec = self.vol_norm.decode(pv_cpu.unsqueeze(-1), group_ids=g_cpu.unsqueeze(-1)).squeeze(-1)
+                yv_dec = safe_decode_vol(yv_cpu.unsqueeze(-1), self.vol_norm,  g_cpu.unsqueeze(-1)).squeeze(-1)
+                pv_dec = safe_decode_vol(pv_cpu.unsqueeze(-1), self.vol_norm,  g_cpu.unsqueeze(-1)).squeeze(-1)
+                pv_dec = torch.clamp(pv_dec, min=2e-7)
                 # map group id -> name
                 assets = [self.id_to_name.get(int(i), str(int(i))) for i in g_cpu.tolist()]
                 # time index (may be missing)
@@ -1675,9 +1715,9 @@ if __name__ == "__main__":
             target_normalizer = MultiNormalizer([
                 GroupNormalizer(
                     groups=GROUP_ID,
-                    center=False,
+                    center=True,
                     scale_by_group= True,
-                    transformation="asinh",
+                    transformation="log1p",
                 ),
                 TorchNormalizer(method="identity", center=False),   # direction
             ]),
@@ -1788,7 +1828,7 @@ if __name__ == "__main__":
         # ---- Build losses as named variables so callbacks can tune them ----
     VOL_LOSS = AsymmetricQuantileLoss(
         quantiles=[0.05, 0.165, 0.25, 0.5, 0.75, 0.835, 0.95],
-        underestimation_factor=1.3,   # final target (will be warmed up)
+        underestimation_factor=1.0,   # final target (will be warmed up)
         mean_bias_weight=0.05,        # will be 0 during warmup, then enabled
     )
     # one-off in your data prep (TRAIN split)
