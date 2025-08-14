@@ -740,7 +740,7 @@ class PerAssetMetrics(pl.Callback):
             print(f"[WARN] Could not save validation predictions: {e}")
 
 class BiasWarmupCallback(pl.Callback):
-    def __init__(self, vol_loss, target_under=1.1115, target_mean_bias=0.15, warmup_epochs=3):
+    def __init__(self, vol_loss, target_under=1.3, target_mean_bias=0.15, warmup_epochs=3):
         super().__init__()
         self.vol_loss = vol_loss
         self.target_under = float(target_under)
@@ -1788,7 +1788,7 @@ if __name__ == "__main__":
         # ---- Build losses as named variables so callbacks can tune them ----
     VOL_LOSS = AsymmetricQuantileLoss(
         quantiles=[0.05, 0.165, 0.25, 0.5, 0.75, 0.835, 0.95],
-        underestimation_factor=1.15,   # final target (will be warmed up)
+        underestimation_factor=1.3,   # final target (will be warmed up)
         mean_bias_weight=0.05,        # will be 0 during warmup, then enabled
     )
     # one-off in your data prep (TRAIN split)
