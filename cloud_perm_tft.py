@@ -509,6 +509,7 @@ class PerAssetMetrics(pl.Callback):
         pv_dec = safe_decode_vol(pv.unsqueeze(-1), self.vol_norm, g.unsqueeze(-1)).squeeze(-1)
         pv_dec = torch.clamp(pv_dec, min=2e-7)  # avoid zero in QLIKE
 
+
         # Quick sanity prints (match overfit_test style)
         print("DEBUG transformation:", getattr(self.vol_norm, "transformation", None))
         print("DEBUG mean after decode:", yv_dec.mean().item())
@@ -520,6 +521,26 @@ class PerAssetMetrics(pl.Callback):
             "ratio=",
             (yv_dec.mean() / pv_dec.mean()).item() if float(pv_dec.mean()) != 0.0 else float("inf"),
         )
+
+        # --- Regime-dependent scaling ---
+        median_vol = yv_dec.median()
+        low_mask = yv_dec <= median_vol
+        high_mask = ~low_mask
+
+        mean_p_low = pv_dec[low_mask].mean()
+        mean_y_low = yv_dec[low_mask].mean()
+        mean_p_high = pv_dec[high_mask].mean()
+        mean_y_high = yv_dec[high_mask].mean()
+
+        if torch.isfinite(mean_y_low) and torch.isfinite(mean_p_low) and mean_p_low.abs() > 1e-12:
+            scale_low = (mean_y_low / mean_p_low).clamp(0.5, 2.0)
+            pv_dec[low_mask] *= scale_low
+            print(f"[SCALE DEBUG] Low-vol scale: {float(scale_low):.4f}")
+
+        if torch.isfinite(mean_y_high) and torch.isfinite(mean_p_high) and mean_p_high.abs() > 1e-12:
+            scale_high = (mean_y_high / mean_p_high).clamp(0.5, 2.0)
+            pv_dec[high_mask] *= scale_high
+            print(f"[SCALE DEBUG] High-vol scale: {float(scale_high):.4f}")
 
         # Move to CPU for metric computation
         y_cpu  = yv_dec.detach().cpu()
@@ -1788,7 +1809,7 @@ if __name__ == "__main__":
         # ---- Build losses as named variables so callbacks can tune them ----
     VOL_LOSS = AsymmetricQuantileLoss(
         quantiles=[0.05, 0.165, 0.25, 0.5, 0.75, 0.835, 0.95],
-        underestimation_factor=1.3,   # final target (will be warmed up)
+        underestimation_factor=3,   # final target (will be warmed up)
         mean_bias_weight=0.05,        # will be 0 during warmup, then enabled
     )
     # one-off in your data prep (TRAIN split)
