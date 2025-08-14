@@ -343,7 +343,9 @@ class CompositeVolMetric(Metric):
     top `high_q` fraction of targets to improve peak capture.
     Peak selection is done in decoded space to avoid over-penalising.
     """
-    def __init__(self, base_loss: Metric, high_q: float = 0.90, penalty_weight: float = 0.5, warmup_epochs: int = 3):
+
+    def __init__(self, base_loss: Metric, high_q: float = 0.90,
+                 penalty_weight: float = 0.5, warmup_epochs: int = 3):
         super().__init__()
         self.base_loss = base_loss
         self.high_q = float(high_q)
@@ -372,19 +374,15 @@ class CompositeVolMetric(Metric):
         return t
 
     def _extract_decoder_vol_target(self, target):
-        """
-        Extract decoder target for volatility. 
-        Preserve [B,1] where possible to keep base_loss happy.
-        """
         if isinstance(target, (list, tuple)) and len(target) >= 2:
-            t = target[1]  # decoder target
+            t = target[1]
         else:
             t = target
         if not torch.is_tensor(t):
             return None
         t = self._squeeze_pred_len(t)
         t = self._squeeze_last1(t)
-        return t  # do NOT collapse [B,1] → [B]
+        return t
 
     def _extract_vol_quantiles(self, y_pred: torch.Tensor) -> torch.Tensor:
         K = len(VOL_QUANTILES)
@@ -397,6 +395,10 @@ class CompositeVolMetric(Metric):
             t = t.repeat_interleave(K, dim=-1)
         return t
 
+    @staticmethod
+    def _decode_asinh(x):
+        return torch.sinh(x)  # inverse of asinh
+
     def forward(self, y_pred, target, **kwargs):
         vol_q = self._extract_vol_quantiles(y_pred)
         target_vol = self._extract_decoder_vol_target(target)
@@ -404,33 +406,32 @@ class CompositeVolMetric(Metric):
         if target_vol is None or not torch.is_tensor(target_vol):
             target_vol = vol_q[..., Q50_IDX].detach()
 
-        # --- Ensure target_vol is at least 2D for base_loss ---
         if target_vol.ndim == 1:
             target_vol = target_vol.unsqueeze(-1)
 
         # Base quantile loss
         main = self.base_loss(vol_q, target_vol)
 
-        # --- Tail penalty in DECODED space ---
+        # Decode to real space
         try:
-            tgt_dec = decode_asinh(target_vol)
-            med_dec = decode_asinh(vol_q[..., Q50_IDX])
+            tgt_dec = self._decode_asinh(target_vol)
+            med_dec = self._decode_asinh(vol_q[..., Q50_IDX])
         except Exception:
-            # tiny decoded mean-calibration term
-            cal = (med_dec.mean() - tgt_dec.mean()) ** 2
-            return main + 0.02 * cal
+            # Fallback: skip penalty if decode fails
+            return main
 
+        # Peak threshold in decoded space
         try:
             thresh_dec = torch.quantile(tgt_dec.detach(), self.high_q)
         except Exception:
             return main
 
-        # Only penalise peaks where we underpredict
+        # Penalise only underprediction on peaks
         mask = (tgt_dec > thresh_dec) & (med_dec < tgt_dec)
         if mask.any():
             penalty = F.mse_loss(med_dec[mask], tgt_dec[mask])
             scale = min(1.0, self.current_epoch / max(1, self.warmup_epochs))
-            return main + scale * self.penalty_weight * penalty
+            main = main + scale * self.penalty_weight * penalty
 
         return main
 
