@@ -383,11 +383,13 @@ class CompositeVolMetric(Metric):
 
     def _extract_decoder_vol_target(self, target):
         """
-        PF passes (encoder_target, decoder_target) into MultiLoss metrics.
+        PF passes (decoder_target_for_this_idx, encoder_target) into MultiLoss metrics.
         We want the decoder target for *volatility* (first column if multiple).
         """
-        if isinstance(target, (list, tuple)) and len(target) >= 2:
-            t = target[1]  # decoder part
+        if isinstance(target, (list, tuple)) and len(target) >= 1:
+            # In PF MultiLoss, metrics see (decoder_target_for_this_idx, encoder_target)
+            # We want the decoder target for this variable
+            t = target[0]
         else:
             t = target
         if not torch.is_tensor(t):
@@ -435,7 +437,11 @@ class CompositeVolMetric(Metric):
             target_vol = target_vol.squeeze(-1)
 
         # 3) base loss (e.g., AsymmetricQuantileLoss) against the volatility target
-        main = self.base_loss(vol_q, target_vol)
+        # Ensure shapes expected by PF QuantileLoss: y_pred [B, 1, K], target [B, 1]
+        if vol_q.ndim == 2:
+            vol_q = vol_q.unsqueeze(1)
+        target_for_base = target_vol.unsqueeze(1) if target_vol.ndim == 1 else target_vol
+        main = self.base_loss(vol_q, target_for_base)
 
         # 4) Decode to real space for peak selection & mean-bias calibration
         try:
