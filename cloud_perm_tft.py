@@ -99,8 +99,8 @@ import argparse
 import pytorch_forecasting as pf
 import inspect
 
-VOL_QUANTILES = [0.05, 0.165, 0.25, 0.50, 0.75, 0.835, 0.9, 0.975, 0.99]
-Q50_IDX = VOL_QUANTILES.index(0.50)  # -> 3
+VOL_QUANTILES = [0.05, 0.165, 0.25, 0.50, 0.75, 0.835, 0.95]
+Q50_IDX = VOL_QUANTILES.index(0.50)
 
 # -----------------------------------------------------------------------
 # Ensure a robust "identity" transformation for GroupNormalizer
@@ -412,6 +412,10 @@ class CompositeVolMetric(Metric):
             tgt_dec = decode_asinh(target_vol)
             med_dec = decode_asinh(vol_q[..., Q50_IDX])
         except Exception:
+            # --- tiny decoded mean-calibration (symmetric) ---
+            cal = (med_dec.mean() - tgt_dec.mean()) ** 2
+            # small weight so it doesn't dominate
+            main = main + 0.02 * cal
             return main
 
         try:
@@ -2023,7 +2027,7 @@ if __name__ == "__main__":
     seed_everything(SEED, workers=True)
     # Loss and output_size for multi-target: realised_vol (quantile regression), direction (classification)
     print("▶ Building model …")
-    print(f"[LR] learning_rate={LR_OVERRIDE if LR_OVERRIDE is not None else 0.0001978}")
+    print(f"[LR] learning_rate={LR_OVERRIDE if LR_OVERRIDE is not None else 0.0002978}")
 
     es_cb = EarlyStopping(
         monitor="val_loss_decoded",  # MAE + RMSE (decoded)
@@ -2044,13 +2048,7 @@ if __name__ == "__main__":
 
     # ---- Losses (place where you currently build VOL_LOSS / DIR_LOSS) ----
     # Keep your VOL_QUANTILES as defined at the top
-    BASE_VOL_LOSS = AsymmetricQuantileLoss(
-        quantiles=VOL_QUANTILES,
-        underestimation_factor=1.0,     # no boost until model stabilises
-        mean_bias_weight=0.0,
-        tail_q=0.90,
-        tail_weight=1.0,
-    )
+    BASE_VOL_LOSS = QuantileLoss(quantiles=VOL_QUANTILES)
 
     VOL_LOSS = CompositeVolMetric(
         base_loss=BASE_VOL_LOSS,
@@ -2120,7 +2118,7 @@ if __name__ == "__main__":
 
 
     
-    lr_decay_cb = EpochLRDecay(gamma=0.95, start_epoch=15) 
+    lr_decay_cb = EpochLRDecay(gamma=0.95, start_epoch=1) 
 
     # ----------------------------
     # Trainer instance
@@ -2133,7 +2131,7 @@ if __name__ == "__main__":
         gradient_clip_val=GRADIENT_CLIP_VAL,
         num_sanity_val_steps = 0,
         logger=logger,
-        callbacks=[best_ckpt_cb, es_cb, bar_cb, metrics_cb, mirror_cb, lr_decay_cb, lr_cb, VolMetricWarmupCallback(VOL_LOSS),vol_warmup_cb],
+        callbacks=[best_ckpt_cb, es_cb, bar_cb, metrics_cb, mirror_cb, lr_decay_cb, lr_cb,vol_warmup_cb],
         check_val_every_n_epoch=int(ARGS.check_val_every_n_epoch),
         log_every_n_steps=int(ARGS.log_every_n_steps),
     )
