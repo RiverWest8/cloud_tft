@@ -162,6 +162,8 @@ def manual_inverse_transform_groupnorm(normalizer, y: torch.Tensor, group_ids: t
     tfm = getattr(normalizer, "transformation", None)
     if tfm == "asinh":
         x = torch.sinh(x)
+    elif tfm == "log1p":
+        x = torch.expm1(x)
     elif tfm in (None, "identity"):
         pass
     else:
