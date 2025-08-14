@@ -763,6 +763,11 @@ class BiasWarmupCallback(pl.Callback):
 # Decay the optimizer LR at the end of each epoch to prevent overshoot/oscillation
 import lightning.pytorch as pl
 
+class MedianMSELoss(nn.Module):
+    def forward(self, y_hat_quantiles, y_true):
+        q50 = y_hat_quantiles[:, 3]  # index of 0.50
+        return F.mse_loss(q50, y_true)
+
 class EpochLRDecay(pl.Callback):
     def __init__(self, gamma: float = 0.95, start_epoch: int = 1):
         """
@@ -1026,7 +1031,7 @@ GROUP_ID: List[str] = ["asset"]
 TIME_COL = "Time"
 TARGETS  = ["realised_vol", "direction"]
 
-MAX_ENCODER_LENGTH = 24
+MAX_ENCODER_LENGTH = 96
 MAX_PRED_LENGTH    = 1
 
 EMBEDDING_CARDINALITY = {}
@@ -1042,7 +1047,7 @@ RUN_SUFFIX = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 MODEL_SAVE_PATH = (LOCAL_CKPT_DIR / f"tft_realised_vol_e{MAX_EPOCHS}_{RUN_SUFFIX}.ckpt")
 
 SEED = 50
-WEIGHT_DECAY = 0.001 #0.00578350719515325     # weight decay for AdamW
+WEIGHT_DECAY = 0.0001 #0.00578350719515325     # weight decay for AdamW
 GRADIENT_CLIP_VAL = 0.78 #0.78    # gradient clipping value for Trainer
 # Feature-importance controls
 ENABLE_FEATURE_IMPORTANCE = True   # gate FI so you can toggle it
@@ -1773,7 +1778,7 @@ if __name__ == "__main__":
         # ---- Build losses as named variables so callbacks can tune them ----
     VOL_LOSS = AsymmetricQuantileLoss(
         quantiles=[0.05, 0.165, 0.25, 0.5, 0.75, 0.835, 0.95],
-        underestimation_factor=1.115,   # final target (will be warmed up)
+        underestimation_factor=2.015,   # final target (will be warmed up)
         mean_bias_weight=0.00,        # will be 0 during warmup, then enabled
     )
     DIR_LOSS = LabelSmoothedBCE(smoothing=0.05)
@@ -1781,6 +1786,7 @@ if __name__ == "__main__":
 
     FIXED_VOL_WEIGHT = 1.0
     FIXED_DIR_WEIGHT = 0.001
+    FIXED_MML_WEIGHT = 0.2
 
     tft = TemporalFusionTransformer.from_dataset(
         training_dataset,
@@ -1792,7 +1798,7 @@ if __name__ == "__main__":
         optimizer="AdamW",
         optimizer_params={"weight_decay": WEIGHT_DECAY},
         output_size=[7, 1],  # 7 quantiles + 1 logit
-        loss=MultiLoss([VOL_LOSS, DIR_LOSS], weights=[FIXED_VOL_WEIGHT, FIXED_DIR_WEIGHT]),
+        loss=MultiLoss([VOL_LOSS, DIR_LOSS, MedianMSELoss()], weights=[FIXED_VOL_WEIGHT, FIXED_DIR_WEIGHT, FIXED_MML_WEIGHT]),
         logging_metrics=[],
         log_interval=50,
         log_val_interval=10,
@@ -1822,6 +1828,9 @@ if __name__ == "__main__":
     target_mean_bias=0.00,
     warmup_epochs=0,
     )
+
+   
+    
     lr_decay_cb = EpochLRDecay(gamma=0.95, start_epoch=0) 
 
     # ----------------------------
