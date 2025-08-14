@@ -112,7 +112,22 @@ Q50_IDX = VOL_QUANTILES.index(0.50)  # -> 3
 # handles both cases safely.
 #
 
+
+
 from pytorch_forecasting.data.encoders import GroupNormalizer
+
+# Ensure log1p mapping exists for forward/inverse
+if ("log1p" not in GroupNormalizer.TRANSFORMATIONS
+    or not isinstance(GroupNormalizer.TRANSFORMATIONS["log1p"], dict)):
+    GroupNormalizer.TRANSFORMATIONS["log1p"] = {
+        "forward": lambda x: torch.log1p(x) if torch.is_tensor(x) else np.log1p(x),
+        "inverse": lambda x: torch.expm1(x) if torch.is_tensor(x) else np.expm1(x),
+    }
+if hasattr(GroupNormalizer, "INVERSE_TRANSFORMATIONS"):
+    GroupNormalizer.INVERSE_TRANSFORMATIONS.setdefault(
+        "log1p",
+        lambda x: torch.expm1(x) if torch.is_tensor(x) else np.expm1(x),
+    )
 
 if ("asinh" not in GroupNormalizer.TRANSFORMATIONS
     or not isinstance(GroupNormalizer.TRANSFORMATIONS["asinh"], dict)):
@@ -162,8 +177,8 @@ def manual_inverse_transform_groupnorm(normalizer, y: torch.Tensor, group_ids: t
     tfm = getattr(normalizer, "transformation", None)
     if tfm == "asinh":
         x = torch.sinh(x)
-    elif tfm in (None, "identity"):
-        pass
+    elif tfm == "log1p":
+        x = torch.expm1(x)
     else:
         try:
             inv = type(normalizer).TRANSFORMATIONS[tfm]["inverse"]
@@ -504,10 +519,20 @@ class PerAssetMetrics(pl.Callback):
         yd = torch.cat(self._yd_dev).to(device) if self._yd_dev else None  # direction labels
         pd = torch.cat(self._pd_dev).to(device) if self._pd_dev else None  # direction logits/probs
 
-        # --- Decode realised_vol to physical scale (robust to PF version)
         yv_dec = safe_decode_vol(yv.unsqueeze(-1), self.vol_norm, g.unsqueeze(-1)).squeeze(-1)
         pv_dec = safe_decode_vol(pv.unsqueeze(-1), self.vol_norm, g.unsqueeze(-1)).squeeze(-1)
         pv_dec = torch.clamp(pv_dec, min=2e-7)  # avoid zero in QLIKE
+
+                # --- Mean calibration (post-prediction scaling; metrics only) ---
+        mean_y = yv_dec.mean()
+        mean_p = pv_dec.mean()
+        if torch.isfinite(mean_y) and torch.isfinite(mean_p) and mean_p.abs() > 1e-12:
+            scale_factor = (mean_y / mean_p).clamp(0.25, 4.0)  # guard against extremes
+            pv_dec = pv_dec * scale_factor
+            try:
+                print(f"[SCALE DEBUG] Applied scale factor: {float(scale_factor):.4f}")
+            except Exception:
+                pass
 
         # Quick sanity prints (match overfit_test style)
         print("DEBUG transformation:", getattr(self.vol_norm, "transformation", None))
@@ -1675,9 +1700,9 @@ if __name__ == "__main__":
             target_normalizer = MultiNormalizer([
                 GroupNormalizer(
                     groups=GROUP_ID,
-                    center=False,
+                    center=True,
                     scale_by_group= True,
-                    transformation="asinh",
+                    transformation="log1p",
                 ),
                 TorchNormalizer(method="identity", center=False),   # direction
             ]),
@@ -1788,8 +1813,8 @@ if __name__ == "__main__":
         # ---- Build losses as named variables so callbacks can tune them ----
     VOL_LOSS = AsymmetricQuantileLoss(
         quantiles=[0.05, 0.165, 0.25, 0.5, 0.75, 0.835, 0.95],
-        underestimation_factor=100,   # final target (will be warmed up)
-        mean_bias_weight=0.05,        # will be 0 during warmup, then enabled
+        underestimation_factor=1.115,   # final target (will be warmed up)
+        mean_bias_weight=0.1,        # will be 0 during warmup, then enabled
     )
     # one-off in your data prep (TRAIN split)
     counts = train_df["direction"].value_counts()
