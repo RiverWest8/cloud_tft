@@ -759,6 +759,34 @@ class BiasWarmupCallback(pl.Callback):
         print(f"[BIAS] epoch={e} under={self.vol_loss.underestimation_factor:.3f} "
               f"mean_bias={self.vol_loss.mean_bias_weight:.3f} "
               f"lr={lr0 if lr0 is not None else 'n/a'}")
+        
+# Decay the optimizer LR at the end of each epoch to prevent overshoot/oscillation
+import lightning.pytorch as pl
+
+class EpochLRDecay(pl.Callback):
+    def __init__(self, gamma: float = 0.95, start_epoch: int = 1):
+        """
+        gamma: multiplicative decay per epoch (0.95 = -5%/epoch)
+        start_epoch: begin decaying after this epoch index (0-based)
+        """
+        super().__init__()
+        self.gamma = float(gamma)
+        self.start_epoch = int(start_epoch)
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        e = int(getattr(trainer, "current_epoch", 0))
+        if e < self.start_epoch:
+            return
+        # scale all param_group LRs
+        try:
+            for opt in trainer.optimizers:
+                for pg in opt.param_groups:
+                    if "lr" in pg and pg["lr"] is not None:
+                        pg["lr"] = float(pg["lr"]) * self.gamma
+            new_lr = trainer.optimizers[0].param_groups[0]["lr"]
+            print(f"[LR] epoch={e} → decayed lr to {new_lr:.6g}")
+        except Exception as err:
+            print(f"[LR] decay skipped: {err}")
             
 # -----------------------------------------------------------------------
 # Compute / device configuration (optimised for NVIDIA L4 on GCP)
@@ -1756,8 +1784,8 @@ if __name__ == "__main__":
 
     tft = TemporalFusionTransformer.from_dataset(
         training_dataset,
-        hidden_size=96,
-        attention_head_size=3,
+        hidden_size=128,
+        attention_head_size=4,
         dropout=0.0833704625250354, #0.0833704625250354,
         hidden_continuous_size=32,
         learning_rate=(LR_OVERRIDE if LR_OVERRIDE is not None else 0.0015), #0.0019 0017978
@@ -1768,8 +1796,6 @@ if __name__ == "__main__":
         logging_metrics=[],
         log_interval=50,
         log_val_interval=10,
-        reduce_on_plateau_patience=5,
-        reduce_on_plateau_min_lr=1e-5,
     )
     vol_normalizer = _extract_norm_from_dataset(training_dataset)
     tft.vol_norm = vol_normalizer          # if your LightningModule is 'tft'
@@ -1792,11 +1818,11 @@ if __name__ == "__main__":
 
     bias_cb = BiasWarmupCallback(
     vol_loss=VOL_LOSS,
-    target_under=1.8,
+    target_under=1.115,
     target_mean_bias=0.05,
     warmup_epochs=3,
     )
-
+    lr_decay_cb = EpochLRDecay(gamma=0.95, start_epoch=2) 
 
     # ----------------------------
     # Trainer instance
