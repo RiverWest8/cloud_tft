@@ -230,7 +230,7 @@ if not hasattr(GroupNormalizer, "decode"):
 from pytorch_forecasting.metrics import QuantileLoss, MultiLoss
 
 class LabelSmoothedBCE(nn.Module):
-    def __init__(self, smoothing: float = 0.1, pos_weight: float = 1.02):
+    def __init__(self, smoothing: float = 0.1, pos_weight: float = 1.001):
         super().__init__()
         self.smoothing = smoothing
         self.register_buffer("pos_weight", torch.tensor(pos_weight))
@@ -728,6 +728,37 @@ class PerAssetMetrics(pl.Callback):
                     print(f"[WARN] Could not upload validation predictions: {e}")
         except Exception as e:
             print(f"[WARN] Could not save validation predictions: {e}")
+
+class BiasWarmupCallback(pl.Callback):
+    def __init__(self, vol_loss, target_under=1.115, target_mean_bias=0.05, warmup_epochs=3):
+        super().__init__()
+        self.vol_loss = vol_loss
+        self.target_under = float(target_under)
+        self.target_mean_bias = float(target_mean_bias)
+        self.warm = int(max(0, warmup_epochs))
+
+    def on_train_epoch_start(self, trainer, pl_module):
+        # current_epoch is 0-based
+        e = int(getattr(trainer, "current_epoch", 0))
+        if self.warm <= 0:
+            # no warmup: use targets directly
+            self.vol_loss.underestimation_factor = self.target_under
+            self.vol_loss.mean_bias_weight = self.target_mean_bias
+        else:
+            prog = min(1.0, float(e) / float(self.warm))
+            # ramp underestimation from 1.0 → target
+            self.vol_loss.underestimation_factor = 1.0 + (self.target_under - 1.0) * prog
+            # keep mean-bias OFF until warmup finishes
+            self.vol_loss.mean_bias_weight = 0.0 if e < self.warm else self.target_mean_bias
+
+        # Debug print
+        try:
+            lr0 = trainer.optimizers[0].param_groups[0]["lr"]
+        except Exception:
+            lr0 = None
+        print(f"[BIAS] epoch={e} under={self.vol_loss.underestimation_factor:.3f} "
+              f"mean_bias={self.vol_loss.mean_bias_weight:.3f} "
+              f"lr={lr0 if lr0 is not None else 'n/a'}")
             
 # -----------------------------------------------------------------------
 # Compute / device configuration (optimised for NVIDIA L4 on GCP)
@@ -1710,9 +1741,18 @@ if __name__ == "__main__":
     mirror_cb = MirrorCheckpoints()
     from pytorch_forecasting.metrics import MultiLoss
 
-    # Fixed weights
+        # Fixed weights
+        # ---- Build losses as named variables so callbacks can tune them ----
+    VOL_LOSS = AsymmetricQuantileLoss(
+        quantiles=[0.05, 0.165, 0.25, 0.5, 0.75, 0.835, 0.95],
+        underestimation_factor=1.115,   # final target (will be warmed up)
+        mean_bias_weight=0.05,        # will be 0 during warmup, then enabled
+    )
+    DIR_LOSS = LabelSmoothedBCE(smoothing=0.05)
+
+
     FIXED_VOL_WEIGHT = 1.0
-    FIXED_DIR_WEIGHT = 0.01
+    FIXED_DIR_WEIGHT = 0.001
 
     tft = TemporalFusionTransformer.from_dataset(
         training_dataset,
@@ -1720,18 +1760,11 @@ if __name__ == "__main__":
         attention_head_size=3,
         dropout=0.0833704625250354, #0.0833704625250354,
         hidden_continuous_size=32,
-        learning_rate=(LR_OVERRIDE if LR_OVERRIDE is not None else 0.003), #0.0019 0017978
+        learning_rate=(LR_OVERRIDE if LR_OVERRIDE is not None else 0.0015), #0.0019 0017978
         optimizer="AdamW",
         optimizer_params={"weight_decay": WEIGHT_DECAY},
         output_size=[7, 1],  # 7 quantiles + 1 logit
-        loss=MultiLoss([
-            AsymmetricQuantileLoss(
-                quantiles=[0.05, 0.165, 0.25, 0.5, 0.75, 0.835, 0.95],
-                underestimation_factor= 1.8, #1.115,  # keep asymmetric penalty
-                mean_bias_weight = 0.05
-            ),
-            LabelSmoothedBCE(smoothing=0.05),
-        ], weights=[FIXED_VOL_WEIGHT, FIXED_DIR_WEIGHT]),
+        loss=MultiLoss([VOL_LOSS, DIR_LOSS], weights=[FIXED_VOL_WEIGHT, FIXED_DIR_WEIGHT]),
         logging_metrics=[],
         log_interval=50,
         log_val_interval=10,
@@ -1757,6 +1790,13 @@ if __name__ == "__main__":
         dirpath=str(LOCAL_CKPT_DIR),
     )
 
+    bias_cb = BiasWarmupCallback(
+    vol_loss=VOL_LOSS,
+    target_under=1.8,
+    target_mean_bias=0.05,
+    warmup_epochs=3,
+    )
+
 
     # ----------------------------
     # Trainer instance
@@ -1769,7 +1809,7 @@ if __name__ == "__main__":
         gradient_clip_val=GRADIENT_CLIP_VAL,
         num_sanity_val_steps = 0,
         logger=logger,
-        callbacks=[lr_cb, best_ckpt_cb, es_cb, bar_cb, metrics_cb, mirror_cb],
+        callbacks=[lr_cb, best_ckpt_cb, es_cb, bar_cb, metrics_cb, mirror_cb, bias_cb],
         check_val_every_n_epoch=int(ARGS.check_val_every_n_epoch),
         log_every_n_steps=int(ARGS.log_every_n_steps),
     )
