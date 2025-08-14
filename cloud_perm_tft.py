@@ -527,6 +527,17 @@ class PerAssetMetrics(pl.Callback):
         yd_cpu = yd.detach().cpu() if yd is not None else None
         pd_cpu = pd.detach().cpu() if pd is not None else None
 
+        # --- Calibration diagnostic (no effect on metrics) ---
+        try:
+            mean_scale = float((y_cpu.mean() / (p_cpu.mean() + 1e-12)).item())
+        except Exception:
+            mean_scale = float("nan")
+        print(f"[CAL DEBUG] mean(y)/mean(p)={mean_scale:.4f} (1==perfect)")
+        try:
+            trainer.callback_metrics["val_mean_scale"] = torch.tensor(mean_scale)
+        except Exception:
+            pass
+
         # --- Decoded regression metrics ---
         eps = 1e-8
         overall_mae  = (p_cpu - y_cpu).abs().mean().item()
@@ -1757,7 +1768,7 @@ if __name__ == "__main__":
     print(f"[LR] learning_rate={LR_OVERRIDE if LR_OVERRIDE is not None else 0.0017978}")
     
     es_cb = EarlyStopping(
-    monitor="val_loss",
+    monitor="val_qlike_overall",
     patience=EARLY_STOP_PATIENCE,
     mode="min"
     )
@@ -1820,7 +1831,7 @@ if __name__ == "__main__":
     lr_cb = LearningRateMonitor(logging_interval="step")
 
     best_ckpt_cb = ModelCheckpoint(
-        monitor="val_loss",
+        monitor="val_qlike_overall",
         mode="min",
         save_top_k=1,
         save_last=True,
@@ -1830,8 +1841,8 @@ if __name__ == "__main__":
 
     bias_cb = BiasWarmupCallback(
         vol_loss=VOL_LOSS,
-        target_under=1.1,        # smaller than 3.0 to avoid overshoot
-        target_mean_bias=0.00,    # add a mild mean-bias penalty
+        target_under=1.115,        # smaller than 3.0 to avoid overshoot
+        target_mean_bias=0.12,    # add a mild mean-bias penalty
         warmup_epochs=5
     )
 
