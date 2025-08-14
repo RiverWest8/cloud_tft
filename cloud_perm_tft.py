@@ -929,7 +929,7 @@ class PerAssetMetrics(pl.Callback):
             print(f"[WARN] Could not save validation predictions: {e}")
 
 class BiasWarmupCallback(pl.Callback):
-    def __init__(self, vol_loss, target_under=1.3, target_mean_bias=0.15, warmup_epochs=3):
+    def __init__(self, vol_loss, target_under=5, target_mean_bias=0.15, warmup_epochs=3):
         super().__init__()
         self.vol_loss = vol_loss
         self.target_under = float(target_under)
@@ -2013,7 +2013,7 @@ if __name__ == "__main__":
         # Fixed weights
     BASE_VOL_LOSS = AsymmetricQuantileLoss(
         quantiles=VOL_QUANTILES,      # you already defined VOL_QUANTILES above
-        underestimation_factor=1.35,  # gentle from epoch 0
+        underestimation_factor=5,  # gentle from epoch 0
         mean_bias_weight=0.15,        # mild mean-bias to fight persistent under
     )
     # Composite: base quantile loss + high-vol penalty (encoded space)
