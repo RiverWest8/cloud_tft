@@ -622,7 +622,7 @@ class PerAssetMetrics(pl.Callback):
             PerAssetMetrics callback behaviour. Assumes last dim is quantiles:
             [0.05, 0.165, 0.25, 0.50, 0.75, 0.835, 0.95]
             """
-            return vol_q[..., Q_50_IDX]
+            return vol_q[..., Q50_IDX]
 
         def _extract_heads(pred):
             """Return (p_vol, p_dir) as 1D tensors [B] on DEVICE.
