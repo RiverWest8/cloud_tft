@@ -282,7 +282,7 @@ class AsymmetricQuantileLoss(QuantileLoss):
     median prediction to match the target mean across the batch, helping
     correct persistent under-prediction on the decoded scale.
     """
-    def __init__(self, quantiles, underestimation_factor: float = 1,
+    def __init__(self, quantiles, underestimation_factor: float = 1.1115,
                  mean_bias_weight: float = 0.0, **kwargs):
         super().__init__(quantiles=quantiles, **kwargs)
         self.underestimation_factor = float(underestimation_factor)
