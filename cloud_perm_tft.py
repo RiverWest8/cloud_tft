@@ -1637,7 +1637,12 @@ if __name__ == "__main__":
     train_df = add_vol_lags(train_df)
     val_df   = add_vol_lags(val_df)
     test_df  = add_vol_lags(test_df)
-
+    # Fill NaNs in all lag columns before building the dataset
+    lag_cols = [col for col in train_df.columns if col.startswith("rv_lag_")]
+    train_df[lag_cols] = train_df[lag_cols].fillna(0)
+    val_df[lag_cols]   = val_df[lag_cols].fillna(0)
+    test_df[lag_cols]  = test_df[lag_cols].fillna(0)
+    
     # Assets to include
     keep_assets = ["BTC", "DOGE"]
 
