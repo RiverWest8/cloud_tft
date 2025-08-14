@@ -422,6 +422,7 @@ class CompositeVolMetric(Metric):
         main = self.base_loss(vol_q, target_vol)
 
         # 4) tail penalty on the median in encoded space (warmed up)
+        # 4) tail penalty on the median in encoded space (warmed up)
         try:
             thresh = torch.quantile(target_vol.detach(), self.high_q)
         except Exception:
@@ -2033,7 +2034,7 @@ if __name__ == "__main__":
     seed_everything(SEED, workers=True)
     # Loss and output_size for multi-target: realised_vol (quantile regression), direction (classification)
     print("▶ Building model …")
-    print(f"[LR] learning_rate={LR_OVERRIDE if LR_OVERRIDE is not None else 0.0003978}")
+    print(f"[LR] learning_rate={LR_OVERRIDE if LR_OVERRIDE is not None else 0.0001978}")
 
     es_cb = EarlyStopping(
         monitor="val_loss_decoded",  # MAE + RMSE (decoded)
@@ -2056,17 +2057,16 @@ if __name__ == "__main__":
     # Keep your VOL_QUANTILES as defined at the top
     BASE_VOL_LOSS = AsymmetricQuantileLoss(
         quantiles=VOL_QUANTILES,
-        underestimation_factor=1.05,  # was large → push down to ~1.05
-        mean_bias_weight=0.00,        # turn off for now (avoid extra upward bias)
+        underestimation_factor=1.0,     # no boost until model stabilises
+        mean_bias_weight=0.0,
         tail_q=0.90,
-        tail_weight=1.0,              # no extra weight in base loss
+        tail_weight=1.0,
     )
 
-    # Gentle, warmed tail penalty *only* on the median in encoded space
     VOL_LOSS = CompositeVolMetric(
         base_loss=BASE_VOL_LOSS,
         high_q=0.95,
-        penalty_weight=0.10,          # small; don’t drive the median up
+        penalty_weight=0.10,
         warmup_epochs=3
     )
 
@@ -2139,7 +2139,7 @@ if __name__ == "__main__":
         gradient_clip_val=GRADIENT_CLIP_VAL,
         num_sanity_val_steps = 0,
         logger=logger,
-        callbacks=[best_ckpt_cb, es_cb, bar_cb, metrics_cb, mirror_cb, lr_decay_cb, lr_cb, penalty_sched_cb, VolMetricWarmupCallback(VOL_LOSS),vol_warmup_cb],
+        callbacks=[best_ckpt_cb, es_cb, bar_cb, metrics_cb, mirror_cb, lr_decay_cb, lr_cb, VolMetricWarmupCallback(VOL_LOSS),vol_warmup_cb],
         check_val_every_n_epoch=int(ARGS.check_val_every_n_epoch),
         log_every_n_steps=int(ARGS.log_every_n_steps),
     )
