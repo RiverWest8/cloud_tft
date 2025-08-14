@@ -526,6 +526,34 @@ class PerAssetMetrics(pl.Callback):
         pv_dec = safe_decode_vol(pv.unsqueeze(-1), self.vol_norm, g.unsqueeze(-1)).squeeze(-1)
         pv_dec = torch.clamp(pv_dec, min=2e-7)  # avoid zero in QLIKE
 
+        print(f"[NORM DEBUG] mean(y_norm)={yv.mean().item():.6f} mean(p_norm)={pv.mean().item():.6f}")
+        mae_norm = (pv - yv).abs().mean().item()
+        print(f"[NORM DEBUG] MAE_norm={mae_norm:.6f}")
+
+        # Pre-inverse (destandardised but not yet expm1 / sinh)
+        center = getattr(self.vol_norm, "center", None)
+        scale  = getattr(self.vol_norm, "scale",  None)
+        g_long = g.long()
+
+        def _pick(arr, g):
+            if isinstance(arr, torch.Tensor):
+                return arr[g]
+            return arr  # fallback (scalar/None)
+
+        s_used = _pick(scale, g_long)  if scale  is not None else None
+        c_used = _pick(center, g_long) if center is not None else None
+
+        if s_used is None:
+            preinv_y = yv.mean().item()
+            preinv_p = pv.mean().item()
+            print("[PREINV DEBUG] scale=None -> using normalised values directly")
+        else:
+            preinv_y = (yv * s_used + (0.0 if c_used is None else c_used)).mean().item()
+            preinv_p = (pv * s_used + (0.0 if c_used is None else c_used)).mean().item()
+
+        print(f"[PREINV DEBUG] mean(preinv_y)={preinv_y:.6f} mean(preinv_p)={preinv_p:.6f}  # inverse applies expm1/asinh next")
+
+
         # Quick sanity prints (match overfit_test style)
         print("DEBUG transformation:", getattr(self.vol_norm, "transformation", None))
         print("DEBUG mean after decode:", yv_dec.mean().item())
