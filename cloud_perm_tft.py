@@ -337,97 +337,118 @@ import torch
 import torch.nn.functional as F
 
 class CompositeVolMetric(Metric):
+    """
+    Wrap a (quantile) volatility loss and add a warmup tail-penalty on the
+    top `high_q` fraction of targets to improve peak capture.
+    Operates entirely in the encoder/normalised (asinh) space.
+    """
     def __init__(self, base_loss: Metric, high_q: float = 0.90, penalty_weight: float = 0.5, warmup_epochs: int = 3):
         super().__init__()
         self.base_loss = base_loss
         self.high_q = float(high_q)
         self.penalty_weight = float(penalty_weight)
         self.warmup_epochs = int(warmup_epochs)
-        self.current_epoch = 0  # will be set by Lightning callback
+        self.current_epoch = 0  # updated by VolMetricWarmupCallback
 
+    # called by VolMetricWarmupCallback at the start of each epoch
     def update_epoch(self, epoch: int):
-        """Called by trainer each epoch to update warmup state."""
-        self.current_epoch = epoch
+        self.current_epoch = int(epoch)
 
+    # ---------- helpers ----------
     @staticmethod
     def _squeeze_pred_len(t: torch.Tensor) -> torch.Tensor:
-        if t.ndim >= 4 and t.size(1) == 1:
-            t = t.squeeze(1)
-        if t.ndim == 3 and t.size(1) == 1:
-            t = t.squeeze(1)
+        # remove prediction-length dimension if it's 1
+        if torch.is_tensor(t):
+            if t.ndim >= 4 and t.size(1) == 1:
+                t = t.squeeze(1)
+            if t.ndim == 3 and t.size(1) == 1:
+                t = t.squeeze(1)
         return t
 
     @staticmethod
     def _squeeze_last1(t: torch.Tensor) -> torch.Tensor:
-        if t.ndim == 2 and t.size(-1) == 1:
-            t = t[:, 0]
-        if t.ndim == 3 and t.size(-1) == 1:
-            t = t[..., 0]
+        # drop a trailing singleton last-dim
+        if torch.is_tensor(t):
+            if t.ndim == 2 and t.size(-1) == 1:
+                t = t[:, 0]
+            if t.ndim == 3 and t.size(-1) == 1:
+                t = t[..., 0]
         return t
 
     def _extract_decoder_vol_target(self, target):
-        if torch.is_tensor(target):
-            t = target
-        elif isinstance(target, (list, tuple)) and len(target) >= 2:
-            t = target[1]
-        else:
-            return None
-
+        """
+        PF passes (encoder_target, decoder_target) into MultiLoss metrics.
+        We want the decoder target for *volatility* (first column if multiple).
+        """
+        t = target
+        if isinstance(target, (list, tuple)) and len(target) >= 2:
+            t = target[1]  # decoder part
         if not torch.is_tensor(t):
             return None
-
         t = self._squeeze_pred_len(t)
         t = self._squeeze_last1(t)
-
+        # if decoder has multiple targets in columns, take col 0 (vol)
         if t.ndim == 2 and t.size(1) >= 1:
             t = t[:, 0]
-        return t
+        return t  # shape [B]
 
     def _extract_vol_quantiles(self, y_pred: torch.Tensor) -> torch.Tensor:
+        """
+        Return the volatility quantiles tensor with last-dim == K.
+        Accepts list/tuple (take first) or tensors shaped [B,1,K], [B,K], [B,D] (keep first K).
+        """
         K = len(VOL_QUANTILES)
         if isinstance(y_pred, (list, tuple)):
             y_pred = y_pred[0]
         t = self._squeeze_pred_len(y_pred)
-        if t.ndim >= 2 and t.size(-1) > K:
+        if torch.is_tensor(t) and t.ndim >= 2 and t.size(-1) > K:
             t = t[..., :K]
-        if t.ndim >= 2 and t.size(-1) == 1:
+        if torch.is_tensor(t) and t.ndim >= 2 and t.size(-1) == 1:
             t = t.repeat_interleave(K, dim=-1)
         return t
 
+    # ---------- Metric API ----------
     def forward(self, y_pred, target, **kwargs):
+        # 1) volatility quantile predictions [..., K]
         vol_q = self._extract_vol_quantiles(y_pred)
-        main = self.base_loss(vol_q, target)
 
+        # 2) decoder volatility target (encoded space) [...]
         target_vol = self._extract_decoder_vol_target(target)
         if target_vol is None or not torch.is_tensor(target_vol):
-            return main
+            # safe fallback to keep the graph alive
+            target_vol = vol_q[..., Q50_IDX].detach()
 
+        # 3) base loss (e.g., AsymmetricQuantileLoss) against the volatility target
+        main = self.base_loss(vol_q, target_vol)
+
+        # 4) tail penalty on the median in encoded space (warmed up)
         try:
             thresh = torch.quantile(target_vol.detach(), self.high_q)
         except Exception:
-            return main
-
+            return main  # conservative if quantile fails
         mask = target_vol > thresh
         if mask.any():
             med_enc = vol_q[..., Q50_IDX]
             penalty = F.mse_loss(med_enc[mask], target_vol[mask])
-
-            # Warmup scaling
-            scale = min(1.0, self.current_epoch / max(1, self.warmup_epochs))
+            scale = min(1.0, float(self.current_epoch) / max(1, self.warmup_epochs))
             return main + scale * self.penalty_weight * penalty
         return main
 
     def to_prediction(self, y_pred: torch.Tensor, **kwargs) -> torch.Tensor:
+        """
+        For logging/metrics, return a point forecast with last-dim==1 (median quantile).
+        """
         K = len(VOL_QUANTILES)
         if isinstance(y_pred, (list, tuple)):
             y_pred = y_pred[0]
         t = self._squeeze_pred_len(y_pred)
-        if t.ndim >= 2 and t.size(-1) > K:
+        if torch.is_tensor(t) and t.ndim >= 2 and t.size(-1) > K:
             t = t[..., :K]
-        if t.ndim == 1:
+        if torch.is_tensor(t) and t.ndim == 1:
             return t.unsqueeze(-1)
-        if t.ndim >= 2 and t.size(-1) >= (Q50_IDX + 1):
+        if torch.is_tensor(t) and t.ndim >= 2 and t.size(-1) >= (Q50_IDX + 1):
             return t[..., Q50_IDX].unsqueeze(-1)
+        # fallback: ensure shape [...,1]
         return t.mean(dim=-1, keepdim=True)
 
 
@@ -2104,8 +2125,9 @@ if __name__ == "__main__":
 
     penalty_sched_cb = UnderPenaltyScheduler(BASE_VOL_LOSS, start=1.35, end=3.0, ramp_epochs=8)
 
+    vol_warmup_cb = VolMetricWarmupCallback(VOL_LOSS)
 
-   
+
     
     lr_decay_cb = EpochLRDecay(gamma=0.95, start_epoch=15) 
 
@@ -2120,7 +2142,7 @@ if __name__ == "__main__":
         gradient_clip_val=GRADIENT_CLIP_VAL,
         num_sanity_val_steps = 0,
         logger=logger,
-        callbacks=[best_ckpt_cb, es_cb, bar_cb, metrics_cb, mirror_cb, lr_decay_cb, lr_cb, penalty_sched_cb, VolMetricWarmupCallback(VOL_LOSS)],
+        callbacks=[best_ckpt_cb, es_cb, bar_cb, metrics_cb, mirror_cb, lr_decay_cb, lr_cb, penalty_sched_cb, VolMetricWarmupCallback(VOL_LOSS),vol_warmup_cb],
         check_val_every_n_epoch=int(ARGS.check_val_every_n_epoch),
         log_every_n_steps=int(ARGS.log_every_n_steps),
     )
