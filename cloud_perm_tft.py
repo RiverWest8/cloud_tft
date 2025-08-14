@@ -523,9 +523,9 @@ class PerAssetMetrics(pl.Callback):
         )
 
         # --- Regime-dependent scaling ---
-        median_vol = yv_dec.median()
-        low_mask = yv_dec <= median_vol
-        high_mask = ~low_mask
+        q33, q66 = torch.quantile(yv_dec, torch.tensor([0.33, 0.66], device=yv_dec.device))
+        low_mask  = yv_dec <= q33
+        high_mask = yv_dec >= q66
 
         mean_p_low = pv_dec[low_mask].mean()
         mean_y_low = yv_dec[low_mask].mean()
