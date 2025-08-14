@@ -271,11 +271,11 @@ class AsymmetricQuantileLoss(QuantileLoss):
       • optional small mean-bias penalty on the median
     """
     def __init__(self, quantiles,
-                 underestimation_factor: float = 1.15,
-                 mean_bias_weight: float = 0.0,
-                 tail_q: float = 0.90,
-                 tail_weight: float = 3.0,
-                 **kwargs):
+             underestimation_factor: float = 1.6,
+             mean_bias_weight: float = 0.05,
+             tail_q: float = 0.90,
+             tail_weight: float = 4.0,
+             **kwargs):
         super().__init__(quantiles=quantiles, **kwargs)
         self.underestimation_factor = float(underestimation_factor)
         self.mean_bias_weight = float(mean_bias_weight)
@@ -337,6 +337,10 @@ import torch
 import torch.nn.functional as F
 
 
+from pytorch_forecasting.metrics.base_metrics import Metric
+import torch
+import torch.nn.functional as F
+
 class CompositeVolMetric(Metric):
     """
     Wrap a (quantile) volatility loss and add a warmup tail-penalty on the
@@ -345,9 +349,14 @@ class CompositeVolMetric(Metric):
     Includes a small mean-bias calibration in decoded space.
     """
 
-    def __init__(self, base_loss: Metric, high_q: float = 0.90,
-                 penalty_weight: float = 0.5, warmup_epochs: int = 3,
-                 cal_weight: float = 0.02):
+    def __init__(
+        self,
+        base_loss: Metric,
+        high_q: float = 0.95,
+        penalty_weight: float = 0.15,
+        warmup_epochs: int = 2,
+        cal_weight: float = 0.02,
+    ):
         super().__init__()
         self.base_loss = base_loss
         self.high_q = float(high_q)
@@ -356,8 +365,8 @@ class CompositeVolMetric(Metric):
         self.cal_weight = float(cal_weight)
         self.current_epoch = 0  # updated externally by a callback
 
+    # called by VolMetricWarmupCallback at the start of each epoch
     def update_epoch(self, epoch: int):
-        """Called by trainer each epoch to update warmup state."""
         self.current_epoch = int(epoch)
 
     # ---------- helpers ----------
@@ -387,9 +396,7 @@ class CompositeVolMetric(Metric):
         We want the decoder target for *volatility* (first column if multiple).
         """
         if isinstance(target, (list, tuple)) and len(target) >= 1:
-            # In PF MultiLoss, metrics see (decoder_target_for_this_idx, encoder_target)
-            # We want the decoder target for this variable
-            t = target[0]
+            t = target[0]  # decoder part for this metric
         else:
             t = target
         if not torch.is_tensor(t):
@@ -417,7 +424,7 @@ class CompositeVolMetric(Metric):
         return t
 
     @staticmethod
-    def _decode_asinh(x):
+    def _decode_asinh(x: torch.Tensor) -> torch.Tensor:
         # inverse of asinh used by GroupNormalizer when transformation="asinh"
         return torch.sinh(x)
 
@@ -436,20 +443,17 @@ class CompositeVolMetric(Metric):
         if target_vol.ndim > 1:
             target_vol = target_vol.squeeze(-1)
 
-        # 3) base loss (e.g., AsymmetricQuantileLoss) against the volatility target
-        # Ensure shapes expected by PF QuantileLoss: y_pred [B, 1, K], target [B, 1]
-        if vol_q.ndim == 2:
-            vol_q = vol_q.unsqueeze(1)
-        target_for_base = target_vol.unsqueeze(1) if target_vol.ndim == 1 else target_vol
-        main = self.base_loss(vol_q, target_for_base)
+        # 3) base loss (QuantileLoss-like) expects shapes [B, 1, K] & [B, 1]
+        vq = vol_q if vol_q.ndim == 3 else vol_q.unsqueeze(1)
+        tv = target_vol if target_vol.ndim == 2 else target_vol.unsqueeze(1)
+        main = self.base_loss(vq, tv)
 
-        # 4) Decode to real space for peak selection & mean-bias calibration
+        # 4) Decode to real space for peak selection & mild mean-bias calibration
         try:
             tgt_dec = self._decode_asinh(target_vol)
             med_dec = self._decode_asinh(vol_q[..., Q50_IDX])
         except Exception:
-            # If decode fails for some reason, skip the extra terms
-            return main
+            return main  # decoding failed; fall back to main only
 
         # Ensure 1D for masking/indexing
         if tgt_dec.ndim > 1:
@@ -618,7 +622,7 @@ class PerAssetMetrics(pl.Callback):
             PerAssetMetrics callback behaviour. Assumes last dim is quantiles:
             [0.05, 0.165, 0.25, 0.50, 0.75, 0.835, 0.95]
             """
-            return vol_q[..., 3]
+            return vol_q[..., Q_50_IDX]
 
         def _extract_heads(pred):
             """Return (p_vol, p_dir) as 1D tensors [B] on DEVICE.
@@ -1514,7 +1518,6 @@ def _evaluate_decoded_metrics(
     if vol_norm is None:
         vol_norm = _extract_norm_from_dataset(ds)
 
-    # ... rest of your function ...
     """
     Compute decoded MAE, RMSE, DirBCE and combined val_loss on up to max_batches.
     Returns: (mae, rmse, dir_bce, val_loss, n)
