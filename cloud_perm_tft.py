@@ -258,7 +258,7 @@ class AsymmetricQuantileLoss(QuantileLoss):
     median prediction to match the target mean across the batch, helping
     correct persistent under-prediction on the decoded scale.
     """
-    def __init__(self, quantiles, underestimation_factor: float = 1.115,
+    def __init__(self, quantiles, underestimation_factor: float = 1.1115,
                  mean_bias_weight: float = 0.0, **kwargs):
         super().__init__(quantiles=quantiles, **kwargs)
         self.underestimation_factor = float(underestimation_factor)
@@ -411,17 +411,16 @@ class PerAssetMetrics(pl.Callback):
               • tensor [B, 7] (vol only)
             """
             import torch
-
             def _to_median_q(t):
                 if t is None:
                     return None
                 if t.ndim == 3 and t.size(1) == 1:
-                    t = t.squeeze(1)  # [B,7]
-                if t.ndim == 2 and t.size(-1) >= 1:
-                    return t.mean(dim=-1)  # mean-of-quantiles
+                    t = t.squeeze(1)       # [B, K]
+                if t.ndim == 2 and t.size(-1) >= 4:
+                    return t[:, 3]         # index of 0.50 in VOL_QUANTILES
                 if t.ndim == 1:
                     return t
-                return t.reshape(t.size(0), -1)[:, 0]
+                return t.reshape(t.size(0), -1)[:, 0]  # last-ditch fallback
 
             def _to_dir_logit(t):
                 if t is None:
@@ -730,7 +729,7 @@ class PerAssetMetrics(pl.Callback):
             print(f"[WARN] Could not save validation predictions: {e}")
 
 class BiasWarmupCallback(pl.Callback):
-    def __init__(self, vol_loss, target_under=1.115, target_mean_bias=0.05, warmup_epochs=3):
+    def __init__(self, vol_loss, target_under=1.1115, target_mean_bias=0.05, warmup_epochs=3):
         super().__init__()
         self.vol_loss = vol_loss
         self.target_under = float(target_under)
@@ -1792,8 +1791,8 @@ if __name__ == "__main__":
 
 
     FIXED_VOL_WEIGHT = 1.0
-    FIXED_DIR_WEIGHT = 0.02
-    FIXED_MML_WEIGHT = 0.2
+    FIXED_DIR_WEIGHT = 0.0
+ 
 
     tft = TemporalFusionTransformer.from_dataset(
         training_dataset,
@@ -1829,12 +1828,7 @@ if __name__ == "__main__":
         dirpath=str(LOCAL_CKPT_DIR),
     )
 
-    bias_cb = BiasWarmupCallback(
-    vol_loss=VOL_LOSS,
-    target_under=1.115,
-    target_mean_bias=0.00,
-    warmup_epochs=0,
-    )
+
 
    
     
@@ -1851,7 +1845,7 @@ if __name__ == "__main__":
         gradient_clip_val=GRADIENT_CLIP_VAL,
         num_sanity_val_steps = 0,
         logger=logger,
-        callbacks=[lr_cb, best_ckpt_cb, es_cb, bar_cb, metrics_cb, mirror_cb, bias_cb, lr_decay_cb],
+        callbacks=[best_ckpt_cb, es_cb, bar_cb, metrics_cb, mirror_cb, lr_decay_cb],
         check_val_every_n_epoch=int(ARGS.check_val_every_n_epoch),
         log_every_n_steps=int(ARGS.log_every_n_steps),
     )
