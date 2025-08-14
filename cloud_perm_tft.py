@@ -313,35 +313,135 @@ class AsymmetricQuantileLoss(QuantileLoss):
 from pytorch_forecasting.metrics.base_metrics import Metric
 
 class CompositeVolMetric(Metric):
-    def __init__(self, base_loss, high_q=0.90, penalty_weight=0.5):
-        super().__init__()  # MUST be first
-
+    """
+    Wrap a quantile loss for volatility and add a small extra penalty on the
+    high-volatility tail (top decile) to fight under-prediction.
+    Operates entirely in the **encoded (asinh)** space.
+    """
+    def __init__(self, base_loss: Metric, high_q: float = 0.90, penalty_weight: float = 0.5):
+        super().__init__()  # must be first
         self.base_loss = base_loss
-        self.high_q = high_q
-        self.penalty_weight = penalty_weight
-    def forward(self, y_pred, target, **kwargs):
-        # PF passes multi-target as tuple (vol, dir) — pick vol
-        if isinstance(target, tuple):
-            target_tensor = target[0]
+        self.high_q = float(high_q)
+        self.penalty_weight = float(penalty_weight)
+
+    # --- helpers ---
+    @staticmethod
+    def _squeeze_pred_len(t: torch.Tensor) -> torch.Tensor:
+        # remove pred_len dimension if it's 1
+        if t.ndim >= 4 and t.size(1) == 1:
+            t = t.squeeze(1)
+        if t.ndim == 3 and t.size(1) == 1:
+            t = t.squeeze(1)
+        return t
+
+    @staticmethod
+    def _squeeze_last1(t: torch.Tensor) -> torch.Tensor:
+        # drop a trailing singleton last-dim
+        if t.ndim == 2 and t.size(-1) == 1:
+            t = t[:, 0]
+        if t.ndim == 3 and t.size(-1) == 1:
+            t = t[..., 0]
+        return t
+
+    def _extract_decoder_vol_target(self, target):
+        """
+        PF passes (encoder_target, decoder_target) to each metric in MultiLoss.
+        We want the **decoder** target for volatility. If decoder is [B, n_targets],
+        we take column 0 (vol).
+        """
+        if torch.is_tensor(target):
+            t = target
+        elif isinstance(target, (list, tuple)) and len(target) >= 2:
+            t = target[1]  # decoder target
         else:
-            target_tensor = target
+            return None
 
-        # Guard if target_tensor is None
-        if target_tensor is None:
-            return self.base_loss(y_pred, target, **kwargs)
+        if not torch.is_tensor(t):
+            return None
 
-        # Base loss
-        main_loss = self.base_loss(y_pred, target, **kwargs)
+        t = self._squeeze_pred_len(t)
+        t = self._squeeze_last1(t)
 
-        # Penalty part
-        with torch.no_grad():
-            thresh = torch.quantile(target_tensor.detach(), self.high_q)
+        # If decoder carries both targets in columns, take the first (vol)
+        if t.ndim == 2 and t.size(1) >= 1:
+            t = t[:, 0]
+        return t  # shape [B] (or [B,] after squeezes)
 
-        mask = target_tensor > thresh
-        penalty = (y_pred[..., 3] - target_tensor).abs()  # example: pick median quantile
-        penalty = penalty[mask].mean() if mask.any() else torch.tensor(0.0, device=penalty.device)
+    def _extract_vol_quantiles(self, y_pred: torch.Tensor) -> torch.Tensor:
+        """
+        Ensure we operate on the volatility **quantiles** only.
+        Accepts shapes like:
+          [B, pred_len=1, K], [B, K], [B, 1, K]
+        If the last dim includes extra columns (e.g., direction appended),
+        we keep only the first K = len(VOL_QUANTILES).
+        """
+        K = len(VOL_QUANTILES)
 
-        return main_loss + self.penalty_weight * penalty    
+        # list/tuple case (PF sometimes returns [vol_head, dir_head])
+        if isinstance(y_pred, (list, tuple)):
+            y_pred = y_pred[0]
+
+        t = y_pred
+        t = self._squeeze_pred_len(t)
+
+        # If we got a 2D or 3D tensor with more than K cols, keep the first K as quantiles
+        if t.ndim >= 2 and t.size(-1) > K:
+            t = t[..., :K]
+
+        # If somehow we got a single column, treat it as a point (replicate to K for base_loss)
+        if t.ndim >= 2 and t.size(-1) == 1:
+            t = t.repeat_interleave(K, dim=-1)
+
+        return t  # expected last dim == K
+
+    # --- Metric API ---
+    def forward(self, y_pred, target, **kwargs):
+        # 1) Slice volatility quantiles
+        vol_q = self._extract_vol_quantiles(y_pred)
+
+        # 2) Base quantile loss (do NOT pass PF kwargs to base loss)
+        main = self.base_loss(vol_q, target)
+
+        # 3) High-vol penalty in encoded space
+        target_vol = self._extract_decoder_vol_target(target)
+        if target_vol is None or not torch.is_tensor(target_vol):
+            return main
+
+        try:
+            thresh = torch.quantile(target_vol.detach(), self.high_q)
+        except Exception:
+            return main  # be conservative if quantile fails (e.g., all-NaN edge case)
+
+        mask = target_vol > thresh
+        if mask.any():
+            # median (0.50) quantile index
+            med_enc = vol_q[..., Q50_IDX]
+            penalty = F.mse_loss(med_enc[mask], target_vol[mask])
+            return main + self.penalty_weight * penalty
+        return main
+
+    def to_prediction(self, y_pred: torch.Tensor, **kwargs) -> torch.Tensor:
+        """
+        Produce a **point** prediction for logging/metrics:
+        take the median (0.50) quantile and return shape [..., 1].
+        This satisfies PF's `y_pred.size(-1) == 1` assertion.
+        """
+        K = len(VOL_QUANTILES)
+
+        if isinstance(y_pred, (list, tuple)):
+            y_pred = y_pred[0]
+
+        t = self._squeeze_pred_len(y_pred)
+        if t.ndim >= 2 and t.size(-1) > K:
+            t = t[..., :K]
+        if t.ndim == 1:
+            # if already a point, return with trailing singleton
+            return t.unsqueeze(-1)
+        if t.ndim >= 2 and t.size(-1) >= (Q50_IDX + 1):
+            med = t[..., Q50_IDX].unsqueeze(-1)
+            return med
+        # fallback: last-ditch ensure final dim==1
+        return t.mean(dim=-1, keepdim=True)
 
 
 
