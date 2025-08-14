@@ -1195,6 +1195,16 @@ def add_calendar_features(df: pd.DataFrame) -> pd.DataFrame:
     df["Is_Weekend"] = (dow >= 5).astype("int8")
     return df
 
+def add_vol_lags(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.sort_values(GROUP_ID + [TIME_COL]).copy()
+    g = df.groupby(GROUP_ID[0], observed=True)
+    # 30-min bars: 1..48 steps (~1 day), 96 (~2 days)
+    for k in [1, 2, 4, 8, 16, 24, 48, 96]:
+        df[f"rv_lag_{k}"] = g["realised_vol"].shift(k)
+    for w in [4, 16, 48, 96]:
+        df[f"rv_rollmean_{w}"] = g["realised_vol"].rolling(w, min_periods=1).mean().reset_index(level=0, drop=True)
+    return df
+
 # -----------------------------------------------------------------------
 # Fast subset helper (keeps temporal structure per asset when possible)
 # -----------------------------------------------------------------------
@@ -1624,11 +1634,14 @@ if __name__ == "__main__":
     train_df = add_calendar_features(train_df)
     val_df   = add_calendar_features(val_df)
     test_df  = add_calendar_features(test_df)
+    train_df = add_vol_lags(train_df)
+    val_df   = add_vol_lags(val_df)
+    test_df  = add_vol_lags(test_df)
 
 
-    train_df = train_df[train_df["asset"] == "BTC"].reset_index(drop=True)
-    val_df   = val_df[val_df["asset"] == "BTC"].reset_index(drop=True)
-    test_df  = test_df[test_df["asset"] == "BTC"].reset_index(drop=True)
+    train_df = train_df[train_df["asset"] == "BTC","ETH"].reset_index(drop=True)
+    val_df   = val_df[val_df["asset"] == "BTC","ETH"].reset_index(drop=True)
+    test_df  = test_df[test_df["asset"] == "BTC","ETH"].reset_index(drop=True)
 
 
     # Optional quick-run subsetting for speed
@@ -1824,7 +1837,7 @@ if __name__ == "__main__":
         # ---- Build losses as named variables so callbacks can tune them ----
     VOL_LOSS = AsymmetricQuantileLoss(
         quantiles=[0.05, 0.165, 0.25, 0.5, 0.75, 0.835, 0.95],
-        underestimation_factor=5,   # final target (will be warmed up)
+        underestimation_factor=1.0,   # final target (will be warmed up)
         mean_bias_weight=0.05,        # will be 0 during warmup, then enabled
     )
     # one-off in your data prep (TRAIN split)
@@ -1877,7 +1890,7 @@ if __name__ == "__main__":
 
     bias_cb = BiasWarmupCallback(
         vol_loss=VOL_LOSS,
-        target_under=10,        # smaller than 3.0 to avoid overshoot
+        target_under=1,        # smaller than 3.0 to avoid overshoot
         target_mean_bias=0.2,    # add a mild mean-bias penalty
         warmup_epochs=5
     )
