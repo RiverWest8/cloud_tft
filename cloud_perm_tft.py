@@ -2052,41 +2052,38 @@ if __name__ == "__main__":
     mirror_cb = MirrorCheckpoints()
     from pytorch_forecasting.metrics import MultiLoss
 
-        # Fixed weights
-    BASE_VOL_LOSS = AsymmetricQuantileLoss(
-        quantiles=VOL_QUANTILES,      # you already defined VOL_QUANTILES above
-        underestimation_factor=1.15,  # gentle from epoch 0
-        mean_bias_weight=0.15,        # mild mean-bias to fight persistent under
-        tail_q = 0.9,
-        tail_weight = 3.0,
-    )
-    # Composite: base quantile loss + high-vol penalty (encoded space)
+    # ---- Losses (place where you currently build VOL_LOSS / DIR_LOSS) ----
+    # Keep your VOL_QUANTILES as defined at the top
     BASE_VOL_LOSS = AsymmetricQuantileLoss(
         quantiles=VOL_QUANTILES,
-        underestimation_factor=1.15,  # start gentle
-        mean_bias_weight=0.15,
-        tail_q=0.9,
-        tail_weight=3.0,
+        underestimation_factor=1.05,  # was large → push down to ~1.05
+        mean_bias_weight=0.00,        # turn off for now (avoid extra upward bias)
+        tail_q=0.90,
+        tail_weight=1.0,              # no extra weight in base loss
     )
 
+    # Gentle, warmed tail penalty *only* on the median in encoded space
     VOL_LOSS = CompositeVolMetric(
-        BASE_VOL_LOSS,
+        base_loss=BASE_VOL_LOSS,
         high_q=0.95,
-        penalty_weight=0.1,
-        warmup_epochs=2
+        penalty_weight=0.10,          # small; don’t drive the median up
+        warmup_epochs=3
     )
+
+    # Direction loss unchanged
+    DIR_LOSS = LabelSmoothedBCE(smoothing=0.05, pos_weight=pos_weight)
+
+
     # one-off in your data prep (TRAIN split)
     counts = train_df["direction"].value_counts()
     n_pos = counts.get(1, 1)
     n_neg = counts.get(0, 1)
-    pos_weight = 1.1
+    pos_weight = 1.0
 
-    # then build the loss with:
-    DIR_LOSS = LabelSmoothedBCE(smoothing=0.05, pos_weight=pos_weight)
 
 
     FIXED_VOL_WEIGHT = 1.0
-    FIXED_DIR_WEIGHT = 0.01
+    FIXED_DIR_WEIGHT = 0.1
  
 
     tft = TemporalFusionTransformer.from_dataset(
