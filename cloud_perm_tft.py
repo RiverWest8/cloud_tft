@@ -1693,7 +1693,7 @@ if __name__ == "__main__":
             target_normalizer = MultiNormalizer([
                 GroupNormalizer(
                     groups=GROUP_ID,
-                    center=False,
+                    center=True,
                     scale_by_group= True,
                     transformation="log1p",
                 ),
