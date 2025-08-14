@@ -336,26 +336,25 @@ from pytorch_forecasting.metrics.base_metrics import Metric
 import torch
 import torch.nn.functional as F
 
+
 class CompositeVolMetric(Metric):
     """
-    Wraps a base volatility loss (e.g., quantile loss) and adds a warmup penalty
-    on the top `high_q` fraction of targets to improve peak capture.
-    Tail penalty is applied in DECODED space to reflect true volatility errors.
+    Wrap a (quantile) volatility loss and add a warmup tail-penalty on the
+    top `high_q` fraction of targets to improve peak capture.
+    Peak selection is done in decoded space to avoid over-penalising.
     """
-    def __init__(self, base_loss: Metric, vol_norm=None, high_q: float = 0.90,
-                 penalty_weight: float = 0.5, warmup_epochs: int = 3):
+    def __init__(self, base_loss: Metric, high_q: float = 0.90, penalty_weight: float = 0.5, warmup_epochs: int = 3):
         super().__init__()
         self.base_loss = base_loss
-        self.vol_norm = vol_norm  # for decoding
         self.high_q = float(high_q)
         self.penalty_weight = float(penalty_weight)
         self.warmup_epochs = int(warmup_epochs)
-        self.current_epoch = 0  # updated by VolMetricWarmupCallback
+        self.current_epoch = 0  # updated externally by a callback
 
     def update_epoch(self, epoch: int):
+        """Called by trainer each epoch to update warmup state."""
         self.current_epoch = int(epoch)
 
-    # ---------- helpers ----------
     @staticmethod
     def _squeeze_pred_len(t: torch.Tensor) -> torch.Tensor:
         if torch.is_tensor(t):
@@ -375,9 +374,10 @@ class CompositeVolMetric(Metric):
         return t
 
     def _extract_decoder_vol_target(self, target):
-        t = target
         if isinstance(target, (list, tuple)) and len(target) >= 2:
-            t = target[1]
+            t = target[1]  # decoder target
+        else:
+            t = target
         if not torch.is_tensor(t):
             return None
         t = self._squeeze_pred_len(t)
@@ -397,40 +397,30 @@ class CompositeVolMetric(Metric):
             t = t.repeat_interleave(K, dim=-1)
         return t
 
-    # ---------- Metric API ----------
     def forward(self, y_pred, target, **kwargs):
-        # Quantile predictions
         vol_q = self._extract_vol_quantiles(y_pred)
-
-        # Vol target (encoded)
         target_vol = self._extract_decoder_vol_target(target)
+
         if target_vol is None or not torch.is_tensor(target_vol):
             target_vol = vol_q[..., Q50_IDX].detach()
 
-        # Base loss in encoded space
+        # Base quantile loss
         main = self.base_loss(vol_q, target_vol)
 
-        # Tail penalty in DECODED space
+        # --- Tail penalty in DECODED space ---
         try:
-            thresh_enc = torch.quantile(target_vol.detach(), self.high_q)
+            tgt_dec = decode_asinh(target_vol)
+            med_dec = decode_asinh(vol_q[..., Q50_IDX])
         except Exception:
             return main
 
-        med_enc = vol_q[..., Q50_IDX]
-
-        # Decode to real vol scale
         try:
-            med_dec = safe_decode_vol(med_enc.unsqueeze(-1), self.vol_norm, None).squeeze(-1)
-            tgt_dec = safe_decode_vol(target_vol.unsqueeze(-1), self.vol_norm, None).squeeze(-1)
-            thresh_dec = safe_decode_vol(thresh_enc.unsqueeze(-1), self.vol_norm, None).squeeze(-1)
+            thresh_dec = torch.quantile(tgt_dec.detach(), self.high_q)
         except Exception:
-            # Fallback if decode fails
-            med_dec, tgt_dec, thresh_dec = med_enc, target_vol, thresh_enc
+            return main
 
-        mask = tgt_dec > thresh_dec
-        under_mask = med_dec < tgt_dec
-        mask = mask & under_mask
-
+        # Only penalise peaks where we underpredict
+        mask = (tgt_dec > thresh_dec) & (med_dec < tgt_dec)
         if mask.any():
             penalty = F.mse_loss(med_dec[mask], tgt_dec[mask])
             scale = min(1.0, self.current_epoch / max(1, self.warmup_epochs))
