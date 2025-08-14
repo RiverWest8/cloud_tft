@@ -1677,7 +1677,7 @@ if __name__ == "__main__":
                     groups=GROUP_ID,
                     center=False,
                     scale_by_group= True,
-                    transformation="asinh",
+                    transformation="log1p",
                 ),
                 TorchNormalizer(method="identity", center=False),   # direction
             ]),
@@ -1849,7 +1849,7 @@ if __name__ == "__main__":
 
    
     
-    lr_decay_cb = EpochLRDecay(gamma=0.95, start_epoch=7) 
+    lr_decay_cb = EpochLRDecay(gamma=0.95, start_epoch=15) 
 
     # ----------------------------
     # Trainer instance
