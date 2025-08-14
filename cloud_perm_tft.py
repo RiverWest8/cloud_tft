@@ -1788,7 +1788,7 @@ if __name__ == "__main__":
         attention_head_size=4,
         dropout=0.0833704625250354, #0.0833704625250354,
         hidden_continuous_size=32,
-        learning_rate=(LR_OVERRIDE if LR_OVERRIDE is not None else 0.0015), #0.0019 0017978
+        learning_rate=(LR_OVERRIDE if LR_OVERRIDE is not None else 0.00115), #0.0019 0017978
         optimizer="AdamW",
         optimizer_params={"weight_decay": WEIGHT_DECAY},
         output_size=[7, 1],  # 7 quantiles + 1 logit
@@ -1819,10 +1819,10 @@ if __name__ == "__main__":
     bias_cb = BiasWarmupCallback(
     vol_loss=VOL_LOSS,
     target_under=1.115,
-    target_mean_bias=0.05,
-    warmup_epochs=3,
+    target_mean_bias=0.00,
+    warmup_epochs=0,
     )
-    lr_decay_cb = EpochLRDecay(gamma=0.95, start_epoch=3) 
+    lr_decay_cb = EpochLRDecay(gamma=0.95, start_epoch=0) 
 
     # ----------------------------
     # Trainer instance
