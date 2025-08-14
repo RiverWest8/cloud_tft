@@ -2071,6 +2071,7 @@ if __name__ == "__main__":
     )
 
     # Direction loss unchanged
+    pos_weight = 1.0
     DIR_LOSS = LabelSmoothedBCE(smoothing=0.05, pos_weight=pos_weight)
 
 
@@ -2078,7 +2079,6 @@ if __name__ == "__main__":
     counts = train_df["direction"].value_counts()
     n_pos = counts.get(1, 1)
     n_neg = counts.get(0, 1)
-    pos_weight = 1.0
 
 
 
