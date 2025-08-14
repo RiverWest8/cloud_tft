@@ -1638,10 +1638,27 @@ if __name__ == "__main__":
     val_df   = add_vol_lags(val_df)
     test_df  = add_vol_lags(test_df)
 
+    # Assets to include
+    keep_assets = ["BTC", "DOGE"]
 
-    train_df = train_df[train_df["asset"] == "BTC","DOGE"].reset_index(drop=True)
-    val_df   = val_df[val_df["asset"] == "BTC","DOGE"].reset_index(drop=True)
-    test_df  = test_df[test_df["asset"] == "BTC","DOGE"].reset_index(drop=True)
+    # Filter & sort
+    train_df = (
+        train_df[train_df["asset"].isin(keep_assets)]
+        .sort_values(["asset", TIME_COL])
+        .reset_index(drop=True)
+    )
+
+    val_df = (
+        val_df[val_df["asset"].isin(keep_assets)]
+        .sort_values(["asset", TIME_COL])
+        .reset_index(drop=True)
+    )
+
+    test_df = (
+        test_df[test_df["asset"].isin(keep_assets)]
+        .sort_values(["asset", TIME_COL])
+        .reset_index(drop=True)
+    )
 
 
     # Optional quick-run subsetting for speed
