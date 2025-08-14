@@ -769,7 +769,7 @@ class MedianMSELoss(nn.Module):
         return F.mse_loss(q50, y_true)
 
 class EpochLRDecay(pl.Callback):
-    def __init__(self, gamma: float = 0.95, start_epoch: int = 1):
+    def __init__(self, gamma: float = 1, start_epoch: int = 1):
         """
         gamma: multiplicative decay per epoch (0.95 = -5%/epoch)
         start_epoch: begin decaying after this epoch index (0-based)
@@ -1778,14 +1778,21 @@ if __name__ == "__main__":
         # ---- Build losses as named variables so callbacks can tune them ----
     VOL_LOSS = AsymmetricQuantileLoss(
         quantiles=[0.05, 0.165, 0.25, 0.5, 0.75, 0.835, 0.95],
-        underestimation_factor=2.015,   # final target (will be warmed up)
+        underestimation_factor=3.0,   # final target (will be warmed up)
         mean_bias_weight=0.00,        # will be 0 during warmup, then enabled
     )
-    DIR_LOSS = LabelSmoothedBCE(smoothing=0.05)
+    # one-off in your data prep (TRAIN split)
+    counts = train_df["direction"].value_counts()
+    n_pos = counts.get(1, 1)
+    n_neg = counts.get(0, 1)
+    pos_weight = float(n_neg / n_pos)
+
+    # then build the loss with:
+    DIR_LOSS = LabelSmoothedBCE(smoothing=0.05, pos_weight=pos_weight)
 
 
     FIXED_VOL_WEIGHT = 1.0
-    FIXED_DIR_WEIGHT = 0.001
+    FIXED_DIR_WEIGHT = 0.02
     FIXED_MML_WEIGHT = 0.2
 
     tft = TemporalFusionTransformer.from_dataset(
@@ -1798,7 +1805,7 @@ if __name__ == "__main__":
         optimizer="AdamW",
         optimizer_params={"weight_decay": WEIGHT_DECAY},
         output_size=[7, 1],  # 7 quantiles + 1 logit
-        loss=MultiLoss([VOL_LOSS, DIR_LOSS, MedianMSELoss()], weights=[FIXED_VOL_WEIGHT, FIXED_DIR_WEIGHT, FIXED_MML_WEIGHT]),
+        loss=MultiLoss([VOL_LOSS, DIR_LOSS], weights=[FIXED_VOL_WEIGHT, FIXED_DIR_WEIGHT]),
         logging_metrics=[],
         log_interval=50,
         log_val_interval=10,
@@ -1831,7 +1838,7 @@ if __name__ == "__main__":
 
    
     
-    lr_decay_cb = EpochLRDecay(gamma=0.95, start_epoch=0) 
+    lr_decay_cb = EpochLRDecay(gamma=0.95, start_epoch=10) 
 
     # ----------------------------
     # Trainer instance
