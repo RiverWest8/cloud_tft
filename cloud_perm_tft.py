@@ -114,19 +114,6 @@ Q50_IDX = VOL_QUANTILES.index(0.50)  # -> 3
 
 from pytorch_forecasting.data.encoders import GroupNormalizer
 
-if ("log1p" not in GroupNormalizer.TRANSFORMATIONS
-    or not isinstance(GroupNormalizer.TRANSFORMATIONS["log1p"], dict)):
-    GroupNormalizer.TRANSFORMATIONS["log1p"] = {
-        "forward": lambda x: torch.log1p(x) if torch.is_tensor(x) else np.log1p(x),
-        "inverse": lambda x: torch.expm1(x) if torch.is_tensor(x) else np.expm1(x),
-    }
-if hasattr(GroupNormalizer, "INVERSE_TRANSFORMATIONS"):
-    GroupNormalizer.INVERSE_TRANSFORMATIONS.setdefault(
-        "log1p",
-        lambda x: torch.expm1(x) if torch.is_tensor(x) else np.expm1(x),
-    )
-
-
 if ("asinh" not in GroupNormalizer.TRANSFORMATIONS
     or not isinstance(GroupNormalizer.TRANSFORMATIONS["asinh"], dict)):
     GroupNormalizer.TRANSFORMATIONS["asinh"] = {
@@ -175,8 +162,6 @@ def manual_inverse_transform_groupnorm(normalizer, y: torch.Tensor, group_ids: t
     tfm = getattr(normalizer, "transformation", None)
     if tfm == "asinh":
         x = torch.sinh(x)
-    elif tfm == "log1p":
-        x = torch.expm1(x)
     elif tfm in (None, "identity"):
         pass
     else:
@@ -190,12 +175,10 @@ def manual_inverse_transform_groupnorm(normalizer, y: torch.Tensor, group_ids: t
 
 @torch.no_grad()
 def safe_decode_vol(y: torch.Tensor, normalizer, group_ids: torch.Tensor | None):
-    tfm = getattr(normalizer, "transformation", None)
-    # Prefer our known-correct path for these transforms
-    if tfm in ("log1p", "asinh"):
-        return manual_inverse_transform_groupnorm(normalizer, y, group_ids)
-
-    # Otherwise try the library decode/inverse then fall back
+    """
+    Try normalizer.decode(), then inverse_transform(), else manual fallback.
+    y is expected as [B,1].
+    """
     try:
         return normalizer.decode(y, group_ids=group_ids)
     except Exception:
@@ -526,34 +509,6 @@ class PerAssetMetrics(pl.Callback):
         pv_dec = safe_decode_vol(pv.unsqueeze(-1), self.vol_norm, g.unsqueeze(-1)).squeeze(-1)
         pv_dec = torch.clamp(pv_dec, min=2e-7)  # avoid zero in QLIKE
 
-        print(f"[NORM DEBUG] mean(y_norm)={yv.mean().item():.6f} mean(p_norm)={pv.mean().item():.6f}")
-        mae_norm = (pv - yv).abs().mean().item()
-        print(f"[NORM DEBUG] MAE_norm={mae_norm:.6f}")
-
-        # Pre-inverse (destandardised but not yet expm1 / sinh)
-        center = getattr(self.vol_norm, "center", None)
-        scale  = getattr(self.vol_norm, "scale",  None)
-        g_long = g.long()
-
-        def _pick(arr, g):
-            if isinstance(arr, torch.Tensor):
-                return arr[g]
-            return arr  # fallback (scalar/None)
-
-        s_used = _pick(scale, g_long)  if scale  is not None else None
-        c_used = _pick(center, g_long) if center is not None else None
-
-        if s_used is None:
-            preinv_y = yv.mean().item()
-            preinv_p = pv.mean().item()
-            print("[PREINV DEBUG] scale=None -> using normalised values directly")
-        else:
-            preinv_y = (yv * s_used + (0.0 if c_used is None else c_used)).mean().item()
-            preinv_p = (pv * s_used + (0.0 if c_used is None else c_used)).mean().item()
-
-        print(f"[PREINV DEBUG] mean(preinv_y)={preinv_y:.6f} mean(preinv_p)={preinv_p:.6f}  # inverse applies expm1/asinh next")
-
-
         # Quick sanity prints (match overfit_test style)
         print("DEBUG transformation:", getattr(self.vol_norm, "transformation", None))
         print("DEBUG mean after decode:", yv_dec.mean().item())
@@ -715,9 +670,8 @@ class PerAssetMetrics(pl.Callback):
             pd_cpu = torch.cat(self._pd_dev).detach().cpu() if self._pd_dev else None
             # decode vol back to physical scale
             if g_cpu is not None and yv_cpu is not None and pv_cpu is not None:
-                yv_dec = safe_decode_vol(yv_cpu.unsqueeze(-1), self.vol_norm,  g_cpu.unsqueeze(-1)).squeeze(-1)
-                pv_dec = safe_decode_vol(pv_cpu.unsqueeze(-1), self.vol_norm,  g_cpu.unsqueeze(-1)).squeeze(-1)
-                pv_dec = torch.clamp(pv_dec, min=2e-7)
+                yv_dec = self.vol_norm.decode(yv_cpu.unsqueeze(-1), group_ids=g_cpu.unsqueeze(-1)).squeeze(-1)
+                pv_dec = self.vol_norm.decode(pv_cpu.unsqueeze(-1), group_ids=g_cpu.unsqueeze(-1)).squeeze(-1)
                 # map group id -> name
                 assets = [self.id_to_name.get(int(i), str(int(i))) for i in g_cpu.tolist()]
                 # time index (may be missing)
@@ -1721,9 +1675,9 @@ if __name__ == "__main__":
             target_normalizer = MultiNormalizer([
                 GroupNormalizer(
                     groups=GROUP_ID,
-                    center=True,
+                    center=False,
                     scale_by_group= True,
-                    transformation="log1p",
+                    transformation="asinh",
                 ),
                 TorchNormalizer(method="identity", center=False),   # direction
             ]),
