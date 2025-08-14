@@ -1664,7 +1664,7 @@ if __name__ == "__main__":
             target_normalizer = MultiNormalizer([
                 GroupNormalizer(
                     groups=GROUP_ID,
-                    center=True,
+                    center=False,
                     scale_by_group= True,
                     transformation="asinh",
                 ),
@@ -1777,8 +1777,8 @@ if __name__ == "__main__":
         # ---- Build losses as named variables so callbacks can tune them ----
     VOL_LOSS = AsymmetricQuantileLoss(
         quantiles=[0.05, 0.165, 0.25, 0.5, 0.75, 0.835, 0.95],
-        underestimation_factor=3.0,   # final target (will be warmed up)
-        mean_bias_weight=0.00,        # will be 0 during warmup, then enabled
+        underestimation_factor=1.15,   # final target (will be warmed up)
+        mean_bias_weight=0.001,        # will be 0 during warmup, then enabled
     )
     # one-off in your data prep (TRAIN split)
     counts = train_df["direction"].value_counts()
@@ -1800,7 +1800,7 @@ if __name__ == "__main__":
         attention_head_size=4,
         dropout=0.0833704625250354, #0.0833704625250354,
         hidden_continuous_size=32,
-        learning_rate=(LR_OVERRIDE if LR_OVERRIDE is not None else 0.00115), #0.0019 0017978
+        learning_rate=(LR_OVERRIDE if LR_OVERRIDE is not None else 0.000815), #0.0019 0017978
         optimizer="AdamW",
         optimizer_params={"weight_decay": WEIGHT_DECAY},
         output_size=[7, 1],  # 7 quantiles + 1 logit
