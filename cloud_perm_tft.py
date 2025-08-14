@@ -2031,8 +2031,8 @@ if __name__ == "__main__":
         quantiles=VOL_QUANTILES,      # you already defined VOL_QUANTILES above
         underestimation_factor=1.15,  # gentle from epoch 0
         mean_bias_weight=0.15,        # mild mean-bias to fight persistent under
-        tail_q = 0.9
-        tail_weight = 3.0
+        tail_q = 0.9,
+        tail_weight = 3.0,
     )
     # Composite: base quantile loss + high-vol penalty (encoded space)
     BASE_VOL_LOSS = QuantileLoss(quantiles=[0.1, 0.5, 0.9])
