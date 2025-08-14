@@ -313,6 +313,13 @@ class AsymmetricQuantileLoss(QuantileLoss):
 from pytorch_forecasting.metrics.base_metrics import Metric
 
 class CompositeVolMetric(Metric):
+    def __init__(self, base_loss, high_q=0.90, penalty_weight=0.5):
+        super().__init__()  # MUST be first
+
+        self.base_loss = base_loss
+        self.high_q = high_q
+        self.penalty_weight = penalty_weight
+        
     def forward(self, y_pred, target, **kwargs):
         # PF passes target as tuple for multi-target: (encoder_target, decoder_target)
         if isinstance(target, tuple):
