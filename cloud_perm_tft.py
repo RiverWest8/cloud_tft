@@ -258,7 +258,7 @@ class AsymmetricQuantileLoss(QuantileLoss):
     median prediction to match the target mean across the batch, helping
     correct persistent under-prediction on the decoded scale.
     """
-    def __init__(self, quantiles, underestimation_factor: float = 3,
+    def __init__(self, quantiles, underestimation_factor: float = 1.115,
                  mean_bias_weight: float = 0.0, **kwargs):
         super().__init__(quantiles=quantiles, **kwargs)
         self.underestimation_factor = float(underestimation_factor)
@@ -1773,7 +1773,7 @@ if __name__ == "__main__":
         # ---- Build losses as named variables so callbacks can tune them ----
     VOL_LOSS = AsymmetricQuantileLoss(
         quantiles=[0.05, 0.165, 0.25, 0.5, 0.75, 0.835, 0.95],
-        underestimation_factor=3,   # final target (will be warmed up)
+        underestimation_factor=1.115,   # final target (will be warmed up)
         mean_bias_weight=0.00,        # will be 0 during warmup, then enabled
     )
     DIR_LOSS = LabelSmoothedBCE(smoothing=0.05)
@@ -1820,9 +1820,9 @@ if __name__ == "__main__":
     vol_loss=VOL_LOSS,
     target_under=1.115,
     target_mean_bias=0.05,
-    warmup_epochs=1,
+    warmup_epochs=3,
     )
-    lr_decay_cb = EpochLRDecay(gamma=0.95, start_epoch=1) 
+    lr_decay_cb = EpochLRDecay(gamma=0.95, start_epoch=3) 
 
     # ----------------------------
     # Trainer instance
@@ -1835,7 +1835,7 @@ if __name__ == "__main__":
         gradient_clip_val=GRADIENT_CLIP_VAL,
         num_sanity_val_steps = 0,
         logger=logger,
-        callbacks=[lr_cb, best_ckpt_cb, es_cb, bar_cb, metrics_cb, mirror_cb, bias_cb],
+        callbacks=[lr_cb, best_ckpt_cb, es_cb, bar_cb, metrics_cb, mirror_cb, bias_cb, lr_decay_cb],
         check_val_every_n_epoch=int(ARGS.check_val_every_n_epoch),
         log_every_n_steps=int(ARGS.log_every_n_steps),
     )
