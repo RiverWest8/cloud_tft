@@ -342,23 +342,28 @@ class CompositeVolMetric(Metric):
     Wrap a (quantile) volatility loss and add a warmup tail-penalty on the
     top `high_q` fraction of targets to improve peak capture.
     Peak selection is done in decoded space to avoid over-penalising.
+    Includes a small mean-bias calibration in decoded space.
     """
 
     def __init__(self, base_loss: Metric, high_q: float = 0.90,
-                 penalty_weight: float = 0.5, warmup_epochs: int = 3):
+                 penalty_weight: float = 0.5, warmup_epochs: int = 3,
+                 cal_weight: float = 0.02):
         super().__init__()
         self.base_loss = base_loss
         self.high_q = float(high_q)
         self.penalty_weight = float(penalty_weight)
         self.warmup_epochs = int(warmup_epochs)
+        self.cal_weight = float(cal_weight)
         self.current_epoch = 0  # updated externally by a callback
 
     def update_epoch(self, epoch: int):
         """Called by trainer each epoch to update warmup state."""
         self.current_epoch = int(epoch)
 
+    # ---------- helpers ----------
     @staticmethod
     def _squeeze_pred_len(t: torch.Tensor) -> torch.Tensor:
+        # remove prediction-length dimension if it's 1
         if torch.is_tensor(t):
             if t.ndim >= 4 and t.size(1) == 1:
                 t = t.squeeze(1)
@@ -368,23 +373,37 @@ class CompositeVolMetric(Metric):
 
     @staticmethod
     def _squeeze_last1(t: torch.Tensor) -> torch.Tensor:
+        # drop a trailing singleton last-dim
         if torch.is_tensor(t):
             if t.ndim == 3 and t.size(-1) == 1:
                 t = t[..., 0]
+            if t.ndim == 2 and t.size(-1) == 1:
+                t = t[:, 0]
         return t
 
     def _extract_decoder_vol_target(self, target):
+        """
+        PF passes (encoder_target, decoder_target) into MultiLoss metrics.
+        We want the decoder target for *volatility* (first column if multiple).
+        """
         if isinstance(target, (list, tuple)) and len(target) >= 2:
-            t = target[1]
+            t = target[1]  # decoder part
         else:
             t = target
         if not torch.is_tensor(t):
             return None
         t = self._squeeze_pred_len(t)
         t = self._squeeze_last1(t)
-        return t
+        # if decoder has multiple targets in columns, take col 0 (vol)
+        if t.ndim == 2 and t.size(1) >= 1:
+            t = t[:, 0]
+        return t  # shape [B]
 
     def _extract_vol_quantiles(self, y_pred: torch.Tensor) -> torch.Tensor:
+        """
+        Return the volatility quantiles tensor with last-dim == K.
+        Accepts list/tuple (take first) or tensors shaped [B,1,K], [B,K], [B,D] (keep first K).
+        """
         K = len(VOL_QUANTILES)
         if isinstance(y_pred, (list, tuple)):
             y_pred = y_pred[0]
@@ -397,45 +416,66 @@ class CompositeVolMetric(Metric):
 
     @staticmethod
     def _decode_asinh(x):
-        return torch.sinh(x)  # inverse of asinh
+        # inverse of asinh used by GroupNormalizer when transformation="asinh"
+        return torch.sinh(x)
 
+    # ---------- Metric API ----------
     def forward(self, y_pred, target, **kwargs):
+        # 1) volatility quantile predictions [..., K]
         vol_q = self._extract_vol_quantiles(y_pred)
-        target_vol = self._extract_decoder_vol_target(target)
 
+        # 2) decoder volatility target (encoded space) [...]
+        target_vol = self._extract_decoder_vol_target(target)
         if target_vol is None or not torch.is_tensor(target_vol):
+            # safe fallback to keep the graph alive
             target_vol = vol_q[..., Q50_IDX].detach()
 
-        if target_vol.ndim == 1:
-            target_vol = target_vol.unsqueeze(-1)
+        # IMPORTANT: keep target_vol 1D so base loss broadcasting matches [B, K]
+        if target_vol.ndim > 1:
+            target_vol = target_vol.squeeze(-1)
 
-        # Base quantile loss
+        # 3) base loss (e.g., AsymmetricQuantileLoss) against the volatility target
         main = self.base_loss(vol_q, target_vol)
 
-        # Decode to real space
+        # 4) Decode to real space for peak selection & mean-bias calibration
         try:
             tgt_dec = self._decode_asinh(target_vol)
             med_dec = self._decode_asinh(vol_q[..., Q50_IDX])
         except Exception:
-            # Fallback: skip penalty if decode fails
+            # If decode fails for some reason, skip the extra terms
             return main
 
-        # Peak threshold in decoded space
+        # Ensure 1D for masking/indexing
+        if tgt_dec.ndim > 1:
+            tgt_dec = tgt_dec.squeeze(-1)
+        if med_dec.ndim > 1:
+            med_dec = med_dec.squeeze(-1)
+
+        # 4a) small symmetric mean-bias calibration (decoded space)
+        try:
+            cal = (med_dec.mean() - tgt_dec.mean()) ** 2
+            main = main + self.cal_weight * cal
+        except Exception:
+            pass
+
+        # 4b) tail penalty on peaks where we underpredict (decoded space)
         try:
             thresh_dec = torch.quantile(tgt_dec.detach(), self.high_q)
         except Exception:
             return main
 
-        # Penalise only underprediction on peaks
         mask = (tgt_dec > thresh_dec) & (med_dec < tgt_dec)
         if mask.any():
             penalty = F.mse_loss(med_dec[mask], tgt_dec[mask])
-            scale = min(1.0, self.current_epoch / max(1, self.warmup_epochs))
+            scale = min(1.0, float(self.current_epoch) / max(1, self.warmup_epochs))
             main = main + scale * self.penalty_weight * penalty
 
         return main
 
     def to_prediction(self, y_pred: torch.Tensor, **kwargs) -> torch.Tensor:
+        """
+        For logging/metrics, return a point forecast with last-dim==1 (median quantile).
+        """
         K = len(VOL_QUANTILES)
         if isinstance(y_pred, (list, tuple)):
             y_pred = y_pred[0]
@@ -446,6 +486,7 @@ class CompositeVolMetric(Metric):
             return t.unsqueeze(-1)
         if torch.is_tensor(t) and t.ndim >= 2 and t.size(-1) >= (Q50_IDX + 1):
             return t[..., Q50_IDX].unsqueeze(-1)
+        # fallback: ensure shape [...,1]
         return t.mean(dim=-1, keepdim=True)
 
 
