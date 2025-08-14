@@ -1639,9 +1639,9 @@ if __name__ == "__main__":
     test_df  = add_vol_lags(test_df)
 
 
-    train_df = train_df[train_df["asset"] == "BTC","ETH"].reset_index(drop=True)
-    val_df   = val_df[val_df["asset"] == "BTC","ETH"].reset_index(drop=True)
-    test_df  = test_df[test_df["asset"] == "BTC","ETH"].reset_index(drop=True)
+    train_df = train_df[train_df["asset"] == "BTC","DOGE"].reset_index(drop=True)
+    val_df   = val_df[val_df["asset"] == "BTC","DOGE"].reset_index(drop=True)
+    test_df  = test_df[test_df["asset"] == "BTC","DOGE"].reset_index(drop=True)
 
 
     # Optional quick-run subsetting for speed
