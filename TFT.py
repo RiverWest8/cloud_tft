@@ -47,6 +47,7 @@ import json
 import numpy as np
 import pandas as pd
 import pandas as _pd
+from lightning.pytorch.callbacks import Callback
 pd = _pd  # Ensure pd always refers to pandas module
 import lightning as pl
 from lightning.pytorch import Trainer, seed_everything
@@ -309,32 +310,26 @@ class AsymmetricQuantileLoss(QuantileLoss):
                 return base
         return base
 
-class CompositeVolLoss(nn.Module):
-    """
-    Wraps the base AsymmetricQuantileLoss and adds a small extra penalty on the
-    top-decile targets to reduce systematic under-prediction. Works entirely in
-    the **encoded (asinh)** space, which is monotone with the decoded scale.
-    """
-    def __init__(self, base_loss: nn.Module, high_q: float = 0.90, penalty_weight: float = 0.5):
-        super().__init__()
+from pytorch_forecasting.metrics.base_metrics import Metric
+
+class CompositeVolMetric(Metric):
+    def __init__(self, base_loss, high_q=0.90, penalty_weight=0.5, **kwargs):
+        super().__init__(**kwargs)
         self.base_loss = base_loss
         self.high_q = float(high_q)
         self.penalty_weight = float(penalty_weight)
 
-    def forward(self, y_pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        # main quantile loss in encoded space
-        main = self.base_loss(y_pred, target)
+    def forward(self, y_pred, target, **kwargs):
+        main = self.base_loss(y_pred, target, **kwargs)
 
-        # median quantile (index of 0.50 in VOL_QUANTILES -> Q50_IDX)
+        # index for median quantile
         try:
             pred_med_enc = y_pred[..., Q50_IDX]
         except Exception:
-            # best-effort fallback
             pred_med_enc = y_pred.reshape(y_pred.size(0), -1)[:, 0]
 
-        # top-decile mask in encoded space (asinh is monotone)
         try:
-            thresh = torch.quantile(target.detach(), 0.90)
+            thresh = torch.quantile(target.detach(), self.high_q)
             mask = target > thresh
         except Exception:
             mask = torch.zeros_like(target, dtype=torch.bool)
@@ -344,7 +339,6 @@ class CompositeVolLoss(nn.Module):
             return main + self.penalty_weight * penalty
         return main
 
-from lightning.pytorch.callbacks import Callback
 
 class UnderPenaltyScheduler(Callback):
     """Gently ramps the base underestimation_factor from `start` to `end` over `ramp_epochs`."""
@@ -1917,7 +1911,7 @@ if __name__ == "__main__":
         mean_bias_weight=0.15,        # mild mean-bias to fight persistent under
     )
     # Composite: base quantile loss + high-vol penalty (encoded space)
-    VOL_LOSS = CompositeVolLoss(BASE_VOL_LOSS, high_q=0.90, penalty_weight=0.5)
+    VOL_LOSS = CompositeVolMetric(BASE_VOL_LOSS, high_q=0.90, penalty_weight=0.5)
     # one-off in your data prep (TRAIN split)
     counts = train_df["direction"].value_counts()
     n_pos = counts.get(1, 1)
