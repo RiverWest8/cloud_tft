@@ -344,6 +344,7 @@ class CompositeVolLoss(nn.Module):
             return main + self.penalty_weight * penalty
         return main
 
+from lightning.pytorch.callbacks import Callback
 
 class UnderPenaltyScheduler(pl.callbacks.Callback):
     """Gently ramps the base underestimation_factor from `start` to `end` over `ramp_epochs`."""
