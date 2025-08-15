@@ -346,7 +346,7 @@ class CompositeVolLoss(nn.Module):
 
 from lightning.pytorch.callbacks import Callback
 
-class UnderPenaltyScheduler(pl.callbacks.Callback):
+class UnderPenaltyScheduler(Callback):
     """Gently ramps the base underestimation_factor from `start` to `end` over `ramp_epochs`."""
     def __init__(self, base_loss: AsymmetricQuantileLoss, start: float = 1.35, end: float = 3.0, ramp_epochs: int = 8):
         super().__init__()
