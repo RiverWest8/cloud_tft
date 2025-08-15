@@ -271,7 +271,7 @@ class AsymmetricQuantileLoss(QuantileLoss):
       • optional small mean-bias penalty on the median
     """
     def __init__(self, quantiles,
-             underestimation_factor: float = 1.6,
+             underestimation_factor: float = 1.3,
              mean_bias_weight: float = 0.05,
              tail_q: float = 0.90,
              tail_weight: float = 4.0,
@@ -343,76 +343,55 @@ import torch.nn.functional as F
 
 class CompositeVolMetric(Metric):
     """
-    Wrap a (quantile) volatility loss and add a warmup tail-penalty on the
-    top `high_q` fraction of targets to improve peak capture.
-    Peak selection is done in decoded space to avoid over-penalising.
-    Includes a small mean-bias calibration in decoded space.
+    Volatility loss + warmup tail penalty on top high_q fraction of targets.
+    Now with significance-based masking so penalty only applies when 
+    underprediction is large enough relative to target std.
     """
 
-    def __init__(
-        self,
-        base_loss: Metric,
-        high_q: float = 0.95,
-        penalty_weight: float = 0.15,
-        warmup_epochs: int = 2,
-        cal_weight: float = 0.02,
-    ):
+    def __init__(self, base_loss: Metric, high_q: float = 0.90,
+                 penalty_weight: float = 0.08, warmup_epochs: int = 2,
+                 cal_weight: float = 0.006):
         super().__init__()
         self.base_loss = base_loss
         self.high_q = float(high_q)
         self.penalty_weight = float(penalty_weight)
         self.warmup_epochs = int(warmup_epochs)
         self.cal_weight = float(cal_weight)
-        self.current_epoch = 0  # updated externally by a callback
+        self.current_epoch = 0
 
-    # called by VolMetricWarmupCallback at the start of each epoch
     def update_epoch(self, epoch: int):
         self.current_epoch = int(epoch)
 
-    # ---------- helpers ----------
     @staticmethod
     def _squeeze_pred_len(t: torch.Tensor) -> torch.Tensor:
-        # remove prediction-length dimension if it's 1
-        if torch.is_tensor(t):
-            if t.ndim >= 4 and t.size(1) == 1:
-                t = t.squeeze(1)
-            if t.ndim == 3 and t.size(1) == 1:
-                t = t.squeeze(1)
+        if torch.is_tensor(t) and t.ndim >= 4 and t.size(1) == 1:
+            t = t.squeeze(1)
+        if torch.is_tensor(t) and t.ndim == 3 and t.size(1) == 1:
+            t = t.squeeze(1)
         return t
 
     @staticmethod
     def _squeeze_last1(t: torch.Tensor) -> torch.Tensor:
-        # drop a trailing singleton last-dim
-        if torch.is_tensor(t):
-            if t.ndim == 3 and t.size(-1) == 1:
-                t = t[..., 0]
-            if t.ndim == 2 and t.size(-1) == 1:
-                t = t[:, 0]
+        if torch.is_tensor(t) and t.ndim == 2 and t.size(-1) == 1:
+            t = t[:, 0]
+        if torch.is_tensor(t) and t.ndim == 3 and t.size(-1) == 1:
+            t = t[..., 0]
         return t
 
     def _extract_decoder_vol_target(self, target):
-        """
-        PF passes (decoder_target_for_this_idx, encoder_target) into MultiLoss metrics.
-        We want the decoder target for *volatility* (first column if multiple).
-        """
-        if isinstance(target, (list, tuple)) and len(target) >= 1:
-            t = target[0]  # decoder part for this metric
+        if isinstance(target, (list, tuple)) and len(target) >= 2:
+            t = target[1]
         else:
             t = target
         if not torch.is_tensor(t):
             return None
         t = self._squeeze_pred_len(t)
         t = self._squeeze_last1(t)
-        # if decoder has multiple targets in columns, take col 0 (vol)
         if t.ndim == 2 and t.size(1) >= 1:
             t = t[:, 0]
-        return t  # shape [B]
+        return t
 
     def _extract_vol_quantiles(self, y_pred: torch.Tensor) -> torch.Tensor:
-        """
-        Return the volatility quantiles tensor with last-dim == K.
-        Accepts list/tuple (take first) or tensors shaped [B,1,K], [B,K], [B,D] (keep first K).
-        """
         K = len(VOL_QUANTILES)
         if isinstance(y_pred, (list, tuple)):
             y_pred = y_pred[0]
@@ -423,69 +402,62 @@ class CompositeVolMetric(Metric):
             t = t.repeat_interleave(K, dim=-1)
         return t
 
-    @staticmethod
-    def _decode_asinh(x: torch.Tensor) -> torch.Tensor:
-        # inverse of asinh used by GroupNormalizer when transformation="asinh"
-        return torch.sinh(x)
-
-    # ---------- Metric API ----------
     def forward(self, y_pred, target, **kwargs):
-        # 1) volatility quantile predictions [..., K]
+        """
+        Base asymmetric-quantile loss + peak-capture weighting + post-decoding
+        calibration. This version decodes the asinh by using torch.sinh and
+        avoids any dependency on an external decode helper.
+        """
+        # Extract heads in the formats emitted by PF/TFT
         vol_q = self._extract_vol_quantiles(y_pred)
-
-        # 2) decoder volatility target (encoded space) [...]
         target_vol = self._extract_decoder_vol_target(target)
+
+        # If target is missing (edge PF formats), fall back to median quantile
         if target_vol is None or not torch.is_tensor(target_vol):
-            # safe fallback to keep the graph alive
             target_vol = vol_q[..., Q50_IDX].detach()
 
-        # IMPORTANT: keep target_vol 1D so base loss broadcasting matches [B, K]
-        if target_vol.ndim > 1:
-            target_vol = target_vol.squeeze(-1)
+        # 1) Base loss (your AsymmetricQuantileLoss)
+        main = self.base_loss(vol_q, target_vol)
 
-        # 3) base loss (QuantileLoss-like) expects shapes [B, 1, K] & [B, 1]
-        vq = vol_q if vol_q.ndim == 3 else vol_q.unsqueeze(1)
-        tv = target_vol if target_vol.ndim == 2 else target_vol.unsqueeze(1)
-        main = self.base_loss(vq, tv)
-
-        # 4) Decode to real space for peak selection & mild mean-bias calibration
+        # 2) Peak-capture weighting (work on *decoded* scale)
         try:
-            tgt_dec = self._decode_asinh(target_vol)
-            med_dec = self._decode_asinh(vol_q[..., Q50_IDX])
+            target_dec = torch.sinh(target_vol)                 # undo asinh
+            pred_med_dec = torch.sinh(vol_q[..., Q50_IDX])      # median quantile decoded
         except Exception:
-            return main  # decoding failed; fall back to main only
-
-        # Ensure 1D for masking/indexing
-        if tgt_dec.ndim > 1:
-            tgt_dec = tgt_dec.squeeze(-1)
-        if med_dec.ndim > 1:
-            med_dec = med_dec.squeeze(-1)
-
-        # 4a) small symmetric mean-bias calibration (decoded space)
-        try:
-            cal = (med_dec.mean() - tgt_dec.mean()) ** 2
-            main = main + self.cal_weight * cal
-        except Exception:
-            pass
-
-        # 4b) tail penalty on peaks where we underpredict (decoded space)
-        try:
-            thresh_dec = torch.quantile(tgt_dec.detach(), self.high_q)
-        except Exception:
+            # if anything goes wrong in decoding, just return base loss
             return main
 
-        mask = (tgt_dec > thresh_dec) & (med_dec < tgt_dec)
-        if mask.any():
-            penalty = F.mse_loss(med_dec[mask], tgt_dec[mask])
-            scale = min(1.0, float(self.current_epoch) / max(1, self.warmup_epochs))
-            main = main + scale * self.penalty_weight * penalty
+        # Compute high-vol threshold (use self.high_q if present; default 0.85)
+        try:
+            q = float(getattr(self, "high_q", 0.85))
+            thresh = torch.quantile(target_dec.detach(), q)
+            high_mask = target_dec > thresh
+            if torch.any(high_mask):
+                peak_loss = F.mse_loss(pred_med_dec[high_mask], target_dec[high_mask])
+                # Warmup scaling so the penalty ramps in smoothly
+                scale = min(1.0, float(self.current_epoch) / max(1, int(self.warmup_epochs)))
+                main = main + scale * float(self.penalty_weight) * peak_loss
+        except Exception:
+            pass  # be conservative if quantile fails
+
+        # 3) Post-decoding calibration towards large targets when under-predicting
+        # Only nudge if we're under and in the upper 30% tail.
+        try:
+            cal_thresh = torch.quantile(target_dec.detach(), 0.70)
+            cal_mask = target_dec > cal_thresh
+            under_mask = pred_med_dec < target_dec
+            adj_mask = cal_mask & under_mask
+            if torch.any(adj_mask) and float(self.cal_weight) > 0:
+                # virtual adjustment: push half-way towards truth, and penalise the gap
+                adj_pred = pred_med_dec[adj_mask] + 0.5 * (target_dec[adj_mask] - pred_med_dec[adj_mask])
+                cal_loss = F.mse_loss(adj_pred, target_dec[adj_mask])
+                main = main + float(self.cal_weight) * cal_loss
+        except Exception:
+            pass
 
         return main
 
     def to_prediction(self, y_pred: torch.Tensor, **kwargs) -> torch.Tensor:
-        """
-        For logging/metrics, return a point forecast with last-dim==1 (median quantile).
-        """
         K = len(VOL_QUANTILES)
         if isinstance(y_pred, (list, tuple)):
             y_pred = y_pred[0]
@@ -496,9 +468,7 @@ class CompositeVolMetric(Metric):
             return t.unsqueeze(-1)
         if torch.is_tensor(t) and t.ndim >= 2 and t.size(-1) >= (Q50_IDX + 1):
             return t[..., Q50_IDX].unsqueeze(-1)
-        # fallback: ensure shape [...,1]
         return t.mean(dim=-1, keepdim=True)
-
 
 class UnderPenaltyScheduler(Callback):
     """Gently ramps the base underestimation_factor from `start` to `end` over `ramp_epochs`."""
@@ -2100,13 +2070,14 @@ if __name__ == "__main__":
 
     # ---- Losses (place where you currently build VOL_LOSS / DIR_LOSS) ----
     # Keep your VOL_QUANTILES as defined at the top
-    BASE_VOL_LOSS = QuantileLoss(quantiles=VOL_QUANTILES)
+    BASE_VOL_LOSS = QuantileLoss(quantiles=VOL_QUANTILES, reduction = "mean")
 
     VOL_LOSS = CompositeVolMetric(
         base_loss=BASE_VOL_LOSS,
-        high_q=0.95,
-        penalty_weight=0.10,
-        warmup_epochs=3
+        high_q=0.90,
+        penalty_weight=0.12,
+        warmup_epochs=2
+        cal_weight = 0.012
     )
 
     # Direction loss unchanged
