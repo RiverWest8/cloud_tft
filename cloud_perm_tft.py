@@ -266,18 +266,20 @@ import torch.nn.functional as F
 class AsymmetricQuantileLoss(QuantileLoss):
     """
     Pinball loss with:
-      • heavier penalty when y_pred < y_true (under-prediction)
+      • heavier penalty when y_pred < y_true (under) or y_pred > y_true (over)
       • extra sample-weights for high-volatility tail (targets above tail_q)
       • optional small mean-bias penalty on the median
     """
     def __init__(self, quantiles,
-             underestimation_factor: float = 1.3,
-             mean_bias_weight: float = 0.05,
-             tail_q: float = 0.90,
-             tail_weight: float = 4.0,
-             **kwargs):
+                 underestimation_factor: float = 1.3,
+                 overestimation_factor: float = 1.0,
+                 mean_bias_weight: float = 0.05,
+                 tail_q: float = 0.90,
+                 tail_weight: float = 4.0,
+                 **kwargs):
         super().__init__(quantiles=quantiles, **kwargs)
         self.underestimation_factor = float(underestimation_factor)
+        self.overestimation_factor = float(overestimation_factor)
         self.mean_bias_weight = float(mean_bias_weight)
         self.tail_q = float(tail_q)
         self.tail_weight = float(tail_weight)
@@ -289,37 +291,32 @@ class AsymmetricQuantileLoss(QuantileLoss):
     def loss_per_prediction(self, y_pred, target):
         # y_pred [..., K], target [...]
         diff = target.unsqueeze(-1) - y_pred  # >0 ⇒ under-prediction
-        q = torch.tensor(self.quantiles, device=y_pred.device, dtype=y_pred.dtype)
-        # broadcast q to diff
-        view = [1] * (diff.ndim - 1) + [-1]
-        q = q.view(*view)
-        alpha = torch.as_tensor(self.underestimation_factor, dtype=y_pred.dtype, device=y_pred.device)
-
-        # pinball with heavier under-pred penalties
-        return torch.where(
-            diff >= 0,
-            alpha * q * diff,
-            (1.0 - q) * (-diff),
+        q = torch.tensor(self.quantiles, device=y_pred.device, dtype=y_pred.dtype).view(
+            *([1] * (diff.ndim - 1)), -1
         )
+        a_under = torch.as_tensor(self.underestimation_factor, dtype=y_pred.dtype, device=y_pred.device)
+        a_over  = torch.as_tensor(self.overestimation_factor,  dtype=y_pred.dtype, device=y_pred.device)
+
+        under_term = a_under * q * torch.clamp(diff, min=0)
+        over_term  = a_over  * (1.0 - q) * torch.clamp(-diff, min=0)
+        return under_term + over_term
 
     def forward(self, y_pred, target):
-        # base per-sample, per-quantile loss
-        loss = self.loss_per_prediction(y_pred, target)  # shape [..., K]
+        loss = self.loss_per_prediction(y_pred, target)  # [..., K]
 
-        # ---- Tail re-weighting (in encoded space) ----
+        # Tail re-weighting (encoded space)
         if self.tail_weight > 1.0:
             try:
                 thresh = torch.quantile(target.detach(), self.tail_q)
-                w = torch.ones_like(target, dtype=loss.dtype, device=loss.device)
-                w = torch.where(target > thresh, w * self.tail_weight, w)  # shape [...]
-                loss = loss * w.unsqueeze(-1)  # broadcast onto quantile dim
+                w = torch.where(target > thresh,
+                                torch.ones_like(target, dtype=loss.dtype, device=loss.device) * self.tail_weight,
+                                torch.ones_like(target, dtype=loss.dtype, device=loss.device))
+                loss = loss * w.unsqueeze(-1)
             except Exception:
-                pass  # be conservative if quantile fails
+                pass
 
-        # reduce
         out = loss.mean()
 
-        # optional mean-bias penalty on median (kept small)
         if self.mean_bias_weight > 0:
             try:
                 med = y_pred[..., self._q50_idx]
@@ -328,9 +325,6 @@ class AsymmetricQuantileLoss(QuantileLoss):
             except Exception:
                 pass
         return out
-
-import torch
-from pytorch_forecasting.metrics import QuantileLoss
 
 from pytorch_forecasting.metrics.base_metrics import Metric
 import torch
@@ -1089,36 +1083,90 @@ class VolMetricWarmupCallback(pl.Callback):
         if hasattr(self.vol_metric, "update_epoch"):
             self.vol_metric.update_epoch(e)
 
+
 class BiasWarmupCallback(pl.Callback):
-    def __init__(self, vol_loss, target_under=5, target_mean_bias=0.15, warmup_epochs=3):
+    def __init__(self, vol_loss_wrapper, target_under=5, target_mean_bias=0.15, warmup_epochs=3):
         super().__init__()
-        self.vol_loss = vol_loss
+        self.wrapper = vol_loss_wrapper
         self.target_under = float(target_under)
         self.target_mean_bias = float(target_mean_bias)
         self.warm = int(max(0, warmup_epochs))
 
+    def _base(self):
+        # If passed CompositeVolMetric, dive into .base_loss; else assume it's already the base loss
+        return getattr(self.wrapper, "base_loss", self.wrapper)
+
     def on_train_epoch_start(self, trainer, pl_module):
-        # current_epoch is 0-based
+        base = self._base()
         e = int(getattr(trainer, "current_epoch", 0))
         if self.warm <= 0:
-            # no warmup: use targets directly
-            self.vol_loss.underestimation_factor = self.target_under
-            self.vol_loss.mean_bias_weight = self.target_mean_bias
+            base.underestimation_factor = self.target_under
+            base.mean_bias_weight = self.target_mean_bias
         else:
             prog = min(1.0, float(e) / float(self.warm))
-            # ramp underestimation from 1.0 → target
-            self.vol_loss.underestimation_factor = 1.0 + (self.target_under - 1.0) * prog
-            # keep mean-bias OFF until warmup finishes
-            self.vol_loss.mean_bias_weight = 0.0 if e < self.warm else self.target_mean_bias
+            base.underestimation_factor = 1.0 + (self.target_under - 1.0) * prog
+            base.mean_bias_weight = 0.0 if e < self.warm else self.target_mean_bias
+
+        # keep over-penalty neutral during warmup
+        if hasattr(base, "overestimation_factor"):
+            base.overestimation_factor = 1.0
 
         # Debug print
         try:
             lr0 = trainer.optimizers[0].param_groups[0]["lr"]
         except Exception:
             lr0 = None
-        print(f"[BIAS] epoch={e} under={self.vol_loss.underestimation_factor:.3f} "
-              f"mean_bias={self.vol_loss.mean_bias_weight:.3f} "
+        print(f"[BIAS] epoch={e} under={getattr(base,'underestimation_factor',float('nan')):.3f} "
+              f"mean_bias={getattr(base,'mean_bias_weight',0.0):.3f} "
               f"lr={lr0 if lr0 is not None else 'n/a'}")
+        
+
+class AutoBiasScheduler(pl.Callback):
+    """
+    After each validation, use PerAssetMetrics' val_mean_scale (= mean(y)/mean(p))
+    to steer asymmetry:
+      • if scale < 0.95 (over-predicting), increase *overestimation* penalty
+      • if scale > 1.05 (under-predicting), increase *underestimation* penalty
+    """
+    def __init__(self, vol_loss_wrapper, min_factor=0.8, max_factor=4.0, gamma=0.6):
+        super().__init__()
+        self.wrapper = vol_loss_wrapper
+        self.min = float(min_factor)
+        self.max = float(max_factor)
+        self.gamma = float(gamma)
+
+    def _base(self):
+        return getattr(self.wrapper, "base_loss", self.wrapper)
+
+    def on_train_epoch_start(self, trainer, pl_module):
+        base = self._base()
+        scale_t = trainer.callback_metrics.get("val_mean_scale", None)
+        try:
+            s = float(scale_t.item() if torch.is_tensor(scale_t) else scale_t)
+        except Exception:
+            return  # nothing logged yet
+
+        if not np.isfinite(s):
+            return
+
+        # default neutral
+        u, o = getattr(base, "underestimation_factor", 1.0), getattr(base, "overestimation_factor", 1.0)
+
+        if s < 0.95:
+            # model is too high on average → penalise overestimation
+            o = float(np.clip((1.0 / s) ** self.gamma, self.min, self.max))
+            u = 1.0
+        elif s > 1.05:
+            # model is too low on average → penalise underestimation
+            u = float(np.clip(s ** self.gamma, self.min, self.max))
+            o = 1.0
+        else:
+            u, o = 1.2, 1.0  # mild nudge near calibrated
+
+        base.underestimation_factor = u
+        if hasattr(base, "overestimation_factor"):
+            base.overestimation_factor = o
+        print(f"[AUTO-BIAS] mean_scale={s:.3f} → under={u:.3f} over={o:.3f}")
         
 # Decay the optimizer LR at the end of each epoch to prevent overshoot/oscillation
 import lightning.pytorch as pl
@@ -2194,59 +2242,60 @@ if __name__ == "__main__":
     mirror_cb = MirrorCheckpoints()
     from pytorch_forecasting.metrics import MultiLoss
 
-    # ---- Losses (place where you currently build VOL_LOSS / DIR_LOSS) ----
-    # Keep your VOL_QUANTILES as defined at the top
-    BASE_VOL_LOSS = QuantileLoss(quantiles=VOL_QUANTILES, reduction = "mean")
+    # ---- Losses ----
+    # Replace QuantileLoss with new AsymmetricQuantileLoss from my patch above
+    BASE_VOL_LOSS = AsymmetricQuantileLoss(
+        quantiles=VOL_QUANTILES,
+        underestimation_factor=1.2,   # will be adjusted by callbacks
+        overestimation_factor=1.0,    # will be adjusted by callbacks
+        tail_q=0.90, tail_weight=3.0,
+        mean_bias_weight=0.05,
+    )
 
     VOL_LOSS = CompositeVolMetric(
-        base_loss=BASE_VOL_LOSS,
+        base_loss=BASE_VOL_LOSS,  # pass the asymmetric loss in
         high_q=0.90,
         penalty_weight=0.12,
         warmup_epochs=2,
-        cal_weight = 0.012
+        cal_weight=0.012
     )
 
     # Direction loss unchanged
     pos_weight = 1.0
     DIR_LOSS = LabelSmoothedBCE(smoothing=0.05, pos_weight=pos_weight)
 
-
-    # one-off in your data prep (TRAIN split)
-    counts = train_df["direction"].value_counts()
-    n_pos = counts.get(1, 1)
-    n_neg = counts.get(0, 1)
-
-
-
     FIXED_VOL_WEIGHT = 1.0
     FIXED_DIR_WEIGHT = 0.1
- 
 
     tft = TemporalFusionTransformer.from_dataset(
         training_dataset,
         hidden_size=64,
         attention_head_size=4,
-        dropout=0.0833704625250354, #0.0833704625250354,
+        dropout=0.0833704625250354,
         hidden_continuous_size=64,
-        learning_rate=(LR_OVERRIDE if LR_OVERRIDE is not None else 0.000815), #0.0019 0017978
+        learning_rate=(LR_OVERRIDE if LR_OVERRIDE is not None else 0.000815),
         optimizer="AdamW",
         optimizer_params={"weight_decay": WEIGHT_DECAY},
-        output_size=[len(VOL_QUANTILES), 1],  # 7 quantiles + 1 logit
+        output_size=[len(VOL_QUANTILES), 1],
         loss=MultiLoss([VOL_LOSS, DIR_LOSS], weights=[FIXED_VOL_WEIGHT, FIXED_DIR_WEIGHT]),
         logging_metrics=[],
         log_interval=50,
         log_val_interval=10,
     )
+
+    # Normaliser + metrics callback
     vol_normalizer = _extract_norm_from_dataset(training_dataset)
-    tft.vol_norm = vol_normalizer          # if your LightningModule is 'tft'
+    tft.vol_norm = vol_normalizer
     metrics_cb = PerAssetMetrics(
         id_to_name=rev_asset,
         vol_normalizer=vol_normalizer,
         max_print=10
     )
 
+    # Learning rate monitor
     lr_cb = LearningRateMonitor(logging_interval="step")
 
+    # Best checkpoint
     best_ckpt_cb = ModelCheckpoint(
         monitor="val_qlike_overall",
         mode="min",
@@ -2256,18 +2305,24 @@ if __name__ == "__main__":
         dirpath=str(LOCAL_CKPT_DIR),
     )
 
-    penalty_sched_cb = UnderPenaltyScheduler(BASE_VOL_LOSS, start=1.35, end=3.0, ramp_epochs=8)
-
+    # 🔹 Bias warmup (points to VOL_LOSS now, not BASE_VOL_LOSS)
     vol_warmup_cb = BiasWarmupCallback(
-        vol_loss=BASE_VOL_LOSS,
-        target_under=1.0,          # was 5 or 3 earlier — way too high
-        target_mean_bias=0.05,     # also reduce mean bias weight
-        warmup_epochs=3
+        vol_loss_wrapper=VOL_LOSS,     # wrapper, so it can access base_loss inside
+        target_under=3.0,
+        target_mean_bias=0.05,
+        warmup_epochs=2
     )
 
+    # 🔹 Auto bias scheduler to adapt under/over penalty
+    auto_bias_cb = AutoBiasScheduler(
+        vol_loss_wrapper=VOL_LOSS,
+        min_factor=0.8, max_factor=4.0, gamma=0.55
+    )
 
-    
-    lr_decay_cb = EpochLRDecay(gamma=0.95, start_epoch=1) 
+    # Drop UnderPenaltyScheduler → auto_bias_cb replaces it
+
+    # LR decay
+    lr_decay_cb = EpochLRDecay(gamma=0.95, start_epoch=1)
 
     # ----------------------------
     # Trainer instance
@@ -2278,9 +2333,19 @@ if __name__ == "__main__":
         precision=PRECISION,
         max_epochs=MAX_EPOCHS,
         gradient_clip_val=GRADIENT_CLIP_VAL,
-        num_sanity_val_steps = 0,
+        num_sanity_val_steps=0,
         logger=logger,
-        callbacks=[best_ckpt_cb, es_cb, bar_cb, metrics_cb, mirror_cb, lr_decay_cb, lr_cb,vol_warmup_cb],
+        callbacks=[
+            best_ckpt_cb,
+            es_cb,
+            bar_cb,
+            metrics_cb,
+            mirror_cb,
+            lr_decay_cb,
+            lr_cb,
+            vol_warmup_cb,
+            auto_bias_cb,  # new
+        ],
         check_val_every_n_epoch=int(ARGS.check_val_every_n_epoch),
         log_every_n_steps=int(ARGS.log_every_n_steps),
     )
