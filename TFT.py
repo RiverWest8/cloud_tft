@@ -47,7 +47,6 @@ import json
 import numpy as np
 import pandas as pd
 import pandas as _pd
-from lightning.pytorch.callbacks import Callback
 pd = _pd  # Ensure pd always refers to pandas module
 import lightning as pl
 from lightning.pytorch import Trainer, seed_everything
@@ -310,52 +309,6 @@ class AsymmetricQuantileLoss(QuantileLoss):
                 return base
         return base
 
-from pytorch_forecasting.metrics.base_metrics import Metric
-
-class CompositeVolMetric(Metric):
-    def __init__(self, base_loss, high_q=0.90, penalty_weight=0.5, **kwargs):
-        super().__init__(**kwargs)
-        self.base_loss = base_loss
-        self.high_q = float(high_q)
-        self.penalty_weight = float(penalty_weight)
-
-    def forward(self, y_pred, target, **kwargs):
-        main = self.base_loss(y_pred, target, **kwargs)
-
-        # index for median quantile
-        try:
-            pred_med_enc = y_pred[..., Q50_IDX]
-        except Exception:
-            pred_med_enc = y_pred.reshape(y_pred.size(0), -1)[:, 0]
-
-        try:
-            thresh = torch.quantile(target.detach(), self.high_q)
-            mask = target > thresh
-        except Exception:
-            mask = torch.zeros_like(target, dtype=torch.bool)
-
-        if mask.any():
-            penalty = F.mse_loss(pred_med_enc[mask], target[mask])
-            return main + self.penalty_weight * penalty
-        return main
-
-
-class UnderPenaltyScheduler(Callback):
-    """Gently ramps the base underestimation_factor from `start` to `end` over `ramp_epochs`."""
-    def __init__(self, base_loss: AsymmetricQuantileLoss, start: float = 1.35, end: float = 3.0, ramp_epochs: int = 8):
-        super().__init__()
-        self.loss = base_loss
-        self.start = float(start)
-        self.end = float(end)
-        self.ramp_epochs = int(max(1, ramp_epochs))
-
-    def on_train_epoch_start(self, trainer, pl_module):
-        e = int(getattr(trainer, "current_epoch", 0))
-        if e >= self.ramp_epochs:
-            new_val = self.end
-        else:
-            new_val = self.start + (self.end - self.start) * (e / float(self.ramp_epochs))
-        self.loss.underestimation_factor = float(new_val)
 
 class PerAssetMetrics(pl.Callback):
     """Collects per-asset predictions during validation and prints/saves metrics.
@@ -1642,8 +1595,6 @@ def run_permutation_importance(
             print(f"[WARN] Could not upload FI CSV: {e}")
     except Exception as e:
         print(f"[WARN] Failed to save FI: {e}")
-
-
 # -----------------------------------------------------------------------
 # Data preparation
 # -----------------------------------------------------------------------
@@ -1686,12 +1637,7 @@ if __name__ == "__main__":
     train_df = add_vol_lags(train_df)
     val_df   = add_vol_lags(val_df)
     test_df  = add_vol_lags(test_df)
-    # Fill NaNs in all lag columns before building the dataset
-    lag_cols = [col for col in train_df.columns if col.startswith("rv_lag_")]
-    train_df[lag_cols] = train_df[lag_cols].fillna(0)
-    val_df[lag_cols]   = val_df[lag_cols].fillna(0)
-    test_df[lag_cols]  = test_df[lag_cols].fillna(0)
-    
+
     # Assets to include
     keep_assets = ["BTC", "DOGE"]
 
@@ -1797,7 +1743,7 @@ if __name__ == "__main__":
                     groups=GROUP_ID,
                     center=True,
                     scale_by_group= True,
-                    transformation="asinh",
+                    transformation="log1p",
                 ),
                 TorchNormalizer(method="identity", center=False),   # direction
             ]),
@@ -1886,11 +1832,11 @@ if __name__ == "__main__":
     # Loss and output_size for multi-target: realised_vol (quantile regression), direction (classification)
     print("▶ Building model …")
     print(f"[LR] learning_rate={LR_OVERRIDE if LR_OVERRIDE is not None else 0.0003978}")
-
+    
     es_cb = EarlyStopping(
-        monitor="val_loss_decoded",  # MAE + RMSE (decoded)
-        patience=EARLY_STOP_PATIENCE,
-        mode="min"
+    monitor="val_rmse_overall",
+    patience=EARLY_STOP_PATIENCE,
+    mode="min"
     )
 
     bar_cb = TQDMProgressBar()
@@ -1905,13 +1851,12 @@ if __name__ == "__main__":
     from pytorch_forecasting.metrics import MultiLoss
 
         # Fixed weights
-    BASE_VOL_LOSS = AsymmetricQuantileLoss(
-        quantiles=VOL_QUANTILES,      # you already defined VOL_QUANTILES above
-        underestimation_factor=1.35,  # gentle from epoch 0
-        mean_bias_weight=0.15,        # mild mean-bias to fight persistent under
+        # ---- Build losses as named variables so callbacks can tune them ----
+    VOL_LOSS = AsymmetricQuantileLoss(
+        quantiles=[0.05, 0.165, 0.25, 0.5, 0.75, 0.835, 0.95],
+        underestimation_factor=1.0,   # final target (will be warmed up)
+        mean_bias_weight=0.05,        # will be 0 during warmup, then enabled
     )
-    # Composite: base quantile loss + high-vol penalty (encoded space)
-    VOL_LOSS = CompositeVolMetric(BASE_VOL_LOSS, high_q=0.90, penalty_weight=0.5)
     # one-off in your data prep (TRAIN split)
     counts = train_df["direction"].value_counts()
     n_pos = counts.get(1, 1)
@@ -1960,7 +1905,12 @@ if __name__ == "__main__":
         dirpath=str(LOCAL_CKPT_DIR),
     )
 
-    penalty_sched_cb = UnderPenaltyScheduler(BASE_VOL_LOSS, start=1.35, end=3.0, ramp_epochs=8)
+    bias_cb = BiasWarmupCallback(
+        vol_loss=VOL_LOSS,
+        target_under=1,        # smaller than 3.0 to avoid overshoot
+        target_mean_bias=0.2,    # add a mild mean-bias penalty
+        warmup_epochs=5
+    )
 
 
    
@@ -1978,7 +1928,7 @@ if __name__ == "__main__":
         gradient_clip_val=GRADIENT_CLIP_VAL,
         num_sanity_val_steps = 0,
         logger=logger,
-        callbacks=[best_ckpt_cb, es_cb, bar_cb, metrics_cb, mirror_cb, lr_decay_cb, lr_cb, penalty_sched_cb],
+        callbacks=[best_ckpt_cb, es_cb, bar_cb, metrics_cb, mirror_cb, lr_decay_cb, lr_cb, bias_cb],
         check_val_every_n_epoch=int(ARGS.check_val_every_n_epoch),
         log_every_n_steps=int(ARGS.log_every_n_steps),
     )
