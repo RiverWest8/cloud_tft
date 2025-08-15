@@ -405,52 +405,83 @@ class CompositeVolMetric(Metric):
     def forward(self, y_pred, target, **kwargs):
         """
         Base asymmetric-quantile loss + peak-capture weighting + post-decoding
-        calibration. This version decodes the asinh by using torch.sinh and
-        avoids any dependency on an external decode helper.
+        calibration. This version makes shapes compatible with PF's QuantileLoss
+        by ensuring target is [B,1] and y_pred is [B,1,K] before calling the
+        base loss. Peak penalty is applied on decoded scale and focuses on
+        relative underestimation in the upper tail.
         """
-        # Extract heads in the formats emitted by PF/TFT
-        vol_q = self._extract_vol_quantiles(y_pred)
-        target_vol = self._extract_decoder_vol_target(target)
+        # 1) Extract heads in the formats emitted by PF/TFT
+        vol_q = self._extract_vol_quantiles(y_pred)          # [B,K] or [B,1,K]
+        target_vol = self._extract_decoder_vol_target(target)  # [B] or [B,1]
 
         # If target is missing (edge PF formats), fall back to median quantile
         if target_vol is None or not torch.is_tensor(target_vol):
             target_vol = vol_q[..., Q50_IDX].detach()
 
-        # 1) Base loss (your AsymmetricQuantileLoss)
-        main = self.base_loss(vol_q, target_vol)
+        # ---- Shape fix for PF QuantileLoss/Metric wrapper ----
+        # Ensure target has shape [B,1]
+        t_for_base = target_vol
+        if torch.is_tensor(t_for_base):
+            # squeeze any trailing singleton and then enforce [B,1]
+            if t_for_base.ndim == 3 and t_for_base.size(-1) == 1:
+                t_for_base = t_for_base[..., 0]
+            if t_for_base.ndim > 1 and t_for_base.size(-1) == 1:
+                t_for_base = t_for_base.squeeze(-1)
+            if t_for_base.ndim == 1:
+                t_for_base = t_for_base.unsqueeze(1)  # [B,1]
+            elif t_for_base.ndim == 2 and t_for_base.size(1) != 1:
+                t_for_base = t_for_base[:, :1]
 
-        # 2) Peak-capture weighting (work on *decoded* scale)
-        try:
-            target_dec = torch.sinh(target_vol)                 # undo asinh
-            pred_med_dec = torch.sinh(vol_q[..., Q50_IDX])      # median quantile decoded
-        except Exception:
-            # if anything goes wrong in decoding, just return base loss
-            return main
+        # Ensure quantiles have shape [B,1,K]
+        q_for_base = vol_q
+        if torch.is_tensor(q_for_base):
+            # collapse pred-length dim if present
+            if q_for_base.ndim >= 4 and q_for_base.size(1) == 1:
+                q_for_base = q_for_base.squeeze(1)
+            if q_for_base.ndim == 3 and q_for_base.size(1) == 1:
+                q_for_base = q_for_base  # already [B,1,K]
+            elif q_for_base.ndim == 2:
+                q_for_base = q_for_base.unsqueeze(1)  # [B,1,K]
 
-        # Compute high-vol threshold (use self.high_q if present; default 0.85)
+        # 2) Base loss (AsymmetricQuantileLoss or QuantileLoss)
+        main = self.base_loss(q_for_base, t_for_base)
+
+        # 3) Peak-capture weighting on *decoded* scale
         try:
+            # work with 1D encoded tensors for decoding
+            t_flat = target_vol
+            if torch.is_tensor(t_flat) and t_flat.ndim > 1:
+                t_flat = t_flat.squeeze(-1)
+            # median quantile on encoded scale
+            med_enc = vol_q[..., Q50_IDX]
+            # decode as we're using asinh transform for vol
+            target_dec = torch.sinh(t_flat)
+            pred_med_dec = torch.sinh(med_enc)
+
+            # focus on highest tail
             q = float(getattr(self, "high_q", 0.85))
             thresh = torch.quantile(target_dec.detach(), q)
             high_mask = target_dec > thresh
             if torch.any(high_mask):
-                peak_loss = F.mse_loss(pred_med_dec[high_mask], target_dec[high_mask])
-                # Warmup scaling so the penalty ramps in smoothly
-                scale = min(1.0, float(self.current_epoch) / max(1, int(self.warmup_epochs)))
-                main = main + scale * float(self.penalty_weight) * peak_loss
+                # relative underestimation (only penalise when pred < target)
+                under = torch.clamp(target_dec - pred_med_dec, min=0.0)
+                rel_under = under / (target_dec + 1e-12)
+                peak_loss = (rel_under[high_mask] ** 2).mean()
+                # no ramp; apply immediately with configured weight
+                main = main + float(self.penalty_weight) * peak_loss
         except Exception:
-            pass  # be conservative if quantile fails
+            pass
 
-        # 3) Post-decoding calibration towards large targets when under-predicting
-        # Only nudge if we're under and in the upper 30% tail.
+        # 4) Post-decoding calibration penalty (upper 30% only when under)
         try:
-            cal_thresh = torch.quantile(target_dec.detach(), 0.70)
-            cal_mask = target_dec > cal_thresh
-            under_mask = pred_med_dec < target_dec
-            adj_mask = cal_mask & under_mask
+            cal_thresh = torch.quantile(torch.sinh(target_vol).detach(), 0.70)
+            target_dec2 = torch.sinh(target_vol if target_vol.ndim == 1 else target_vol.squeeze(-1))
+            pred_med_dec2 = torch.sinh(vol_q[..., Q50_IDX])
+            adj_mask = (target_dec2 > cal_thresh) & (pred_med_dec2 < target_dec2)
             if torch.any(adj_mask) and float(self.cal_weight) > 0:
-                # virtual adjustment: push half-way towards truth, and penalise the gap
-                adj_pred = pred_med_dec[adj_mask] + 0.5 * (target_dec[adj_mask] - pred_med_dec[adj_mask])
-                cal_loss = F.mse_loss(adj_pred, target_dec[adj_mask])
+                # penalise half-gap to avoid instability
+                adj_pred = pred_med_dec2[adj_mask] + 0.5 * (target_dec2[adj_mask] - pred_med_dec2[adj_mask])
+                cal_loss = F.mse_loss(adj_pred, target_dec2[adj_mask])
                 main = main + float(self.cal_weight) * cal_loss
         except Exception:
             pass
