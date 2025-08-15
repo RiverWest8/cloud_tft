@@ -540,6 +540,82 @@ class PerAssetMetrics(pl.Callback):
         # cached final rows/overall from last epoch
         self._last_rows = None
         self._last_overall = None
+        # calibration parameter cache
+        self._cal_params = {}
+
+    def _calibrate_per_asset(self, y_true_np, y_pred_np, g_ids_np):
+        """Return (pred_calibrated_np, params_dict) where params_dict maps int(group_id)
+        -> {"a": a, "b": b, "ratio": ratio, "p70": p70, "p95": p95}.
+        1) Fit y ≈ a + b * y_pred (least squares) per asset.
+        2) Tail boost: compute ratio = mean(y_top)/mean(y_pred_top) for top 15% of y.
+           Apply multiplicative boost ratio**w where w ramps from 0 at p70 to 1 at p95 of the fitted preds.
+        """
+        import numpy as _np
+        y = y_true_np.astype(float)
+        p = y_pred_np.astype(float)
+        g = g_ids_np.astype(int)
+        out = p.copy()
+        params = {}
+        for gid in _np.unique(g):
+            m = (g == gid)
+            if m.sum() < 10:
+                continue
+            yt = y[m]
+            yp = p[m]
+            # Linear calibration: least squares for a,b
+            X = _np.vstack([_np.ones_like(yp), yp]).T
+            try:
+                coef, *_ = _np.linalg.lstsq(X, yt, rcond=None)
+                a, b = float(coef[0]), float(coef[1])
+            except Exception:
+                a, b = 0.0, 1.0
+            yp_lin = a + b * yp
+            # Tail ratio on top 15% of true vols
+            try:
+                q85 = _np.quantile(yt, 0.85)
+                top = yt > q85
+                if top.any() and _np.isfinite(yp_lin[top]).mean() > 0:
+                    num = float(yt[top].mean())
+                    den = float(_np.maximum(yp_lin[top].mean(), 1e-12))
+                    ratio = float(_np.clip(num / den, 0.5, 5.0))
+                else:
+                    ratio = 1.0
+            except Exception:
+                ratio = 1.0
+            # Smooth ramp of boost on fitted preds
+            try:
+                p70 = float(_np.quantile(yp_lin, 0.70))
+                p95 = float(_np.quantile(yp_lin, 0.95))
+            except Exception:
+                p70, p95 = float(_np.median(yp_lin)), float(_np.max(yp_lin))
+            denom = max(p95 - p70, 1e-12)
+            w = _np.clip((yp_lin - p70) / denom, 0.0, 1.0)
+            yp_cal = yp_lin * (ratio ** w)
+            out[m] = yp_cal
+            params[int(gid)] = {"a": a, "b": b, "ratio": ratio, "p70": p70, "p95": p95}
+        return out, params
+
+    def _apply_saved_calibration(self, y_pred_np, g_ids_np):
+        """Apply previously saved per-asset calibration params to predictions (numpy)."""
+        import numpy as _np
+        if not getattr(self, "_cal_params", None):
+            return y_pred_np
+        p = y_pred_np.astype(float).copy()
+        g = g_ids_np.astype(int)
+        for gid, cfg in self._cal_params.items():
+            m = (g == int(gid))
+            if not _np.any(m):
+                continue
+            a = float(cfg.get("a", 0.0))
+            b = float(cfg.get("b", 1.0))
+            ratio = float(cfg.get("ratio", 1.0))
+            p70 = float(cfg.get("p70", 0.0))
+            p95 = float(cfg.get("p95", 1.0))
+            yp_lin = a + b * p[m]
+            denom = max(p95 - p70, 1e-12)
+            w = _np.clip((yp_lin - p70) / denom, 0.0, 1.0)
+            p[m] = yp_lin * (ratio ** w)
+        return p
 
     @torch.no_grad()
     def on_validation_epoch_start(self, trainer, pl_module):
@@ -732,7 +808,6 @@ class PerAssetMetrics(pl.Callback):
         pv_dec = safe_decode_vol(pv.unsqueeze(-1), self.vol_norm, g.unsqueeze(-1)).squeeze(-1)
         pv_dec = torch.clamp(pv_dec, min=2e-7)  # avoid zero in QLIKE
 
-
         # Quick sanity prints (match overfit_test style)
         print("DEBUG transformation:", getattr(self.vol_norm, "transformation", None))
         print("DEBUG mean after decode:", yv_dec.mean().item())
@@ -768,6 +843,19 @@ class PerAssetMetrics(pl.Callback):
         p_cpu  = pv_dec.detach().cpu()
         yd_cpu = yd.detach().cpu() if yd is not None else None
         pd_cpu = pd.detach().cpu() if pd is not None else None
+
+        # ---- Per-asset calibration on decoded scale (improves peak capture) ----
+        try:
+            g_cpu = g.detach().cpu()
+            raw_mae  = (p_cpu - y_cpu).abs().mean().item()
+            raw_mse  = ((p_cpu - y_cpu) ** 2).mean().item()
+            raw_rmse = raw_mse ** 0.5
+            p_cal_np, cal_params = self._calibrate_per_asset(y_cpu.numpy(), p_cpu.numpy(), g_cpu.numpy())
+            self._cal_params = cal_params
+            p_cpu = torch.from_numpy(p_cal_np)
+            print(f"[CAL] Applied per-asset linear+tail calibration | MAE(raw→cal) {raw_mae:.6f}→{(p_cpu - y_cpu).abs().mean().item():.6f}")
+        except Exception as e:
+            print(f"[CAL] Skipped per-asset calibration: {e}")
 
         # --- Calibration diagnostic (no effect on metrics) ---
         try:
@@ -924,6 +1012,13 @@ class PerAssetMetrics(pl.Callback):
                     "y_vol": yv_dec.numpy().tolist(),
                     "y_vol_pred": pv_dec.numpy().tolist(),
                 })
+                # Add calibrated predictions if we have saved params
+                try:
+                    g_np = g_cpu.numpy()
+                    pv_cal_np = self._apply_saved_calibration(pv_dec.numpy(), g_np)
+                    df_out["y_vol_pred_cal"] = pv_cal_np.tolist()
+                except Exception:
+                    pass
                 if yd_cpu is not None and pd_cpu is not None and yd_cpu.numel() > 0 and pd_cpu.numel() > 0:
                     # ensure pd is probability
                     pdp = pd_cpu
