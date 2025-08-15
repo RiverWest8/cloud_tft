@@ -1644,7 +1644,7 @@ if __name__ == "__main__":
     test_df[lag_cols]  = test_df[lag_cols].fillna(0)
     
     # Assets to include
-    keep_assets = ["BTC", "DOGE"]
+    keep_assets = ["BTC"]
 
     # Filter & sort
     train_df = (
